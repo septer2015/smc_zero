@@ -20,6 +20,9 @@ SweepMode: TypeAlias = Literal["wick_close_inside", "wick_only"]
 Season: TypeAlias = Literal["summer", "winter"]
 Killzone: TypeAlias = Literal["prelondon", "london", "ny"]
 BreakEvent: TypeAlias = Literal["bos", "choch"]
+# Where a limit order sits inside an entry gap: ``proximal`` = the edge price
+# reaches first (top of a bullish gap, bottom of a bearish one), ``mid`` = centre.
+FVGEntryMode: TypeAlias = Literal["proximal", "mid"]
 # Half-open MSK hour window: ``start <= hour < end``.
 HourWindow: TypeAlias = tuple[int, int]
 
@@ -98,7 +101,14 @@ class StructureConfig:
 
 @dataclass(frozen=True, slots=True)
 class FVGConfig:
-    """Three-candle fair value gap detection parameters."""
+    """Three-candle fair value gap detection parameters (SPEC_SMC.md, п.8).
+
+    The gap is the strict wick imbalance of the triple ``(k - 1, k, k + 1)`` and is
+    only visible from bar ``k + 1`` on.  ``min_gap_size`` is applied at detection
+    (``size >= min_gap_size``, inclusive, like prod's lookup filter) - narrower gaps
+    are not marked at all.  Where the limit order sits inside the gap is *not* a
+    detection parameter and lives in ``TradeConfig.fvg_entry_mode`` (Э2').
+    """
 
     min_gap_size: float = 0.0
 

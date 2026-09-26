@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from smc_zero.config import BreakEvent, StructureConfig
+from smc_zero.indicators._markup import known_at
 
 
 def _fractal_mask(values: np.ndarray, lookback: int, *, higher: bool) -> np.ndarray:
@@ -58,18 +59,6 @@ def _fractal_mask(values: np.ndarray, lookback: int, *, higher: bool) -> np.ndar
     return mask
 
 
-def _known_positions(swing: np.ndarray, lookback: int, index: pd.Index) -> pd.Series:
-    """Return the confirming bar position (``i + lookback``) of each swing, NA elsewhere.
-
-    The result is built on the *input* index: pandas aligns on labels when a Series
-    is put into a DataFrame constructor, so a freshly built ``RangeIndex`` series
-    would silently turn into NA for a DatetimeIndex frame.
-    """
-    positions = np.arange(swing.size)
-    values = np.where(swing, positions + lookback, np.nan)
-    return pd.Series(values, index=index).astype("Int64")
-
-
 def swing_points(df: pd.DataFrame, cfg: StructureConfig | None = None) -> pd.DataFrame:
     """Return swing flags plus the position at which each swing becomes known.
 
@@ -94,8 +83,8 @@ def swing_points(df: pd.DataFrame, cfg: StructureConfig | None = None) -> pd.Dat
             "swing_low": swing_low,
             "swing_high_price": np.where(swing_high, high, np.nan),
             "swing_low_price": np.where(swing_low, low, np.nan),
-            "swing_high_known_at": _known_positions(swing_high, lookback, df.index),
-            "swing_low_known_at": _known_positions(swing_low, lookback, df.index),
+            "swing_high_known_at": known_at(swing_high, lookback, df.index),
+            "swing_low_known_at": known_at(swing_low, lookback, df.index),
         },
         index=df.index,
     )

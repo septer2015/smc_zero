@@ -19,6 +19,7 @@ Confirmation: TypeAlias = Literal["close", "wick"]
 SweepMode: TypeAlias = Literal["wick_close_inside", "wick_only"]
 Season: TypeAlias = Literal["summer", "winter"]
 Killzone: TypeAlias = Literal["prelondon", "london", "ny"]
+BreakEvent: TypeAlias = Literal["bos", "choch"]
 # Half-open MSK hour window: ``start <= hour < end``.
 HourWindow: TypeAlias = tuple[int, int]
 
@@ -72,14 +73,22 @@ class SessionConfig:
 
 @dataclass(frozen=True, slots=True)
 class StructureConfig:
-    """Swing / BOS / CHoCH detection parameters.
+    """Swing / BOS / CHoCH detection parameters (SPEC_SMC.md, C4).
 
     ``swing_lookback`` is the symmetric number of candles on both sides of a
-    swing (the swing only becomes known after the right candle closes, i.e. at
-    bar ``i + swing_lookback``).
+    swing: the swing is a strict N-bar fractal and only becomes known after the
+    right candles close, i.e. at bar ``i + swing_lookback``.  The default is ``1``
+    for prod-fractal compatibility (prod's formula, core.py lines 339-343, is
+    exactly the 1-bar case); tests must cover ``N > 1`` as well.
+
+    ``confirmation`` decides *what must cross* a swing level to count as a break:
+    ``"close"`` is prod parity and the spec default (a break is a close beyond the
+    level, never a wick), ``"wick"`` makes a touch count.  Swing detection itself
+    is always the strict wick fractal - the two are independent, and the
+    interpretation is recorded in the Э1'.2 report as a spec clarification.
     """
 
-    swing_lookback: int = 3
+    swing_lookback: int = 1
     confirmation: Confirmation = "close"
 
     def __post_init__(self) -> None:

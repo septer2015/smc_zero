@@ -107,7 +107,7 @@ class FVGConfig:
     only visible from bar ``k + 1`` on.  ``min_gap_size`` is applied at detection
     (``size >= min_gap_size``, inclusive, like prod's lookup filter) - narrower gaps
     are not marked at all.  Where the limit order sits inside the gap is *not* a
-    detection parameter and lives in ``TradeConfig.fvg_entry_mode`` (Э2').
+    detection parameter and lives in ``EntryConfig.fvg_entry_mode`` (Э4').
     """
 
     min_gap_size: float = 0.0
@@ -136,14 +136,29 @@ class OBConfig:
 
 @dataclass(frozen=True, slots=True)
 class LiquidityConfig:
-    """Liquidity sweep and equal high/low tolerance parameters."""
+    """Liquidity levels and sweep detection parameters.
+
+    ``equal_tol`` clusters equal highs/lows (Э3').  ``sweep_buffer`` is the price
+    distance a wick must exceed a level by, in *price units* like
+    ``RiskConfig.spread`` (prod feeds ``sweep_buffer_pip * pip_size``);
+    ``sweep_lookback`` is the prod search window (``sweep_lookback``, default 48),
+    counted backwards from the evaluated bar *including* it.  ``sweep_mode`` keeps
+    prod's rule (a wick beyond the buffered threshold plus a close back inside it)
+    or relaxes it to a bare pierce.
+    """
 
     equal_tol: float = 0.0
     sweep_mode: SweepMode = "wick_close_inside"
+    sweep_buffer: float = 0.0
+    sweep_lookback: int = 48
 
     def __post_init__(self) -> None:
         if self.equal_tol < 0:
             raise ValueError("equal_tol must be >= 0")
+        if self.sweep_buffer < 0:
+            raise ValueError("sweep_buffer must be >= 0")
+        if self.sweep_lookback < 1:
+            raise ValueError("sweep_lookback must be >= 1")
 
 
 @dataclass(frozen=True, slots=True)

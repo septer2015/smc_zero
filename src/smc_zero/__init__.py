@@ -13,6 +13,7 @@ from smc_zero.config import (
     LiquidityConfig,
     OBConfig,
     RiskConfig,
+    SessionConfig,
     StructureConfig,
     TimeframeConfig,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "LiquidityConfig",
     "OBConfig",
     "RiskConfig",
+    "SessionConfig",
     "StructureConfig",
     "TimeframeConfig",
     "__version__",

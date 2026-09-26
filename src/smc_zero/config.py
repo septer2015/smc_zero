@@ -17,6 +17,10 @@ from typing import Literal, TypeAlias
 Timeframe: TypeAlias = Literal["M15", "H1", "D1"]
 Confirmation: TypeAlias = Literal["close", "wick"]
 SweepMode: TypeAlias = Literal["wick_close_inside", "wick_only"]
+Season: TypeAlias = Literal["summer", "winter"]
+Killzone: TypeAlias = Literal["prelondon", "london", "ny"]
+# Half-open MSK hour window: ``start <= hour < end``.
+HourWindow: TypeAlias = tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +30,44 @@ class TimeframeConfig:
     ltf: Timeframe = "M15"
     mtf: Timeframe = "H1"
     htf: Timeframe = "D1"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionConfig:
+    """Killzone gate: seasonal session windows in MSK hours (SPEC_SMC.md, C1).
+
+    Moscow is UTC+3 all year round, so the boundaries are MSK hours and the
+    season only selects *which* pair applies: London follows the EU DST calendar,
+    New York the US one.  Both calendars live in :mod:`smc_zero.utils.time` and
+    are consumed only by :mod:`smc_zero.indicators.sessions`, so the Э3' session
+    level maps (``london_*`` / ``ny_*``) can reuse this very table instead of
+    re-declaring windows.
+
+    ``use_kz`` is ``True`` by default (prod's gate defaulted to *off*).
+    ``prelondon`` is off by default: C1 leaves open whether prod's 07-09 MSK
+    window survives.  Windows are half-open in MSK hours.
+    """
+
+    use_kz: bool = True
+    prelondon: bool = False
+    prelondon_msk: HourWindow = (7, 9)
+    london_summer_msk: HourWindow = (9, 12)
+    london_winter_msk: HourWindow = (10, 13)
+    ny_summer_msk: HourWindow = (14, 17)
+    ny_winter_msk: HourWindow = (15, 18)
+
+    def __post_init__(self) -> None:
+        windows: dict[str, HourWindow] = {
+            "prelondon_msk": self.prelondon_msk,
+            "london_summer_msk": self.london_summer_msk,
+            "london_winter_msk": self.london_winter_msk,
+            "ny_summer_msk": self.ny_summer_msk,
+            "ny_winter_msk": self.ny_winter_msk,
+        }
+        for name, window in windows.items():
+            start, end = window
+            if not 0 <= start < end <= 24:
+                raise ValueError(f"{name} must satisfy 0 <= start < end <= 24, got {window}")
 
 
 @dataclass(frozen=True, slots=True)

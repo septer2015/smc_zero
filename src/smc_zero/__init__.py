@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from smc_zero.config import (
     BacktestConfig,
+    DisplacementConfig,
     FVGConfig,
     LiquidityConfig,
     OBConfig,
@@ -22,6 +23,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BacktestConfig",
+    "DisplacementConfig",
     "FVGConfig",
     "LiquidityConfig",
     "OBConfig",

@@ -145,6 +145,10 @@ def structure_breaks(df: pd.DataFrame, cfg: StructureConfig | None = None) -> pd
     * ``structure_event`` - ``"bos"`` / ``"choch"`` / ``None`` for that same bar.
     * ``trend`` - ``int8`` trend state after the bar: ``+1``, ``-1`` or ``0`` while
       no break has happened yet.
+    * ``break_level`` - the swing level the break was measured against
+      (``last_swing_high`` for ``+1``, ``last_swing_low`` for ``-1``), NaN without a
+      break.  The impulse gate (Э1'.5) and the strategy read the level from here
+      instead of re-deriving the structure.
 
     The break is always measured against a trailing swing, never against the swing
     of the current bar, so substituting a future candle cannot change past rows.
@@ -162,12 +166,14 @@ def structure_breaks(df: pd.DataFrame, cfg: StructureConfig | None = None) -> pd
     up = last_high < probe_up  # NaN levels compare False -> no break before a swing exists
     down = last_low > probe_down
     break_dir = np.where(up, 1, np.where(down, -1, 0)).astype(np.int8)
+    break_level = np.where(up, last_high, np.where(down, last_low, np.nan))
     events, trends = _run_trend_automaton(break_dir)
     return pd.DataFrame(
         {
             "break_dir": break_dir,
             "structure_event": pd.Series(events, index=df.index, dtype="object"),
             "trend": trends,
+            "break_level": break_level,
         },
         index=df.index,
     )

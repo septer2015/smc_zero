@@ -100,6 +100,44 @@ class StructureConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DisplacementConfig:
+    """Formal impulse (displacement) thresholds - spec п.7, conflict C3.
+
+    Prod never measured the impulse: its only relative threshold,
+    ``BOS_MIN_BREAK_PIP``, is a break *distance in pips*, not a body/ATR ratio, and
+    no ATR is computed in the prod sources.  These thresholds therefore have no prod
+    counterpart to compare against and are validated by tests plus mutation gates
+    (SPEC_SMC.md §7.5).  Defaults are inert: with ``atr_mult_min = 0``,
+    ``body_frac_min = 0`` and ``no_return_bars = 0`` the gate blocks nothing, so a
+    real run must set them explicitly.
+
+    * ``atr_period`` - Wilder ATR period the impulse leg is normalised by;
+    * ``atr_mult_min`` - minimum ``|close[c] - close[c - leg_bars]| / ATR[c]``;
+    * ``body_frac_min`` - minimum share of the leg range covered by candle bodies;
+    * ``no_return_bars`` - bars *after* the confirming bar during which no close may
+      come back beyond the broken level (``0`` = no waiting, the gate is known at the
+      confirming bar itself);
+    * ``leg_bars`` - length of the impulse leg in bars.
+    """
+
+    atr_period: int = 14
+    atr_mult_min: float = 0.0
+    body_frac_min: float = 0.0
+    no_return_bars: int = 0
+    leg_bars: int = 1
+
+    def __post_init__(self) -> None:
+        if self.atr_period < 1:
+            raise ValueError("atr_period must be >= 1")
+        if self.leg_bars < 1:
+            raise ValueError("leg_bars must be >= 1")
+        if self.no_return_bars < 0:
+            raise ValueError("no_return_bars must be >= 0")
+        if min(self.atr_mult_min, self.body_frac_min) < 0:
+            raise ValueError("atr_mult_min and body_frac_min must be >= 0")
+
+
+@dataclass(frozen=True, slots=True)
 class FVGConfig:
     """Three-candle fair value gap detection parameters (SPEC_SMC.md, п.8).
 

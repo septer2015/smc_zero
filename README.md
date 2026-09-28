@@ -38,4 +38,10 @@ one limit filled on the bar after its signal, the stop looked at before the targ
 list charged as spread/swap plus the profile's commission and slippage, the C7 margin gate asked
 with the running equity, and a ledger row for every intent that did not become a trade;
 `backtester/metrics.py` - the metric table; `backtester/reports.py` - the text summary and the
-trade-log export). Data files live in `./data/`, reports land in `./reports/`.
+trade-log export) and the walk-forward layer (`backtester/walkforward.py` - the out-of-sample split
+of one tape (Э6'): `split_walkforward` cuts anchored expanding folds by default and rolling ones
+with `anchored=False`, as positional views of the caller's frame, so a fold never shares a bar with
+its own train window; `aggregate_fold_metrics` reports the mean *and* the population sigma of the
+six headline metrics, and `run_walkforward` joins the folds to the Э5' engine with fixed costs and
+no optimization - fitting the parameters is Э7'). Data files live in `./data/`, reports land in
+`./reports/`.

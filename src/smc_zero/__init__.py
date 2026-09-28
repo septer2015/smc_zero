@@ -17,6 +17,7 @@ from smc_zero.config import (
     SessionConfig,
     StructureConfig,
     TimeframeConfig,
+    WalkForwardConfig,
 )
 
 __version__ = "0.1.0"
@@ -31,5 +32,6 @@ __all__ = [
     "SessionConfig",
     "StructureConfig",
     "TimeframeConfig",
+    "WalkForwardConfig",
     "__version__",
 ]

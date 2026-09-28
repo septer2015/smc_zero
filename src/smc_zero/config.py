@@ -730,3 +730,50 @@ class BacktestConfig:
             raise ValueError("pf_cap must be > 0")
         if self.sharpe_bars_per_day < 1:
             raise ValueError("sharpe_bars_per_day must be >= 1")
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardConfig:
+    """Walk-forward splitting of a tape: the fit window and the out-of-sample window (Э6').
+
+    A fold is a pair ``(train, test)`` of *adjacent* slices of one tape: ``train`` is the
+    information the optimizer of Э7' may look at, ``test`` the bars that are simulated with
+    the parameters it chose - the walk-forward of SPEC_SMC.md §7.10 never lets a fold see its
+    own future.  ``anchored`` picks between the two classic schemes:
+
+    * ``anchored=True`` (the default, an expanding window): ``train`` always starts at the
+      tape's first bar and grows by ``test_period_bars`` every fold, so the first fold's train
+      window is exactly ``min_train_bars`` bars long and the k-th one is
+      ``min_train_bars + k * test_period_bars``;
+    * ``anchored=False`` (a rolling window): ``train`` is a fixed ``train_period_bars`` window
+      that slides with the test window - it starts at ``test_start - train_period_bars``,
+      clipped at the tape's first bar, so the early folds of a tape carry a shorter warm-up
+      than ``train_period_bars``.
+
+    ``test_start`` is always the end of the train window and the test window is always
+    ``test_period_bars`` long, so the two windows never share a bar and the fold count of a
+    tape of ``n`` bars is ``max(0, (n - min_train_bars) // test_period_bars)`` - the same
+    number for both schemes, only the train window differs between them.
+
+    The defaults are the M15 units of the project (96 bars a day): a 60 day warm-up, a 20 day
+    out-of-sample window and a 120 day rolling window.  They cut the 100 111 M15 bars of
+    ``./data/EURUSD_M15.csv`` (4.1 years, 2022-08-15 .. 2026-09-22) into **49 folds** - a
+    fine-grained grid, *not* the 6-10 fold span the Э6' sketch expected from them: a 60 day
+    warm-up is 1.6 % of the tape, so the grid is set by ``test_period_bars``, and reaching
+    6-10 folds at a 20 day test window needs a warm-up of about 3.5 years.  The span is
+    therefore a decision about ``min_train_bars`` (SPEC_SMC.md §7.10 п.62 records the
+    arithmetic); the window lengths below stay as specified.
+    """
+
+    anchored: bool = True
+    test_period_bars: int = 96 * 20
+    min_train_bars: int = 96 * 60
+    train_period_bars: int = 96 * 120
+
+    def __post_init__(self) -> None:
+        if self.test_period_bars < 1:
+            raise ValueError("test_period_bars must be >= 1")
+        if self.min_train_bars < 1:
+            raise ValueError("min_train_bars must be >= 1")
+        if self.train_period_bars < 1:
+            raise ValueError("train_period_bars must be >= 1")

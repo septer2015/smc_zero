@@ -15,9 +15,11 @@ definition is pinned by tests and mutation gates only.
 * ``disp_body_frac`` = ``sum|close - open| / sum(high - low)`` over the leg bars
   ``(c - leg_bars + 1 .. c)`` - a zero leg range makes the condition false;
 * ``disp_close_beyond`` - the confirming bar closed beyond the broken level;
-* ``disp_no_fast_return`` - during ``no_return_bars`` bars after ``c`` no close came
-  back beyond the level; a close exactly *on* the level is not a return (so ``<=`` /
-  ``>=`` against the level);
+* ``disp_no_fast_return`` - no return event during the ``no_return_bars`` bars after ``c``
+  (§7.5 п.20): for an up break a return is a close *below* the broken level, for a down
+  break a close *above* it - continuing in the direction of the break is not a return.  A
+  close exactly *on* the level is not a return either (non-strict ``>=`` / ``<=`` against
+  the level);
 * ``disp_ok`` - all of the above.  **Unknown counts as false**: while the return
   window still reaches past the last bar of the frame the gate is not satisfied
   (``disp_known_at`` already points beyond the frame, so a consumer filtering on
@@ -88,26 +90,31 @@ def _no_fast_return(
     down_rows: np.ndarray,
     window: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (no close came back beyond the level, the return window has fully closed).
+    """Return (no return event happened, the return window has fully closed).
 
-    The window of an up break is ``c + 1 .. c + window`` and a close *above* the level
-    inside it is a return; a down break mirrors that with closes *below* the level.  A
-    window that reaches past the frame end is not mature, so it counts as "violated"
-    for :func:`displacement_gate` - an unknown gate must never look satisfied.
+    A *return event* (§7.5 п.20) is a close back beyond the broken level: for an up break
+    any close *below* the level ``L`` inside ``c + 1 .. c + window``, for a down break any
+    close *above* ``L``.  Continuing in the direction of the break is not a return, and a
+    close exactly on ``L`` is not a return either - so the window must stay ``>= L`` for an
+    up break and ``<= L`` for a down break (non-strict comparisons).  A window that reaches
+    past the frame end is not mature, so it counts as "returned" for
+    :func:`displacement_gate` - an unknown gate must never look satisfied.
     """
     n = close.size
     no_return = np.zeros(n, dtype=bool)
-    if window == 0:  # no waiting: nothing can violate and the gate is known at c
+    if window == 0:  # empty window: nothing can violate and the gate is known at c
         no_return[:] = True
         return no_return, np.ones(n, dtype=bool)
     series = pd.Series(close)
-    # rolling(window).max() at bar j covers j-window+1..j; shifting by -window lands on
-    # c and covers the future window c+1..c+window.
-    forward = series.rolling(window, min_periods=window).max().shift(-window).to_numpy()
-    mature = ~np.isnan(forward)
-    backward = series.rolling(window, min_periods=window).min().shift(-window).to_numpy()
-    no_return[up_rows] = mature[up_rows] & (forward[up_rows] <= level[up_rows])
-    no_return[down_rows] = mature[down_rows] & (backward[down_rows] >= level[down_rows])
+    rolling = series.rolling(window, min_periods=window)
+    # The rolling window at bar j covers j-window+1..j; shifting by -window lands on c, so at
+    # c these two series hold the low/high of the future window c+1..c+window.  Both are NaN
+    # while that window is not fully inside the frame.
+    window_low = rolling.min().shift(-window).to_numpy()
+    window_high = rolling.max().shift(-window).to_numpy()
+    mature = ~np.isnan(window_high)
+    no_return[up_rows] = mature[up_rows] & (window_low[up_rows] >= level[up_rows])
+    no_return[down_rows] = mature[down_rows] & (window_high[down_rows] <= level[down_rows])
     return no_return, mature
 
 

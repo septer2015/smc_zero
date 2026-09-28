@@ -3,13 +3,17 @@
 There is no prod oracle for this module (SPEC_SMC.md §7.5 п.14: prod never measured the
 impulse - ``BOS_MIN_BREAK_PIP`` is a break distance in pips and no ATR exists in the prod
 sources), so the definition is pinned by these tests plus the mutation gates of §7.5 п.19:
-``known_at = c`` without the lag must break test (d), an ATR that reads future bars must
-break test (e), and dropping the fast-return condition must break test (c).
+``known_at = c`` without the lag must break test (d) (m1), an ATR that reads future bars must
+break test (e) (m2), dropping the fast-return condition must break test (c) (m3), and
+inverting the direction of the rule (a return = *continuing* beyond the level) must break
+test (c) too (m4).
 
-The fast-return rule is taken verbatim from §7.5 п.15: inside the ``no_return_bars`` window
+The fast-return rule follows the ruling of §7.5 п.20: inside the ``no_return_bars`` window
 *after* the confirming bar ``c`` no close may come back *beyond* the broken level, i.e.
-``close > level`` for an up break and ``close < level`` for a down break, while a close
-exactly *on* the level is not a return (strict comparison).
+``close < level`` for an up break and ``close > level`` for a down break, while a close
+exactly *on* the level is not a return (non-strict comparison).  Continuing in the direction
+of the break is not a return - the pre-ruling literal reading of §7.5 п.15 said the
+opposite and is superseded.
 """
 
 from __future__ import annotations
@@ -78,37 +82,73 @@ def gate_cfg(**overrides: object) -> DisplacementConfig:
 
 
 # Break bars: row 1 breaks DOWN through 10.06 and row 3 breaks UP through 10.10 with a
-# 0.55 body inside a 0.65 range (the impulse); the bars after row 3 close at or below the
-# broken level.  ATR(3) of this frame is [nan, nan, 0.20, 0.35, ...], so row 3 measures
-# disp_atr = 0.55 / 0.35 and disp_body_frac = 0.55 / 0.65.
+# 0.55 body inside a 0.65 range (the impulse).  ATR(3) of this frame is [nan, nan, 0.20,
+# 0.35, ...], so row 3 measures disp_atr = 0.55 / 0.35 and disp_body_frac = 0.55 / 0.65.
+# Rows 4 and 5 keep closing *above* the broken 10.10 level: the impulse continues, so per
+# §7.5 п.20 there is no return event and the gate stays satisfied.
 IMPULSE_ROWS = [
     (10.00, 10.10, 9.90, 10.00),
     (10.00, 10.10, 9.90, 10.05),
     (10.05, 10.15, 9.95, 10.00),
     (10.00, 10.60, 9.95, 10.55),
-    (10.55, 10.60, 10.00, 10.05),
-    (10.05, 10.10, 9.95, 10.00),
+    (10.55, 10.60, 10.25, 10.30),
+    (10.30, 10.35, 10.20, 10.25),
     (10.00, 10.10, 9.95, 10.00),
     (10.00, 10.10, 9.90, 10.00),
 ]
 BREAK_DIRS = [0, -1, 0, 1, 0, 0, 0, 0]
 BREAK_LEVELS = [np.nan, 10.06, np.nan, 10.10, np.nan, np.nan, np.nan, np.nan]
 
-# Row 4 closes at 10.30, i.e. back beyond the broken 10.10 level, on the first bar of row
-# 3's return window: the case the "drop the fast-return condition" mutation must break.
+# Row 4 closes at 10.05, i.e. back *below* the broken 10.10 level, on the first bar of row
+# 3's return window: the return event the "drop the fast-return condition" (m3) and the
+# "invert the direction" (m4) mutations must break.
 RETURNED_ROWS = [
     *IMPULSE_ROWS[:4],
-    (10.55, 10.60, 10.25, 10.30),
-    (10.30, 10.35, 10.20, 10.25),
+    (10.55, 10.60, 10.00, 10.05),
+    (10.05, 10.10, 9.95, 10.00),
     *IMPULSE_ROWS[6:],
 ]
 
-# Row 4 closes exactly on 10.10: not a return (strict comparison), so the gate still holds.
+# Both window closes sit exactly on 10.10: not a return (non-strict comparison), so the gate
+# still holds.  A `>` / `<` against the level instead of `>=` / `<=` must break this fixture.
 TOUCHING_ROWS = [
     *IMPULSE_ROWS[:4],
     (10.55, 10.60, 10.05, 10.10),
-    (10.10, 10.15, 10.00, 10.05),
+    (10.10, 10.15, 10.10, 10.10),
     *IMPULSE_ROWS[6:],
+]
+
+# The same statuses for a DOWN break: DOWN_MIRROR_ROWS is IMPULSE_ROWS reflected around the
+# broken 10.10 level, which maps high<->low and leaves every true range - hence ATR, disp_atr
+# and disp_body_frac - identical, while row 3 becomes a down break.  Rows 4 and 5 keep
+# closing *below* the level (continuation, no return event).
+DOWN_MIRROR_ROWS = [
+    (10.20, 10.30, 10.10, 10.20),
+    (10.20, 10.30, 10.10, 10.15),
+    (10.15, 10.25, 10.05, 10.20),
+    (10.20, 10.25, 9.60, 9.65),
+    (9.65, 9.95, 9.60, 9.90),
+    (9.90, 10.00, 9.85, 9.95),
+    (10.20, 10.25, 10.10, 10.20),
+    (10.20, 10.30, 10.10, 10.20),
+]
+DOWN_BREAK_DIRS = [0, 0, 0, -1, 0, 0, 0, 0]
+DOWN_BREAK_LEVELS = [np.nan, np.nan, np.nan, 10.10, np.nan, np.nan, np.nan, np.nan]
+
+# Mirror of RETURNED_ROWS: row 4 closes at 10.15, back *above* the broken 10.10 level.
+DOWN_RETURNED_ROWS = [
+    *DOWN_MIRROR_ROWS[:4],
+    (9.65, 10.20, 9.60, 10.15),
+    (10.15, 10.25, 10.10, 10.20),
+    *DOWN_MIRROR_ROWS[6:],
+]
+
+# Mirror of TOUCHING_ROWS: both window closes sit exactly on the broken level.
+DOWN_TOUCHING_ROWS = [
+    *DOWN_MIRROR_ROWS[:4],
+    (9.65, 10.15, 9.60, 10.10),
+    (10.10, 10.10, 10.05, 10.10),
+    *DOWN_MIRROR_ROWS[6:],
 ]
 
 # Structure frames (as in tests/test_structure.py): an up break against the swing high
@@ -193,23 +233,62 @@ def test_leg_bars_widen_the_measured_leg() -> None:
 
 
 def test_fast_return_inside_the_window_blocks_the_gate() -> None:
-    """(c) The mutation "drop the fast-return condition" must break the ``returned`` case."""
+    """(c) A close back beyond the level is a return; m3 and m4 must break this."""
     frame = make_frame(IMPULSE_ROWS)
     breaks = make_breaks(frame.index, BREAK_DIRS, BREAK_LEVELS)
-    respected = displacement_gate(frame, breaks, gate_cfg())
-    assert respected["disp_no_fast_return"].iloc[3]
-    assert respected["disp_ok"].iloc[3]
+    continuation = displacement_gate(frame, breaks, gate_cfg())
+    # Closes 10.30 / 10.25 stay above the broken 10.10: the impulse continues, no return.
+    assert continuation["disp_no_fast_return"].iloc[3]
+    assert continuation["disp_ok"].iloc[3]
 
     returned = make_frame(RETURNED_ROWS)
     back = displacement_gate(
         returned, make_breaks(returned.index, BREAK_DIRS, BREAK_LEVELS), gate_cfg()
     )
-    assert not back["disp_no_fast_return"].iloc[3]
+    assert not back["disp_no_fast_return"].iloc[3]  # close 10.05 is below the level
     assert not back["disp_ok"].iloc[3]
 
     touching = make_frame(TOUCHING_ROWS)
     on_level = displacement_gate(
         touching, make_breaks(touching.index, BREAK_DIRS, BREAK_LEVELS), gate_cfg()
+    )
+    assert on_level["disp_no_fast_return"].iloc[3]  # exactly on the level is not a return
+    assert on_level["disp_ok"].iloc[3]
+
+    # A return window that runs past the last bar is not mature, and unknown counts as false
+    # even though every other condition of row 3 is satisfied.
+    cut = make_frame(IMPULSE_ROWS[:5])
+    immature = displacement_gate(
+        cut, make_breaks(cut.index, BREAK_DIRS[:5], BREAK_LEVELS[:5]), gate_cfg()
+    )
+    assert immature["disp_atr"].iloc[3] == pytest.approx(0.55 / 0.35)  # ATR itself is known
+    assert immature["disp_known_at"].iloc[3] == 5  # ... but c + no_return_bars leaves the frame
+    assert not immature["disp_no_fast_return"].iloc[3]
+    assert not immature["disp_ok"].iloc[3]
+
+
+def test_fast_return_mirrors_for_a_down_break() -> None:
+    """(c) The rule is symmetric: for a down break a close back *above* the level is a return."""
+    frame = make_frame(DOWN_MIRROR_ROWS)
+    breaks = make_breaks(frame.index, DOWN_BREAK_DIRS, DOWN_BREAK_LEVELS)
+    continuation = displacement_gate(frame, breaks, gate_cfg())
+    assert continuation["disp_close_beyond"].iloc[3]  # close 9.65 is below the 10.10 level
+    # The mirror keeps the impulse measurements of IMPULSE_ROWS, so only the direction differs.
+    assert continuation["disp_atr"].iloc[3] == pytest.approx(0.55 / 0.35)
+    assert continuation["disp_body_frac"].iloc[3] == pytest.approx(0.55 / 0.65)
+    assert continuation["disp_no_fast_return"].iloc[3]  # closes 9.90 / 9.95 stay below
+    assert continuation["disp_ok"].iloc[3]
+
+    returned = make_frame(DOWN_RETURNED_ROWS)
+    back = displacement_gate(
+        returned, make_breaks(returned.index, DOWN_BREAK_DIRS, DOWN_BREAK_LEVELS), gate_cfg()
+    )
+    assert not back["disp_no_fast_return"].iloc[3]  # close 10.15 is above the level
+    assert not back["disp_ok"].iloc[3]
+
+    touching = make_frame(DOWN_TOUCHING_ROWS)
+    on_level = displacement_gate(
+        touching, make_breaks(touching.index, DOWN_BREAK_DIRS, DOWN_BREAK_LEVELS), gate_cfg()
     )
     assert on_level["disp_no_fast_return"].iloc[3]  # exactly on the level is not a return
     assert on_level["disp_ok"].iloc[3]
@@ -255,11 +334,13 @@ def test_tampering_inside_the_return_window_becomes_visible_at_known_at() -> Non
     breaks = make_breaks(frame.index, BREAK_DIRS, BREAK_LEVELS)
     tampered_bar = 4  # the first bar of row 3's return window (c + 1 .. c + no_return_bars)
     mutated = frame.copy(deep=True)
+    # Close back *below* the broken 10.10 level: a return event inside the window, while row
+    # 3 itself (its OHLC and therefore ATR / disp_atr / disp_body_frac) is untouched.
     mutated.loc[mutated.index[tampered_bar], ["open", "high", "low", "close"]] = [
         10.55,
         10.60,
-        10.25,
-        10.30,
+        10.00,
+        10.05,
     ]
     base = displacement_gate(frame, breaks, gate_cfg())
     changed = displacement_gate(mutated, breaks, gate_cfg())
@@ -354,6 +435,12 @@ def test_gate_consumes_real_structure_breaks() -> None:
     assert gate["disp_known_at"].isna().tolist() == break_rows
     # Break rows 3, 4, 7 and 8 -> known_at = c + 2.
     assert gate["disp_known_at"].dropna().tolist() == [5, 6, 9, 10]
+    # Rows 3 and 4 break DOWN through 9.0 and their return window (bars 5, 6) closes back
+    # *above* that level (9.85 and 9.6): a return event, so the gate is off even though the
+    # impulse itself closed beyond the level.
+    assert gate["disp_close_beyond"].iloc[3] and gate["disp_close_beyond"].iloc[4]
+    assert gate["disp_no_fast_return"].iloc[3:5].tolist() == [False, False]
+    assert not gate["disp_ok"].iloc[3]
     # Rows 7 and 8 close beyond their level, but their return window reaches past the last
     # bar: unknown = false, while known_at already points past the frame.
     assert gate["disp_close_beyond"].iloc[7] and not gate["disp_ok"].iloc[7]

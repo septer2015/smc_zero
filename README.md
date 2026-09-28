@@ -32,6 +32,10 @@ ranges with their availability gates and fresh/broken lifecycle) and the strateg
 (`strategy/intents.py` - the M15 entry chain of SPEC_SMC.md §7.8 with `sweep -> CHoCH ->
 displacement -> FVG limit`, one intent per accepted setup and a rejection ledger;
 `strategy/take_profit.py` - the nearest visible liquidity level with the RR fallback;
-`strategy/risk_gate.py` - the C7 margin check and the risk percentage of a batch of intents).
-The backtester layer is still a documented stub: the engine, the costs and the equity curve
-arrive with Э5'. Data files live in `./data/`.
+`strategy/risk_gate.py` - the C7 margin check and the risk percentage of a batch of intents)
+and the backtester layer (`backtester/engine.py` - the event-driven engine of SPEC_SMC.md §7.9:
+one limit filled on the bar after its signal, the stop looked at before the target, the C6 price
+list charged as spread/swap plus the profile's commission and slippage, the C7 margin gate asked
+with the running equity, and a ledger row for every intent that did not become a trade;
+`backtester/metrics.py` - the metric table; `backtester/reports.py` - the text summary and the
+trade-log export). Data files live in `./data/`, reports land in `./reports/`.

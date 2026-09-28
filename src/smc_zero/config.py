@@ -59,6 +59,10 @@ Side: TypeAlias = Literal["long", "short"]
 # one of the sweep-midpoint branches (core.py lines 712-734).  The latter two are
 # deferred by SPEC_SMC.md §7.8 п.33 and raise from the strategy instead of guessing.
 EntryType: TypeAlias = Literal["fvg", "sweep50", "fvg_or_sweep50"]
+# The FX pairs of the Alfa-Forex price list (C6).  BTCUSD / ETHUSD carry no spread or
+# swap line there, and §5 п.9 (which symbols v1 trades) is still open, so v1 ships the
+# two pairs whose C6 profile is actually known.
+Symbol: TypeAlias = Literal["EURUSD", "GBPUSD"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,14 +598,135 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class InstrumentSpec:
+    """The Alfa-Forex price list of one symbol (C6): the costs the engine charges.
+
+    A row of prod's ``ALFAFOREX_SPECS`` as a dataclass (Э5', SPEC_SMC.md §7.9).
+    ``spread_pip`` is the round-trip spread of the price list, ``limit_stop_level_pip``
+    the broker's minimum distance between the market and a pending order,
+    ``swap_long_pip`` / ``swap_short_pip`` the overnight rates in *pips per night*
+    (negative = charged to the trader) and ``contract_size`` the units of one lot;
+    ``pip_size`` is the pip of the symbol (prod's ``PIP_SIZE``: 0.0001 for FX).
+
+    The helpers keep the FX arithmetic in one place: :attr:`spread_abs` and
+    :meth:`swap_abs` are price units (exactly what the engine multiplies by the lot with
+    :meth:`money`), and the lot itself comes from :class:`RiskConfig` - a price list does
+    not know the position size.  ``pip_size`` / ``contract_size`` are deliberately *also*
+    fields of that risk profile: C7 prices a stop in pips, C6 quotes a spread in pips, and
+    Э5' hands the instrument to the engine *beside* the risk profile instead of letting the
+    engine guess which copy it means (§7.9 keeps the duplication on the table until C6
+    replaces the C7 trio).
+    """
+
+    symbol: Symbol = "EURUSD"
+    pip_size: float = 0.0001
+    contract_size: float = 100_000.0
+    spread_pip: float = 1.4
+    limit_stop_level_pip: float = 0.7
+    swap_long_pip: float = -0.70
+    swap_short_pip: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.pip_size <= 0:
+            raise ValueError("pip_size must be > 0")
+        if self.contract_size <= 0:
+            raise ValueError("contract_size must be > 0")
+        if self.spread_pip < 0:
+            raise ValueError("spread_pip must be >= 0")
+        if self.limit_stop_level_pip < 0:
+            raise ValueError("limit_stop_level_pip must be >= 0")
+
+    @property
+    def spread_abs(self) -> float:
+        """The round-trip spread in price units (prod: ``spread_pip * pip_size``)."""
+        return self.spread_pip * self.pip_size
+
+    def swap_pip(self, side: Side) -> float:
+        """The overnight rate of ``side`` in pips per night (one leg of the pair)."""
+        return self.swap_long_pip if side == "long" else self.swap_short_pip
+
+    def swap_abs(self, side: Side, days_held: int) -> float:
+        """The overnight result of ``side`` in price units for ``days_held`` nights."""
+        return self.swap_pip(side) * days_held * self.pip_size
+
+    def money(self, move_abs: float, lot: float) -> float:
+        """Convert a price distance into account currency: ``move * contract * lot``."""
+        return move_abs * self.contract_size * lot
+
+
+#: The price-list rows v1 ships: the two FX pairs of prod's ``ALFAFOREX_SPECS``.
+ALFAFOREX_SPECS: dict[str, InstrumentSpec] = {
+    "EURUSD": InstrumentSpec(),
+    "GBPUSD": InstrumentSpec(
+        symbol="GBPUSD",
+        spread_pip=2.1,
+        limit_stop_level_pip=1.1,
+        swap_long_pip=-0.55,
+        swap_short_pip=-0.25,
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
 class BacktestConfig:
-    """Backtest wiring: capital, costs and the unclosed-tail protection."""
+    """Backtest wiring: capital, the order lifecycle and the unclosed-tail protection.
+
+    ``initial_capital`` is the *backtester's* capital (prod's 10000, SPEC_SMC.md §5 п.10)
+    and the denominator of ``return_pct``; ``RiskConfig.deposit`` (1000) is the C7
+    denominator of the reported ``risk_pct``.  The two are different questions - the
+    deposit prices a stop, the capital is what the equity curve starts from - and mixing
+    them is the C7 trap the metric layer guards against (§7.9).
+
+    The order lifecycle is prod's, one field per counter:
+
+    * ``limit_valid_bars`` - ``LIMIT_VALID_BARS = 10``: how many M15 bars a pending limit
+      stays alive after the signal bar (fills are searched from the *next* bar, never from
+      the signal bar itself);
+    * ``max_orders_day`` - prod's ``params["max_orders_day"]`` (diagnostic default 5): how
+      many orders the day may *place* (``0`` refuses every order) - prod's counter is spent by
+      a placement, not by a fill, and §7.9 records it;
+    * ``max_sl_per_day`` - ``MAX_SL_PER_DAY = 2``: after this many stops no new order is
+      placed for the rest of the day (prod's counter - its blocking branch is dead code,
+      see §7.9);
+    * ``force_close_eod`` - ``DEFAULT_FORCE_CLOSE_EOD = False``: close an open trade at the
+      last close of its MSK day instead of carrying it over the date change;
+    * ``max_bars_per_trade`` - prod's literal ``500`` inside ``simulate_trade_idx``: the
+      window in which SL/TP may resolve, after which the trade is dropped as
+      ``no_result``.
+
+    ``pf_cap`` (prod's ``PF_CAP = 5.0``) and ``sharpe_bars_per_day`` (prod scales the
+    bar-to-bar ratio by ``sqrt(96)`` - the M15 bars of a day) are the two metric constants
+    and live here so no reporting number is a literal.  ``risk`` / ``timeframes`` /
+    ``session`` are the profiles the engine reads, and ``drop_unclosed`` is the
+    constitution's protection: the still-forming tail of the tape is dropped before
+    anything is simulated (rule 2b).
+    """
 
     initial_capital: float = 10_000.0
+    limit_valid_bars: int = 10
+    max_orders_day: int = 5
+    max_sl_per_day: int = 2
+    force_close_eod: bool = False
+    max_bars_per_trade: int = 500
+    pf_cap: float = 5.0
+    sharpe_bars_per_day: int = 96
     drop_unclosed: bool = True
     risk: RiskConfig = field(default_factory=RiskConfig)
     timeframes: TimeframeConfig = field(default_factory=TimeframeConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
 
     def __post_init__(self) -> None:
         if self.initial_capital <= 0:
             raise ValueError("initial_capital must be > 0")
+        if self.limit_valid_bars < 0:
+            raise ValueError("limit_valid_bars must be >= 0")
+        if self.max_orders_day < 0:
+            raise ValueError("max_orders_day must be >= 0")
+        if self.max_sl_per_day < 0:
+            raise ValueError("max_sl_per_day must be >= 0")
+        if self.max_bars_per_trade < 1:
+            raise ValueError("max_bars_per_trade must be >= 1")
+        if self.pf_cap <= 0:
+            raise ValueError("pf_cap must be > 0")
+        if self.sharpe_bars_per_day < 1:
+            raise ValueError("sharpe_bars_per_day must be >= 1")

@@ -477,7 +477,9 @@ margin-check до ордера: `lot * contract_size * price / leverage <= free_
     `available_at <= t < broken_at`, `NaT` = живой бессрочно, отсутствие колонки = «не
     ломался». Отдельного состояния `breaker` в v1 нет: «после пробоя цена вернулась к
     уровню с другой стороны» и определение подтверждения ретеста (закрытие обратно за
-    уровень или касание тенью) — решение Э4'. Пробой тенью пробоем не считается (п.2
+    уровень или касание тенью) — решение Э4', и оно принято: ретест-ветка отложена за
+    v1, `StrategyConfig.setup_type = "breaker"` падает `NotImplementedError` (§7.8 п.33).
+    Пробой тенью пробоем не считается (п.2
     спеки: BOS/CHoCH и уровень — по закрытию), поэтому `broken_at` не может совпасть с
     `available_at` бара, где уровень лишь проколот.
 30. **Окна KZ на 2026-10-28 — вопрос закрыт: код и тесты окончательны.** Арифметика:
@@ -507,6 +509,226 @@ margin-check до ордера: `lot * contract_size * price / leverage <= free_
     красные (a) ×1 и (f) ×1 — «своя свеча не двигает свой PDH»; m4 «`idl_dyn` без лага
     `shift(1)`» → ровно (d) ×1; m5 «`broken_at` по `open_time` бара пробоя» → красные (e) ×2
     и (f) ×1.
+
+### 7.8 Слой стратегии (Э4') — объём v1, часы Альфы, TP и риск-гейты
+
+33. **Объём v1: свежие уровни, `mid`-вход, TP с RR-фолбэком.** Литералы
+    `SetupType` / `FVGEntryMode` / `TPMode` / `FVGSelect` объявлены целиком, но v1
+    реализует ровно по одному значению, и это значения прода: `setup_type = "fresh"`
+    (свежий уровень, `fresh_at` — единственный источник «жив ли уровень»),
+    `entry.edge = "mid"` (`DEFAULT_FVG_ENTRY_EDGE`), `take_profit.mode =
+    "liquidity_with_rr_fallback"` (дефолт C2), `fvg_select = "first"`
+    (`DEFAULT_FVG_SELECT`). Всё остальное *падает*, а не подменяется молча:
+    `"breaker"` → `build_intents`, `"distal"` → `entry_level` (Э2'),
+    `"liquidity"`/`"rr"` → `build_take_profit`, `"biggest"` → `build_intents`.
+    Отложены вместе с ними: equal-high/low кластеризация (`equal_tol`),
+    order-lifecycle прода (`MAX_ORDERS_PER_ENTRY`, `LIMIT_VALID_BARS`,
+    `MAX_SL_PER_DAY`, EOD-закрытие — Э5'), «reduced_risk» (Э7', §7.6 п.25).
+    Отдельного состояния «breaker/retest» у уровня нет — см. §7.7 п.29.
+    Кандидаты на вход v1 — только инстансы `static_levels` (Э3'). Динамические
+    `idl_dyn`/`idh_dyn` в проде *не* самостоятельные уровни: они создаются и
+    снимаются его BOS-машиной (`bos_levels`, имена `BOS_IDL`/`BOS_IDH`), которой
+    в v1 нет, поэтому слой стратегии не достраивает им семантику и не торгует
+    их; те же BOS-уровни — причина, по которой прод сужает полосу SL
+    (`max_sl_reversal_pip`, п.35) — тоже отложено. По той же логике фиксирован и
+    `entry_type` прода: v1 реализует `"fvg"` (`ENTRY_TYPE`), а `"sweep50"` /
+    `"fvg_or_sweep50"` (reference, стр. 712-734) требуют своего решения.
+34. **Часы торговли Альфы (C6) — внешний гейт, отдельно от KZ.** `ALFAFOREX_SPECS`
+    (reference, стр. 76–78): открытие 02:00 MSK, закрытие 23:55 MSK. Это числа из
+    прайс-листа, поэтому они живут в конфиге: `SessionConfig.session_open_msk =
+    (2, 0)`, `session_close_msk = (23, 55)` (обе пары валидируются: `0 <= hour <= 23`,
+    `0 <= minute <= 59`). `in_trading_hours` / `alfa_trading_mask`
+    (`indicators/sessions.py`) дают скаляр и маску: неделя открыта с 02:00 MSK
+    понедельника включительно по 23:55 MSK пятницы **исключительно** (граница
+    полуоткрыта `[open, close)`, пятничный 23:55 — уже закрытие), выходные закрыты
+    целиком. День недели и минута считаются в MSK (UTC+3 без сезонных переходов),
+    а не в UTC: 00:10 MSK субботы = 21:10 UTC пятницы — именно этот бар маска
+    обязана гасить, и на этом ловятся мутации m1/m2/m4 (п.39). Гейт внешний по
+    отношению к `in_killzone`: бар вне торговых часов не несёт сигнала вообще, бар
+    внутри часов ещё должен попасть в разрешённую KZ.
+35. **Цепочка входа — порядок гейтов и причины отказа.** `build_intents` идёт по
+    *инстансам уровней* (Э3': `static_levels`, п.33) и по каждому закрытому бару
+    M15. Гейты делятся на **барные** и **попыточные**: барные — часы Альфы
+    (`sessions.alfa_trading_mask`) и KZ (`sessions.in_killzone`) — отсекают бар
+    целиком и записей в леджере не оставляют (вне часов/сессии сигнала не
+    существует вовсе, а не «отклонён»); попытка же существует там и только там,
+    где найден свип (`liquidity.sweep_index`), поэтому каждый (бар, инстанс) с
+    найденным свипом даёт ровно одну запись в леджер (принятый интент или причина).
+    Порядок гейтов попытки (дешёвое раньше дорогого): (1) `level_not_available`
+    (`t < available_at`: цена уровня ещё не факт) → (2) `level_broken`
+    (`fresh_at` ложно по `broken_at`) → (3) `level_used_today` (кэп п.38) →
+    (4) `bias_skip` (сторона против `bias_dir`, только закрытые HTF) →
+    (5) `stale_signal` (`i - sweep_bar > signal_max_age_bars`) → (6)
+    `choch_not_found` (`CHOCH_WAIT_BARS = 20` *от бара свипа вперёд*, прод
+    допускает CHoCH и на текущем баре) → (7) `displacement_skip` (импульс
+    пробоя-CHoCH, `impulse.py`; §7.5, п.40) → (8) `fvg_not_ready`
+    (`i - choch_idx < 2`, прод) → (9) `fvg_not_found` (первый гэп шириной
+    `>= min_fvg_pip * pip_size` в окне `(choch_bar, choch_bar + fvg_lookback]`, не позже
+    `i - 1`) → (10) `fvg_too_old` (`i - fvg_bar > max_fvg_age_bars`) → (11)
+    `wrong_side_limit` (вход обязан быть не ближе `limit_stop_pip = 0.7` к закрытию бара
+    сигнала) → (12) геометрия SL → (13) `min_sl_skip` → (14) `spread_pct_skip` → (15)
+    `limit_stop_violation` (последний прод-«дубль» той же дистанции). Порядок
+    11-15 — прод (`try_open_trade`, reference, стр. 739-804), а не выдуманный:
+    прод проверяет сторону лимитника *до* полосы SL. Порядок (1)-(4) — тоже прод, и это
+    решение R5 Э4'.1: `level_*` отвечают раньше `bias_skip`, леджер — единственное место,
+    где порядок виден (принимаемые интенты конъюнктивной цепочки от него не зависят), а
+    гейт (7) вставлен после bias и CHoCH, перед FVG-гейтами: `disp_*` определены только на
+    барах пробоя структуры, до найденного CHoCH проверять нечего.
+    Сетка ТФ как в конституции: M15 даёт sweep→CHoCH→FVG, H1/D1 — bias, PDH/PDL и
+    сессии; отдельных «H1-фильтров» в слое стратегии нет, H1-зона/OB выражаются
+    уровнем (`LevelConfig`). Семантика сигнала портирована, а не изобретена:
+    поиск свипа — `liquidity.sweep_index` (Э1'.4, ровно порт `find_sweep_arr`,
+    самый *экстремальный* бар окна, окно включает текущий бар), возраст сигнала —
+    `DEFAULT_SIGNAL_MAX_AGE_BARS = 60`, окно CHoCH — `CHOCH_WAIT_BARS = 20`, FVG —
+    `fvg_lookback = 20` после CHoCH и `max_fvg_age_bars = 12`, вход —
+    `entry_level(..., "mid")` (`DEFAULT_FVG_ENTRY_EDGE`), SL — за экстремум свипа
+    (`sl_buffer_pip = 5`) с прод-фолбэком на край FVG (`sl_fvg = край + buffer`),
+    когда `|entry - sl_source| < min_sl_realistic_pip = 20`: полоса SL 20–60
+    пипсов проверяется *после* фолбэка, и вне полосы интент не выходит —
+    `sl_rejected_all` (ни источник, ни край FVG не в полосе) либо
+    `sl_rejected_wide` (источник шире 60). Ниже `min_sl_pip = 5` — `min_sl_skip`.
+    Две дальнейшие проверки прода (`min_sl_realistic_skip`,
+    `max_sl_realistic_skip`, reference, стр. 789-795) в v1 не пишутся: после этой
+    развилки `sl_size` уже внутри полосы по построению, то есть в проде это
+    мёртвые ветки, а мёртвый код нельзя покрыть тестом. `min_sl_skip` остаётся и
+    достижим конфигом (`min_sl_pip > min_sl_realistic_pip`), при дефолтах нет.
+    `stale_signal` при дефолтах (`sweep_lookback = 48 < 60`) недостижим: окно
+    свипа само ограничивает возраст 48 барами — в проде гейт работал благодаря
+    машине состояний (`pending_sweeps`), которой в v1 нет; гейт хранится как
+    защита нестандартного конфига (`signal_max_age_bars < sweep_lookback`), и тест
+    задаёт такой конфиг. Спред-гейт прод (`DEFAULT_MAX_SPREAD_PCT_OF_SL = 0.12`,
+    спред не больше 12% SL) сохранён как `StrategyConfig.max_spread_pct_of_sl` и
+    работает от `RiskConfig.spread`; пока тот равен нулю (дефолт Э3'), гейт
+    выключен — включится вместе с `BrokerSpec`/издержками (C6, Э5'), где спред
+    EURUSD = 1.4 пипса. `effective_max_sl` прод сужает до `max_sl_reversal_pip`
+    для BOS-уровней; они вне v1 (п.33), поэтому полоса одна — 20–60.
+
+    Две реализации детали, без которых цепочка неоднозначна. **Дубликаты цен.**
+    Внутри бара инстансы с одинаковой ценой и стороной гасятся прод-таблицей
+    приоритетов (`LEVEL_PRIORITY`: PDH/PDL → PWH/PWL → PMH/PML → Asian → London →
+    NY), как `deduplicate_levels` в проде: иначе один и тот же свип дал бы две
+    заявки одной ценой. **Жизнь инстанса.** Инстанс активен на окне
+    `[available_at, min(broken_at, available_at следующего инстанса с тем же
+    именем))`: прод пересобирает свой список уровней на каждый день и держит
+    только текущий (сегодняшние PDH/PDL, PWH текущей недели и т.д.), Э3' отдаёт
+    «свежесть» через `fresh_at`, а замену преемником надо добавить — иначе
+    прошлогодний PWH остался бы активным навсегда. Свип-поиск вызывается только
+    когда окно `sweep_lookback + 1` бар вообще пробивало уровень (роллинг
+    max/min) — это чистая оптимизация, `sweep_index` остаётся единственной
+    реализацией правила.
+36. **TP (C2).** Прод считает TP только от RR (reference, стр. 783), спека требует
+    противоположную ликвидность, поэтому v1 = «уровень, иначе RR»:
+    `take_profit.take_profit_for(entry, sl, side, book, t, cfg: TPConfig)` берёт *ближайший
+    по цене* противоположный уровень из книги (`available_at <= t`, лонг → уровни выше
+    входа, шорт → ниже), пропускает уровни ближе `min_tp_rr = 1.0` по RR и падает в
+    прод-формулу `entry ∓ sl_size * rr_fallback` (`rr_fallback = 2.0`), когда
+    подходящего уровня нет. Уровни дальше `min_tp_rr` берутся как есть: спека п.9
+    хочет уровень, а не кратность. Фильтр «известен ДО входа» — обязательный
+    тест на утечку (C2 п.2): уровень с `available_at > t` не может стать TP
+    (`test_a_level_that_is_not_a_fact_yet_is_not_a_target`; мутация «игнор `available_at`»
+    краснит его и `test_a_target_invisible_at_the_entry_bar_is_not_used`).
+    Источник TP помечается в интенте (`TPSource`), чтобы отчёт отличал цель по
+    ликвидности от фолбэка. Скалярное правило — единственная реализация: цепочка зовёт его
+    напрямую, а батч-обёртка `build_take_profit(intents_df, levels_df, cfg)` (п.41) — тот же
+    вызов по строкам кадра; строгие режимы `"liquidity"` / `"rr"` падают из этого модуля
+    (п.33).
+
+37. **Риск-гейты (C7) — последний барьер, перед самой заявкой.** `risk_gate.check_intent`
+    вызывается с *текущим* equity (аргумент, не константа), а процент риска считается от
+    `RiskConfig.deposit = 1000` — решение R2 Э4'.1: (1) margin:
+    `lot * contract_size * price / leverage <= equity` — иначе отказ `no_margin` (C7, ровно
+    эта формула, `price` — цена входа лимитника); (2) риск сделки
+    `sl_pips * pip_size * contract_size * lot` в процентах от `cfg.deposit` — при
+    `> RiskConfig.warning_risk_pct = 2.0` интент *проходит* с флагом `risk_warning` (C7: лот
+    задан явно, «без запроса не трогаем»), а медиану риска печатает отчёт Э5'. Имена отказа и
+    флага — из черновика, они не переименовывались (R3). FX-трио (`pip_size`,
+    `contract_size`, `deposit`) живёт в `RiskConfig` — это одна копия брокерских чисел, поэтому
+    `apply_risk_gate(intents, cfg: RiskConfig, current_equity)` (п.41) считает и маржу, и риск из
+    одного объекта; `StrategyConfig.pip_size` — read-only свойство к тому же числу, второго
+    значения в стратегии нет. `BacktestConfig.initial_capital` (10 000; вопрос §5 п.10)
+    остаётся капиталом бэктестера: маржа меряется от переданного equity, `risk_pct` — от
+    депозита 1000, то есть два числа отвечают на два разных вопроса, пока §5 п.10 не отвечен.
+    `risk_pct` в v1 по-прежнему не сайзинг: лот берётся из `RiskConfig.lot`, а не выводится
+    из процента (конституция п.4 требует сайзинг по риску в бэктесте; процентный лот
+    `equity * risk_pct / (sl * contract_size)` — отдельное решение, здесь не реализован).
+38. **Один сетап на уровень в день и леджер отказов.** v1 заменяет прод-счётчики
+    (`MAX_USES_PER_LEVEL = 2` считал использования *цены*) на
+    `max_setups_per_level_per_day = 1` для *инстанса* уровня, то есть ключ кэпа —
+    `(имя, дата)` инстанса из `LevelConfig`: после первого принятого интента этот
+    инстанс новых не даёт (`level_used_today`). Отдельной «MSK-даты бара» не
+    нужно: инстанс по построению живёт внутри своего периода (Э3' датирует
+    инстансы календарём UTC, как и свечи данных), а его жизнь и так ограничена
+    заменой преемником (п.35). Каждая отклонённая попытка попадает в леджер
+    (`rejections` из `build_intents`) с колонками «бар, open_time, имя уровня,
+    дата, цена, сторона (long/short), причина»; причины — имена гейтов п.35.
+    Леджер — тестовая поверхность: тесты бьют по причинам, а не по отсутствию
+    сделки, поэтому молчаливый отказ без записи считается дефектом.
+39. **Мутации-гейты Э4'.0 (часы Альфы)** (`tests/test_sessions.py`, 75 тестов:
+    16 функций KZ + 8 функций торговых часов; пробой скриптом, исходник
+    восстанавливается): m1 «пятничное закрытие не
+    проверяется» → красные `test_trading_hours_open_monday_close_friday` и
+    `test_mask_follows_the_configured_boundaries` (2); m2 «суббота торгуется»
+    (`weekday <= 5`) → красные `test_weekend_is_closed` ×4; m3 «нижняя граница
+    понедельника снята» → те же 2, что в m1; m4 «день недели берётся из UTC-штампа,
+    а не из MSK» → 4 упавших, включая `test_midweek_hours_are_open[0]`
+    (понедельник 21:00 UTC = вторник 00:00 MSK). Тест-паритет маски и скаляра
+    (`test_mask_agrees_with_the_scalar_gate_over_a_whole_week`) эти мутации не
+    ловит по построению (обе стороны меняются синхронно) и нужен как защита от
+    расхождения двух API, а не от неверного правила.
+
+
+40. **Дисплейсмент-гейт (Э4'.1, решение R1).** У прода такого гейта не было — `impulse.py`
+    (§7.5) писался без пар-источника, — поэтому это единственный гейт цепочки, чья семантика в
+    ТЗ держится тестами и мутациями, а не продом. Место — (7), после `choch_not_found` и до
+    FVG-гейтов: `disp_*` известны только на барах пробоя структуры, до найденного CHoCH
+    проверять нечего. Правило: на баре решения `i` берётся бар подтверждения `c = choch_bar` и
+    читается `disp_ok[c] & (disp_known_at[c] <= i)` — «импульс формально есть» и «это уже факт
+    на момент решения»; окно `no_return_bars` (§7.5 п.20) поэтому не читается раньше своего
+    закрытия, и вердикт бара, попавшего внутрь окна, — `displacement_skip`.
+    `StrategyConfig.use_displacement = False` выключает гейт целиком (дефолт — включён),
+    `StrategyConfig.displacement` несёт `DisplacementConfig`. Дефолты `DisplacementConfig`
+    инертны по построению (§7.5), то есть при дефолтном конфиге гейт пропускает всё, у чего
+    есть ATR: реальный прогон обязан задать пороги (`atr_mult_min` / `body_frac_min` /
+    `no_return_bars`) явно. Следствие той же инертности: `disp_atr` считается от Wilder ATR, а
+    «неизвестно = ложь», поэтому пробой раньше, чем в кадре набралось `atr_period` бар, гейт не
+    пропускает. Мутации (пробой скриптом, исходник восстанавливается, порядок как в п.39):
+    m1 «гейт всегда пропускает» → красные 5
+    (`test_every_gate_rejects_with_its_own_reason[displacement_skip]`,
+    `test_a_weak_impulse_does_not_displace`,
+    `test_the_pullback_after_the_choch_voids_the_impulse`,
+    `test_the_impulse_is_read_only_once_its_window_has_closed`,
+    `test_a_future_bar_cannot_make_the_impulse_known_earlier`); m2 «`disp_ok` читается без
+    `disp_known_at`» → красные 2 — последние два из списка m1: leak-тест «вердикт бара 29 не
+    двигается закрытием бара 30» без `disp_known_at` падает.
+41. **Публичный batch-API слоя стратегии (Э4'.1, решение R4).** Валютой слоя остаётся
+    `EntryChain(intents: tuple[TradeIntent, ...], rejections: DataFrame)` — на ней стоят тесты
+    Э4'.0, и перевод её на DataFrame означал бы переписать зелёный слой; DataFrame — это
+    *батч-форма*: `base.intents_frame` / `base.intents_from_frame` (колонки = поля
+    `TradeIntent`, `open_time` нормализуется в UTC тем же `base.utc_stamps`, отсутствующая
+    колонка — жёсткая ошибка). Обёртки: `take_profit.build_take_profit(intents_df, levels_df,
+    cfg: TPConfig) -> DataFrame` перезаписывает `tp` / `tp_source` / `rr`;
+    `risk_gate.apply_risk_gate(intents_df, cfg: RiskConfig, current_equity) -> (kept, ledger)`
+    добавляет `risk_pct` / `risk_warning` прошедшим и складывает отказы в отдельный леджер
+    (`bar, open_time, level_name, side, entry, required_margin, equity, risk_pct, risk_warning,
+    reason`) — молчаливых отказов нет и здесь. Обе обёртки тонкие: они зовут скалярные правила
+    (`take_profit.take_profit_for`, `risk_gate.check_intent`), поэтому у каждого правила одна
+    реализация, а паритет «обёртка = скаляр = то, что построила цепочка» пинуют
+    `tests/test_take_profit.py`, `tests/test_risk_gate.py` и
+    `test_the_chain_feeds_the_take_profit_and_the_risk_gate`. Мутации-гейты Э4'.1 (R1 — п.40):
+    R2 m1 «знаменатель `risk_pct` = текущий equity» → красные 3
+    (`test_the_margin_of_a_tenth_lot_eurusd_is_two_hundred_seventy_dollars`,
+    `test_the_risk_percentage_is_measured_against_the_deposit`,
+    `test_the_chain_feeds_the_take_profit_and_the_risk_gate`); R2 m2 «хардкод 10 000» → красные 6
+    (те же плюс `test_the_warning_threshold_is_strict`, `test_a_flagged_intent_is_still_placed`,
+    `test_the_batch_wrapper_splits_the_intents_and_the_ledger`); TP m1 «игнор `available_at`» →
+    красные 2 (`test_a_level_that_is_not_a_fact_yet_is_not_a_target`,
+    `test_a_target_invisible_at_the_entry_bar_is_not_used`); TP m2 «игнор `min_tp_rr`» →
+    красные 3 (`test_a_target_under_the_rr_floor_is_skipped_for_the_next_one`,
+    `test_the_rr_fallback_is_prod_multiple_when_no_level_clears`,
+    `test_a_target_under_the_rr_floor_falls_back_to_the_multiple`). Итог слоя: `ruff check` чист,
+    `pytest` 277 passed (было 247; +30 тестов Э4'.1), дерево после мутаций восстановлено
+    побайтово (сверяется `diff`).
+
 
 ### 7.3 Прочее, перенесённое в v1 без изменений
 

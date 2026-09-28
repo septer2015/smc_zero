@@ -40,6 +40,7 @@ SOURCE_TIME_COLUMN = "datetime"
 TIMEFRAME_PERIODS: dict[str, pd.Timedelta] = {
     "M15": pd.Timedelta(minutes=15),
     "H1": pd.Timedelta(hours=1),
+    "H4": pd.Timedelta(hours=4),
     "D1": pd.Timedelta(days=1),
 }
 
@@ -271,6 +272,30 @@ def resample_to_timeframe(src_df: pd.DataFrame, target: str) -> pd.DataFrame:
     return aggregated.reset_index()
 
 
+def _extra_column_names(
+    htf_df: pd.DataFrame,
+    extra_columns: tuple[str, ...],
+    suffix: str,
+) -> dict[str, str]:
+    """Map the requested ``extra_columns`` of an HTF frame onto their suffixed names.
+
+    ``merge_asof`` suffixes only the names present in *both* frames, so an HTF-only
+    column (``trend``) would keep its bare name and silently escape the suffix
+    contract.  Renaming the HTF copy up front makes the merged name depend on
+    ``suffix`` alone, whatever the LTF frame happens to carry.
+    """
+    if extra_columns and not suffix:
+        raise ValueError("extra_columns needs a non-empty HTF suffix")
+    names: dict[str, str] = {}
+    for column in extra_columns:
+        if column not in htf_df.columns:
+            raise ValueError(f"htf_df has no extra column {column!r}")
+        if column in names:
+            raise ValueError(f"duplicate extra column {column!r}")
+        names[column] = f"{column}{suffix}"
+    return names
+
+
 def align_htf_to_ltf(
     ltf_df: pd.DataFrame,
     htf_df: pd.DataFrame,
@@ -280,6 +305,7 @@ def align_htf_to_ltf(
     ltf_key: str = "open",
     ltf_period: pd.Timedelta | str | None = None,
     suffixes: tuple[str, str] = ("", "_htf"),
+    extra_columns: tuple[str, ...] = (),
     drop_unclosed: bool = True,
 ) -> pd.DataFrame:
     """Attach the most recent *closed* HTF bar to every LTF bar.
@@ -294,11 +320,22 @@ def align_htf_to_ltf(
     and most conservative - an M15 bar starting at 15:00 sees the H1 bar that
     closed at 15:00 or earlier) or ``"close"`` (the HTF bar closing exactly at
     the LTF bar's own close is visible too).
+
+    ``extra_columns`` lists HTF columns beyond OHLCV that must be carried along
+    (e.g. ``("trend",)`` for the bias).  They travel through the very same
+    ``close_time`` merge, so an extra value of an HTF bar that is still open stays
+    invisible until that bar closes, and it appears as ``<column><htf suffix>``
+    regardless of whether the LTF frame owns that name.
     """
     left = ltf_df.copy()
     right = htf_df.copy()
     if TIMESTAMP_COLUMN not in left.columns or TIMESTAMP_COLUMN not in right.columns:
         raise ValueError("align_htf_to_ltf expects a 'timestamp' column in both frames")
+    extra_names = _extra_column_names(right, extra_columns, suffixes[1])
+    clashing = [name for name in extra_names.values() if name in left.columns]
+    if clashing:
+        raise ValueError(f"ltf_df already has {clashing}: pick another suffix for extra_columns")
+    right = right.rename(columns=extra_names)
     left[TIMESTAMP_COLUMN] = _to_utc(left[TIMESTAMP_COLUMN])
     right[TIMESTAMP_COLUMN] = _to_utc(right[TIMESTAMP_COLUMN])
 

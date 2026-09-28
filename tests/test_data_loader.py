@@ -266,6 +266,77 @@ def test_align_htf_to_ltf_drops_flagged_unclosed_htf_bar() -> None:
     assert aligned["timestamp_htf"].max() == htf[TIMESTAMP_COLUMN].iloc[-2]
 
 
+# Extra HTF columns travel through the same close_time stitch as the OHLCV columns,
+# so they are tested with the same tamper-over-positions pattern.  ``CORRUPTED_MARKER``
+# is a value no HTF bar ever carries, so a leak cannot hide behind a coincidence.
+EXTRA_COLUMN = "trend"
+EXTRA_SUFFIX = "_h1"
+CORRUPTED_MARKER = -1.0
+
+
+@pytest.mark.parametrize(
+    "corrupted_index",
+    CORRUPTED_HTF_BAR_INDICES,
+    ids=("last", "middle", "early"),
+)
+def test_align_extra_column_of_an_open_htf_bar_stays_invisible(corrupted_index: int) -> None:
+    ltf = _frame("2022-01-03 00:00", periods=LTF_BARS, freq="15min")
+    htf = _frame("2022-01-03 00:00", periods=HTF_BARS, freq="1h")
+    htf[EXTRA_COLUMN] = np.arange(HTF_BARS, dtype="float64")
+    attached = f"{EXTRA_COLUMN}{EXTRA_SUFFIX}"
+
+    kwargs = {
+        "htf_period": "H1",
+        "suffixes": ("", EXTRA_SUFFIX),
+        "extra_columns": (EXTRA_COLUMN,),
+    }
+    aligned = align_htf_to_ltf(ltf, htf, **kwargs)
+
+    corrupted = htf.copy()
+    corrupted.loc[corrupted.index[corrupted_index], EXTRA_COLUMN] = CORRUPTED_MARKER
+    aligned_corrupted = align_htf_to_ltf(ltf, corrupted, **kwargs)
+
+    bar_open = htf[TIMESTAMP_COLUMN].iloc[corrupted_index]
+    bar_close = bar_open + MTF_PERIOD
+    before = aligned[TIMESTAMP_COLUMN] < bar_close
+    window = (aligned[TIMESTAMP_COLUMN] >= bar_close) & (
+        aligned[TIMESTAMP_COLUMN] < bar_close + MTF_PERIOD
+    )
+    # both sides must be exercised, otherwise the test proves nothing
+    assert bool(before.any()) and bool(window.any())
+
+    # the extra value of an HTF bar that is still open is invisible before its close
+    assert not bool(aligned_corrupted.loc[before, attached].eq(CORRUPTED_MARKER).any())
+    # and it is exactly the attached bar inside its own visibility window
+    assert bool(aligned_corrupted.loc[window, attached].eq(CORRUPTED_MARKER).all())
+    assert bool(aligned.loc[window, attached].eq(corrupted_index).all())
+    assert bool(aligned.loc[window, f"timestamp{EXTRA_SUFFIX}"].eq(bar_open).all())
+
+
+def test_align_htf_to_ltf_rejects_broken_extra_columns() -> None:
+    ltf = _frame("2022-01-03 00:00", periods=LTF_BARS, freq="15min")
+    htf = _frame("2022-01-03 00:00", periods=HTF_BARS, freq="1h")
+    htf[EXTRA_COLUMN] = np.arange(HTF_BARS, dtype="float64")
+
+    with pytest.raises(ValueError, match="no extra column"):
+        align_htf_to_ltf(ltf, htf, htf_period="H1", extra_columns=("missing",))
+    with pytest.raises(ValueError, match="non-empty HTF suffix"):
+        align_htf_to_ltf(ltf, htf, htf_period="H1", suffixes=("", ""), extra_columns=("trend",))
+    with pytest.raises(ValueError, match="duplicate extra column"):
+        align_htf_to_ltf(ltf, htf, htf_period="H1", extra_columns=("trend", "trend"))
+    # an LTF frame owning the suffixed name would make merge_asof suffix both copies
+    # and the requested column would silently vanish, so it is refused up front
+    busy = ltf.assign(**{f"{EXTRA_COLUMN}{EXTRA_SUFFIX}": 0.0})
+    with pytest.raises(ValueError, match="already has"):
+        align_htf_to_ltf(
+            busy,
+            htf,
+            htf_period="H1",
+            suffixes=("", EXTRA_SUFFIX),
+            extra_columns=(EXTRA_COLUMN,),
+        )
+
+
 def test_resample_to_timeframe_is_left_labelled_and_interval_local() -> None:
     ltf = _frame("2022-01-03 00:00", periods=12, freq="15min")
 

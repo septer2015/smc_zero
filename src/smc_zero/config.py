@@ -13,13 +13,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
-# Timeframes supported by the pipeline: M15 entry, H1 structure, D1 bias.
-Timeframe: TypeAlias = Literal["M15", "H1", "D1"]
+# Timeframes supported by the pipeline: M15 entry, H1 structure, H4/D1 bias.
+Timeframe: TypeAlias = Literal["M15", "H1", "H4", "D1"]
 Confirmation: TypeAlias = Literal["close", "wick"]
 SweepMode: TypeAlias = Literal["wick_close_inside", "wick_only"]
 Season: TypeAlias = Literal["summer", "winter"]
 Killzone: TypeAlias = Literal["prelondon", "london", "ny"]
 BreakEvent: TypeAlias = Literal["bos", "choch"]
+# What ``bias_dir`` does when the bias timeframes disagree: ``no_trade`` zeroes it,
+# ``reduced_risk`` is a deferred decision (SPEC_SMC.md §7.6) and is not implemented
+# by v1 - :func:`smc_zero.indicators.bias.bias_frames` raises for it.
+ConflictPolicy: TypeAlias = Literal["no_trade", "reduced_risk"]
+# Per-bar verdict of the multi-timeframe bias: all timeframes agree long / short,
+# they disagree (``conflict``) or at least one of them has no trend yet (``undefined``).
+BiasState: TypeAlias = Literal["agree_long", "agree_short", "conflict", "undefined"]
 # Where a limit order sits inside an entry gap: ``proximal`` = the edge price
 # reaches first (top of a bullish gap, bottom of a bearish one), ``mid`` = centre.
 FVGEntryMode: TypeAlias = Literal["proximal", "mid"]
@@ -29,7 +36,11 @@ HourWindow: TypeAlias = tuple[int, int]
 
 @dataclass(frozen=True, slots=True)
 class TimeframeConfig:
-    """Working timeframe hierarchy (M5 and H4 are deliberately absent)."""
+    """Working timeframe hierarchy (M5 is deliberately absent).
+
+    ``htf`` stays ``"D1"`` for the global bias context; the full bias hierarchy is
+    ``BiasConfig.timeframes`` (H1 + H4 + D1, SPEC_SMC.md C5).
+    """
 
     ltf: Timeframe = "M15"
     mtf: Timeframe = "H1"
@@ -97,6 +108,41 @@ class StructureConfig:
     def __post_init__(self) -> None:
         if self.swing_lookback < 1:
             raise ValueError("swing_lookback must be >= 1")
+
+
+@dataclass(frozen=True, slots=True)
+class BiasConfig:
+    """Multi-timeframe bias hierarchy and its conflict policy (SPEC_SMC.md, C5).
+
+    ``timeframes`` lists the frames whose *closed* trends have to agree; the bias
+    direction is only non-zero when every single one of them points the same way,
+    so a longer list is strictly more conservative.  Unanimity is the owner ruling
+    for v1 (SPEC_SMC.md §7.6 п.24): a 2-1 split is a conflict, not a majority
+    direction, and an undefined trend outranks a conflict.  A ``majority`` mode is
+    deferred to Э7' (``BiasConfig.agreement``, §7.6 п.25) and is not implemented.
+    The tuple is also the order in which the trend columns are attached
+    (``trend_h1``, ``trend_h4``, ``trend_d1``) and must therefore be non-empty and
+    duplicate free.
+
+    ``on_conflict`` decides what ``bias_dir`` does when the timeframes disagree:
+    ``no_trade`` (default, the conservative SMC ruling) forces ``bias_dir = 0`` while
+    ``bias_state`` still reports ``"conflict"``; ``reduced_risk`` awaits a decision
+    about what "reduced" means (lot fraction or a wider SL) and raises
+    ``NotImplementedError`` from the indicator instead of guessing.
+
+    ``structure`` is the swing / BOS / CHoCH configuration used to derive the trend
+    of every HTF frame, so the bias layer never falls back on a hidden default.
+    """
+
+    timeframes: tuple[Timeframe, ...] = ("H1", "H4", "D1")
+    on_conflict: ConflictPolicy = "no_trade"
+    structure: StructureConfig = field(default_factory=StructureConfig)
+
+    def __post_init__(self) -> None:
+        if not self.timeframes:
+            raise ValueError("timeframes must not be empty")
+        if len(set(self.timeframes)) != len(self.timeframes):
+            raise ValueError(f"timeframes must be unique, got {self.timeframes}")
 
 
 @dataclass(frozen=True, slots=True)

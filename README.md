@@ -2,8 +2,9 @@
 
 SMC backtest foundation with a strict three-timeframe hierarchy: **D1** = global bias, PDH/PDL
 and major order blocks; **H1** = working structure (BOS/CHoCH), premium/discount and sessions;
-**M15** = entry zone (sweep -> CHoCH -> entry into an M15 FVG/OB inside the H1 zone). M5 and H4
-are intentionally not used.
+**M15** = entry zone (sweep -> CHoCH -> entry into an M15 FVG/OB inside the H1 zone). M5 is
+intentionally not used. **H4** takes part in the HTF bias only: `BiasConfig.timeframes` defaults
+to `("H1", "H4", "D1")` (SPEC_SMC.md C5), and H4 is never an entry timeframe.
 
 Time convention: the `datetime` column in `./data/*.csv` (M15/H1/D1) is an **open_time** stamp
 (UTC-naive, localized to UTC), so `close_time = timestamp + bar period`. The last bar of every
@@ -23,5 +24,8 @@ ruff check .
 pytest
 ```
 
-SMC indicator/strategy logic is not implemented yet - see the documented stubs under
-`src/smc_zero/indicators`, `strategy`, `backtester` and `utils`. Data files live in `./data/`.
+Implemented so far: the data layer (`data_loader.py`: open_time convention, closed-bar
+HTF -> LTF stitching) and the indicator layer (`indicators/structure.py` swings and BOS/CHoCH,
+`fvg.py`, `liquidity.py` sweeps, `impulse.py` displacement gate, `sessions.py` killzones,
+`bias.py` H1/H4/D1 bias). The strategy, backtester and level-map layers are still documented
+stubs. Data files live in `./data/`.

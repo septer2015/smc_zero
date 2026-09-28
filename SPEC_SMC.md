@@ -893,7 +893,126 @@ margin-check до ордера: `lot * contract_size * price / leverage <= free_
     Итог слоя: `ruff check ./src ./tests` чист, `pytest` 306 passed (было 277; +29 тестов
     Э5': 18 в `tests/test_engine.py`, 8 в `tests/test_metrics.py`, 3 в `tests/test_reports.py`),
     файлы после мутаций восстановлены побайтово (сверяется `diff`).
+### 7.10 Walk-forward (Э6') — фолды, агрегат метрик и отсутствие lookahead
+
+61. **Разбиение — позиционные срезы одной ленты: anchored расширяется, rolling скользит.**
+    `backtester/walkforward.py::split_walkforward(df, cfg)` возвращает список пар
+    `(train, test)`; границы считает `_fold_bounds`: окна полуоткрытые, `train_end` шагает от
+    `min_train_bars` вверх на `test_period_bars`, пока в ленту влезает целое тестовое окно,
+    `test_start = train_end`, `test_end = test_start + test_period_bars`. Схема меняет **только
+    левый край** train-окна: `anchored=True` держит его на первом баре ленты (первый фолд —
+    ровно `min_train_bars`, k-й — `min_train_bars + k * test_period_bars`), `anchored=False`
+    ставит `train_end - train_period_bars` с клипом по началу ленты (поэтому ранние фолды
+    короткой ленты прогреваются меньше `train_period_bars`). Тестовые окна у обеих схем
+    совпадают, значит **число фолдов от схемы не зависит**: `(n - min_train_bars) //
+    test_period_bars`. Лента, в которую не влезает целый фолд, даёт **пустой список**, а не
+    половинчатое тестовое окно. Где: `split_walkforward`, `_fold_bounds`. Чем подтверждено:
+    `test_the_folds_of_a_short_tape_start_at_the_warm_up_the_config_asks_for` (1000 баров,
+    `min_train=200`, `test=100` → ровно 8 фолдов: train 200–300, 200–400, …, 200–900; test
+    300–400, …, 900–1000), `test_the_anchored_folds_always_start_at_the_first_bar` (train_start
+    anchored = `[0] * 8`, rolling = `[0, 0, 100, …, 600]` при `train_period_bars=300`),
+    `test_a_longer_warm_up_produces_fewer_folds` (`min_train=500` → 5 фолдов),
+    `test_a_tape_too_short_for_one_fold_has_no_folds` (250 баров → `[]`, при `min_train=150` —
+    один фолд 150–250).
+62. **Дефолты окон (96 бар = торговый день M15) и арифметика фолдов: спека ждала 6–10, дефолты
+    дают 49.** `WalkForwardConfig`: `anchored=True`, `test_period_bars=96*20` (20 дней),
+    `min_train_bars=96*60` (60 дней), `train_period_bars=96*120` (120 дней, для rolling).
+    Проверка на реальной ленте `./data/EURUSD_M15.csv` (100 111 баров, 2022-08-15 07:00 …
+    2026-09-22 21:45 UTC, `is_closed` истинно везде — хвост уже снят `drop_unclosed`):
+    дефолты дают **49 фолдов**, первый из них train 5760 баров (2022-08-15 07:00 … 2022-11-09
+    06:45) и test 1920 баров (2022-11-09 07:00 … 2022-12-07 14:45), последний — train 97 920
+    баров, test 1920 баров (2026-08-20 16:15 … 2026-09-18 00:00). Остаток ленты короче тестового
+    окна и фолдом не становится — это осознанно (см. п.61). Число фолдов задаёт **warm-up**, а
+    не длина тестового окна: 2 года → 27 фолдов, 3 года → 14, 3.5 года → 8, 4 года → 2. Чтобы
+    получить требуемые спекой **6–10 фолдов**, `min_train_bars` должен лежать в диапазоне
+    ≈ 80 900 … 88 500 баров (3.4–3.7 года; 84 000 баров = 3.5 года → 8 фолдов), то есть
+    60-дневный warm-up из задания — это **осознанно мелкая сетка**: агрегат читается как
+    распределение из 49 фолдов, а не как одно среднее. Длина warm-up — решение заказчика
+    (правка одного поля `min_train_bars`, кода не касается), до него дефолты остаются как в
+    задании. Величины окон фиксирует
+    `test_the_default_windows_are_the_m15_units_of_the_project`, арифметику —
+    `test_the_default_windows_cut_four_years_into_a_fine_grained_grid` (4 года = 96 000 баров →
+    47 фолдов); нулевое окно отклоняется в `__post_init__`
+    (`test_a_window_of_zero_bars_is_refused` — 3 параметра). Побочный факт того же счёта:
+    с `train_period_bars=96*120` на реальной ленте ранние rolling-фолды клипаются
+    (`[5760, 7680, 9600, …]`), как и описано в п.61.
+63. **Инвариант «фолд не видит своего будущего» — структурный, а не проверяемый постфактум.**
+    Срезы — это `df.iloc[...]` по одной и той же ленте, поэтому метки остаются метками
+    заказчика, `set(train.index) & set(test.index)` пусто по построению, а первый симулируемый
+    бар — следующий за последним фитируемым (`test.index[0] == train.index[-1] + 1`). Ничего не
+    копируется, не сортируется и не дропается: незакрытый хвост ленты остаётся делом движка
+    (правило 2b) и может коснуться только самого последнего фолда, а внутри тестового окна
+    действуют гарантии Э5' (лимит исполняется не раньше `placed + 1`, маска часов гейтит
+    placement/fills/resolution). Чем подтверждено:
+    `test_a_fold_never_shares_a_bar_with_its_train_window`,
+    `test_no_fold_of_a_run_shares_a_bar_with_its_train_window` (то же через раннер: билдер видит
+    обе пары множеств). Мутация-гейт **m1** «тестовое окно начинается на бар раньше `train_end`»
+    → красные оба теста пересечения (в юнит-файле вместе с границами фолдов краснеют ещё 6
+    тестов, в интеграционном — 3).
+64. **Агрегат — среднее И σ по фолдам.** `aggregate_fold_metrics(fold_results)` читает таблицы
+    `metrics.calc_metrics` каждого фолда и отдаёт по каждому из шести головных полей
+    (`FOLD_METRIC_FIELDS`: trades, profit, win_rate, pf, max_dd, sharpe) пару `<field>_mean` /
+    `<field>_std` плюс `folds`. σ — **популяционная** (`ddof=0`): фолды это вся наблюдённая
+    популяция, а не выборка из большей, и число нужно, чтобы сказать, насколько фолды неровные
+    (20-дневное окно, сделавшее +8 % в одном фолде и −3 % в следующем, сообщается средним *и*
+    этим разбросом, никогда — одним средним). Поля именно читаются, а не пересчитываются:
+    агрегат одного фолда равен этому фолду. Пустой список, отсутствующее головное поле и
+    нефинитное значение — жёсткая ошибка: у walk-forward без фолдов нет
+    out-of-sample-свидетельства, а усреднение нулей такой таблицы его выдумало бы. Чем
+    подтверждено: `test_the_aggregate_averages_the_folds_and_reports_their_spread` (три фолда с
+    руками посчитанными числами: 1/2/3 сделки → mean 2.0, σ 0.82; profit 10/20/30 → 20.0, σ
+    8.16; win_rate 0/50/100 → 50.0, σ 40.82; pf 1/2/3 → 2.0, σ 0.82; max_dd 5/10/15 → 10.0, σ
+    4.08; sharpe 0.5/1/1.5 → 1.0, σ 0.41),
+    `test_the_aggregate_of_one_fold_is_that_fold`,
+    `test_the_aggregate_refuses_an_empty_fold_list`,
+    `test_the_aggregate_refuses_a_fold_without_a_headline_field`. Мутация-гейт **m3** «сумма
+    вместо среднего» → красные `test_the_aggregate_averages_the_folds_and_reports_their_spread`
+    и интеграционный `test_the_aggregate_of_the_folds_is_their_mean_with_a_spread`.
 
 
 
+
+
+
+
+65. **`run_walkforward` — и почему билдер интентов получает ОБА окна.** Скетч задания
+    (`intents_fn(train_df)`, интенты по train-окну и прогон по test) **не симулируется**: движок
+    Э5' заново выводит бар каждого интента из той ленты, которую ему дали (`engine._intents_by_bar`),
+    поэтому интенты, взведённые на train-окне, падают
+    `ValueError: the intent of bar 2 (2026-06-08 00:30:00+00:00) is in no bar of the tape`
+    (подтверждено `test_the_builder_may_not_arm_its_intents_on_the_train_window`). Отсюда
+    контракт раннера: `run_walkforward(df, intents_fn, cfg, backtest, instrument)` зовёт
+    `intents_fn(train, test)`, где **второй** аргумент — окно, в котором интенты обязаны быть
+    взведены (единственное, что можно симулировать), а **первый** — окно фита: Э7' будет
+    подбирать по нему параметры, а заглушка Э6' его игнорирует — это и есть «walk-forward без
+    оптимизации». Прогон: `split_walkforward(df, cfg)` → для каждого фолда
+    `run_backtest(test, intents_fn(train, test), cfg_bt, instrument)`; издержки, гейты и метрики
+    у всех фолдов одни и те же, движок Э5' не менялся (read-only). Результат —
+    `WalkForwardResult(fold_metrics, aggregated, config, backtest)`, где `fold_metrics[i]` — это
+    таблица `calc_metrics` i-го фолда того же разбиения. Лента, в которую не влезает ни один
+    фолд, → `ValueError`: walk-forward из ничего это ошибка конфига, а не находка. Чем
+    подтверждено (синтетическая лента 500 закрытых баров M15, 2 фолда по 100 баров, в каждом
+    окне 1 TP и 1 SL): `test_every_fold_is_the_engine_run_of_its_own_test_window` (таблица фолда
+    равна независимому `run_backtest` по этому же окну, `result == [TP, SL]`, `spread_cost > 0` —
+    правило 4), `test_the_aggregate_of_the_folds_is_their_mean_with_a_spread` (фолды дают profit
+    27.2 и 67.2 → `profit_mean` 47.2, `profit_std` 20.0, `trades_mean` 2.0, `win_rate_mean` 50.0),
+    `test_a_tape_too_short_for_a_fold_is_refused`.
+66. **Мутации-гейты Э6'** (все проверены на живом коде, дерево восстановлено побайтово, сверено
+    `diff`): m1 «тестовое окно начинается на бар раньше `train_end`» →
+    `test_a_fold_never_shares_a_bar_with_its_train_window` +
+    `test_no_fold_of_a_run_shares_a_bar_with_its_train_window` (+6 граничных тестов фолдов);
+    m2 «`anchored` игнорируется, все фолды rolling» →
+    `test_the_anchored_folds_always_start_at_the_first_bar`
+    (+ `test_the_default_windows_cut_four_years_into_a_fine_grained_grid`); m3 «агрегат
+    суммирует фолды вместо среднего» →
+    `test_the_aggregate_averages_the_folds_and_reports_their_spread` +
+    `test_the_aggregate_of_the_folds_is_their_mean_with_a_spread`. Итог слоя: `ruff check .` чист,
+    `pytest` **325 passed** (было 306; +19 тестов Э6': 14 в `tests/test_walkforward.py`, 5 в
+    `tests/test_walkforward_integration.py`), 0 errors.
+67. **Что осталось открытым после Э6'.** Э7': objective для optuna (какие пороги фитить —
+    `DisplacementConfig` / `FVGConfig` / `StructureConfig` / `RiskConfig` — и **по какой метрике**:
+    агрегат даёт распределение, а не число, поэтому objective должен читать `aggregated`,
+    например требовать `profit_mean > 0` при ограничении на `max_dd_std`) и выбор
+    `min_train_bars` под 6–10 фолдов (п.62). Отложено и сознательно не сделано: экспорт фолдов
+    отчётом (`reports/` — презентация, отдельный шаг), M5 (вне рамок, §6).
 

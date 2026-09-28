@@ -32,6 +32,33 @@ BiasState: TypeAlias = Literal["agree_long", "agree_short", "conflict", "undefin
 FVGEntryMode: TypeAlias = Literal["proximal", "mid"]
 # Half-open MSK hour window: ``start <= hour < end``.
 HourWindow: TypeAlias = tuple[int, int]
+# MSK time of day as ``(hour, minute)``: the broker's session boundaries (C6).
+TimeOfDay: TypeAlias = tuple[int, int]
+# Where a take-profit may come from (SPEC_SMC.md, C2): the nearest counter-side
+# liquidity level visible at the entry bar, the RR fallback only, or the level with
+# the RR fallback as a second chance - the C2 default.  ``"liquidity"`` and ``"rr"``
+# need a ruling about the empty-book / RR-grid cases and are not implemented by v1
+# (SPEC_SMC.md §7.8 п.36).
+TPMode: TypeAlias = Literal["liquidity", "rr", "liquidity_with_rr_fallback"]
+# How a gap is chosen among the gaps inside the lookback window: prod's ``"first"``
+# (parity, default) or ``"biggest"`` (prod's alternative branch, deferred by §7.8).
+FVGSelect: TypeAlias = Literal["first", "biggest"]
+# Which level state may carry a setup.  v1 trades fresh levels only: the breaker /
+# retest lifecycle of spec п.4 is a separate setup left out of v1 (§7.8 п.33).
+SetupType: TypeAlias = Literal["fresh", "breaker"]
+# The SL anchor of an intent: beyond the swept extreme of the signal, or beyond the
+# gap edge (prod's fallback when the swept extreme sits too close to the entry).
+SLType: TypeAlias = Literal["sweep_extreme", "fvg_edge"]
+# Where an intent's take-profit came from (C2): a liquidity level or the RR fallback.
+TPSource: TypeAlias = Literal["liquidity", "rr"]
+# Direction of an intent (SPEC_SMC.md §7.8 п.35).  The entry chain derives it from the
+# level it trades: a level *above* the price is swept upwards and sold (``short``), a
+# level below it is swept downwards and bought (``long``).
+Side: TypeAlias = Literal["long", "short"]
+# Which entry flavour of prod's ``ENTRY_TYPE`` v1 implements: the FVG limit only, or
+# one of the sweep-midpoint branches (core.py lines 712-734).  The latter two are
+# deferred by SPEC_SMC.md §7.8 п.33 and raise from the strategy instead of guessing.
+EntryType: TypeAlias = Literal["fvg", "sweep50", "fvg_or_sweep50"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +88,11 @@ class SessionConfig:
     ``use_kz`` is ``True`` by default (prod's gate defaulted to *off*).
     ``prelondon`` is off by default: C1 leaves open whether prod's 07-09 MSK
     window survives.  Windows are half-open in MSK hours.
+
+    ``session_open_msk`` / ``session_close_msk`` are the broker's weekly trading
+    hours (C6) and are *not* killzones: the killzone gate filters the sessions
+    inside the day, the mask built by :func:`smc_zero.indicators.sessions.alfa_trading_mask`
+    filters whole days (Monday opening, Friday closing, weekend off).
     """
 
     use_kz: bool = True
@@ -70,6 +102,13 @@ class SessionConfig:
     london_winter_msk: HourWindow = (10, 13)
     ny_summer_msk: HourWindow = (14, 17)
     ny_winter_msk: HourWindow = (15, 18)
+    # Broker trading hours (C6): Alfa opens Monday 02:00 MSK and closes Friday
+    # 23:55 MSK, the market is shut over the weekend.  These are MSK *times of day*,
+    # not half-open windows, and they are consumed by ``sessions.alfa_trading_mask``.
+    # The pair lives here while v1 has no broker profile object (``BrokerSpec``, C6,
+    # Э5'), because the mask must reuse this module's single MSK definition.
+    session_open_msk: TimeOfDay = (2, 0)
+    session_close_msk: TimeOfDay = (23, 55)
 
     def __post_init__(self) -> None:
         windows: dict[str, HourWindow] = {
@@ -83,6 +122,15 @@ class SessionConfig:
             start, end = window
             if not 0 <= start < end <= 24:
                 raise ValueError(f"{name} must satisfy 0 <= start < end <= 24, got {window}")
+        for name, time_of_day in (
+            ("session_open_msk", self.session_open_msk),
+            ("session_close_msk", self.session_close_msk),
+        ):
+            hour, minute = time_of_day
+            if not 0 <= hour <= 23:
+                raise ValueError(f"{name} hour must satisfy 0 <= hour <= 23, got {time_of_day}")
+            if not 0 <= minute <= 59:
+                raise ValueError(f"{name} minute must satisfy 0 <= minute <= 59, got {time_of_day}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +239,7 @@ class FVGConfig:
     only visible from bar ``k + 1`` on.  ``min_gap_size`` is applied at detection
     (``size >= min_gap_size``, inclusive, like prod's lookup filter) - narrower gaps
     are not marked at all.  Where the limit order sits inside the gap is *not* a
-    detection parameter and lives in ``EntryConfig.fvg_entry_mode`` (Э4').
+    detection parameter and lives in ``EntryConfig.edge`` (Э4').
     """
 
     min_gap_size: float = 0.0
@@ -199,6 +247,67 @@ class FVGConfig:
     def __post_init__(self) -> None:
         if self.min_gap_size < 0:
             raise ValueError("min_gap_size must be >= 0")
+
+
+@dataclass(frozen=True, slots=True)
+class EntryConfig:
+    """Where the pending limit order sits inside the entry gap (SPEC_SMC.md, п.8).
+
+    ``edge`` keeps prod's ``fvg_entry_edge`` (C6): ``"proximal"`` is the gap edge
+    price reaches first, ``"mid"`` the centre of the gap.  v1 rules for ``"mid"``
+    (prod's own default ``DEFAULT_FVG_ENTRY_EDGE``); ``"distal"`` was never used by
+    the prod run and is deferred by §7.8 п.33 - the value itself is validated by
+    :func:`smc_zero.indicators.fvg.entry_level`, not here, so that the deferral
+    message lives next to the code that would have to implement it.
+
+    ``limit_stop_pip`` is prod's ``limit_stop_level_pip`` (0.7 pip for EURUSD, C6):
+    the minimal distance a pending order - and hence the SL - must keep from the
+    close of the signal bar.  Like ``LiquidityConfig.sweep_buffer`` and
+    ``LevelConfig.break_buffer_pip`` it is a *pip* value converted at the call site
+    with ``StrategyConfig.pip_size``, so the strategy layer never re-defines a pip.
+
+    ``type`` is prod's ``ENTRY_TYPE`` switch.  ``"fvg"`` is the only flavour v1
+    trades; ``"sweep50"`` / ``"fvg_or_sweep50"`` (core.py lines 712-734) are
+    deferred by SPEC_SMC.md §7.8 п.33 and raise ``NotImplementedError`` from
+    ``build_intents`` instead of silently falling back on the FVG entry.
+    """
+
+    type: EntryType = "fvg"
+    edge: FVGEntryMode = "mid"
+    limit_stop_pip: float = 0.7
+
+    def __post_init__(self) -> None:
+        if self.limit_stop_pip < 0:
+            raise ValueError("limit_stop_pip must be >= 0")
+
+
+@dataclass(frozen=True, slots=True)
+class TPConfig:
+    """Take-profit policy (SPEC_SMC.md, C2 / п.9).
+
+    ``mode = "liquidity_with_rr_fallback"`` (the C2 default) aims at the nearest
+    counter-side liquidity level that is *visible* at the entry bar and clears
+    ``min_tp_rr``; when no such level exists the target falls back to prod's
+    formula ``entry -/+ sl_size * rr_fallback`` (core.py line 783).  A level that is
+    farther than ``min_tp_rr`` is taken as it is - spec п.9 wants the level, not a
+    multiple - while a level that is closer is skipped in favour of the next one.
+    ``min_tp_rr = 1.0`` is the ruling of §7.8 п.36; ``rr_fallback = 2.0`` is prod's
+    ``params["rr"]`` default.
+
+    ``"liquidity"`` and ``"rr"`` are recognised names whose edge cases (empty level
+    book, which RR grid replaces static levels) are not decided yet: the take-profit
+    builder raises ``NotImplementedError`` for them instead of guessing.
+    """
+
+    mode: TPMode = "liquidity_with_rr_fallback"
+    min_tp_rr: float = 1.0
+    rr_fallback: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.min_tp_rr <= 0:
+            raise ValueError("min_tp_rr must be > 0")
+        if self.rr_fallback <= 0:
+            raise ValueError("rr_fallback must be > 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,12 +402,37 @@ class LevelConfig:
 
 @dataclass(frozen=True, slots=True)
 class RiskConfig:
-    """Position sizing and trading costs.
+    """Position sizing, trading costs and the C7 risk profile.
+
+    ``risk_pct`` is the per-trade risk budget in percent of equity; ``rr`` keeps
+    prod's ``params["rr"]`` (the 1.5 / 2.0 / 2.5 grid built from ``MIN_RR`` /
+    ``MAX_RR`` / ``RR_STEP``), which v1 uses only as the TP fallback
+    (``TPConfig.rr_fallback``) - the strict RR mode is deferred.
 
     ``commission`` is charged per trade in account currency, ``spread`` and
     ``slippage`` are expressed in price units.  :attr:`has_costs` is the guard
     used by the reporting layer: without costs a positive equity curve must not
     be presented as a profit.
+
+    ``lot``, ``leverage``, ``contract_size``, ``pip_size`` and ``deposit`` are C7's
+    fixed risk profile, and it is the *one* copy of every broker number: the risk
+    gate of :mod:`smc_zero.strategy.risk_gate` prices an order from this object
+    alone (``apply_risk_gate(intents, cfg, equity)``).  The lot is *given*, not
+    derived from ``risk_pct`` (``DEFAULT_LOT = 0.1`` with ``contract_size =
+    100 000`` is $1/pip on EURUSD, so a 20-60 pip SL risks 2-6 % of a $1000
+    deposit - C7's own arithmetic), and an order has to pass a margin check before
+    it is placed.  ``warning_risk_pct`` is C7's reporting threshold: a single trade
+    above it is still allowed but flagged, and the backtester must print the
+    median risk per trade.
+
+    ``deposit`` is the C7 answer of SPEC_SMC.md §7.8 п.37 (ruling R2): the
+    *denominator* of the reported ``risk_pct`` column, 1000 as the owner ruled.
+    It is deliberately not ``BacktestConfig.initial_capital`` - that field is the
+    backtester's own capital (prod's 10000, SPEC_SMC.md §5 п.10) and the margin
+    gate measures against the *current* equity it is handed, so the two numbers
+    answer two different questions until §5 п.10 is answered.  ``pip_size`` and
+    ``contract_size`` are the FX pair of the price list (0.0001 pip, 100 000 a
+    lot); ``BrokerSpec`` (C6, Э5') has to *replace* this trio, not duplicate it.
     """
 
     risk_pct: float = 1.0
@@ -306,6 +440,12 @@ class RiskConfig:
     commission: float = 0.0
     spread: float = 0.0
     slippage: float = 0.0
+    lot: float = 0.1
+    leverage: float = 40.0
+    contract_size: float = 100_000.0
+    pip_size: float = 0.0001
+    deposit: float = 1000.0
+    warning_risk_pct: float = 2.0
 
     def __post_init__(self) -> None:
         if self.risk_pct <= 0:
@@ -314,11 +454,143 @@ class RiskConfig:
             raise ValueError("rr must be > 0")
         if min(self.commission, self.spread, self.slippage) < 0:
             raise ValueError("commission, spread and slippage must be >= 0")
+        if self.lot <= 0:
+            raise ValueError("lot must be > 0")
+        if self.leverage < 1:
+            raise ValueError("leverage must be >= 1")
+        if self.contract_size <= 0:
+            raise ValueError("contract_size must be > 0")
+        if self.pip_size <= 0:
+            raise ValueError("pip_size must be > 0")
+        if self.deposit <= 0:
+            raise ValueError("deposit must be > 0")
+        if not 0 < self.warning_risk_pct <= 100:
+            raise ValueError("warning_risk_pct must satisfy 0 < warning_risk_pct <= 100")
 
     @property
     def has_costs(self) -> bool:
         """``True`` when commission, spread and slippage are all set."""
         return self.commission > 0 and self.spread > 0 and self.slippage > 0
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyConfig:
+    """Entry-chain thresholds of the Э4' strategy layer (SPEC_SMC.md §7.8).
+
+    Every window is counted in *bars of the entry timeframe* and every number has a
+    prod counterpart, because C6/C7 forbid inventing broker or strategy numbers:
+
+    * ``setup_type`` - ``"fresh"`` trades levels still unbroken at the entry bar;
+      ``"breaker"`` (spec п.4) is deferred beyond v1 and raises
+      ``NotImplementedError`` instead of silently trading fresh levels;
+    * ``signal_max_age_bars`` - ``DEFAULT_SIGNAL_MAX_AGE_BARS = 60``: how old the
+      sweep signal may be at the entry bar (prod tests ``i - source_idx > age``);
+    * ``sweep_buffer_pip`` / ``min_fvg_pip`` - prod has no constant for either: the
+      optimizer grids are 1-3 (step 1) and 1-5 (step 1) and the diagnostic
+      fall-throughs are 1, which is the v1 value;
+    * ``fvg_lookback`` - prod's ``fvg_lookback`` (grid 10-30 step 5, diagnostic
+      default 20): how far after the CHoCH a gap is still accepted;
+    * ``max_fvg_age_bars`` - ``DEFAULT_MAX_FVG_AGE_BARS = 12``: gap age at entry;
+    * ``choch_wait_bars`` - ``CHOCH_WAIT_BARS = 20``: prod's CHoCH window, which
+      starts at the sweep bar and runs forward;
+    * ``fvg_select`` - ``"first"`` is prod's ``DEFAULT_FVG_SELECT``;
+    * ``max_setups_per_level_per_day`` - v1 ruling (§7.8): one setup per level
+      *instance* per MSK day, replacing prod's ``MAX_USES_PER_LEVEL = 2`` (which
+      counted uses of one *price*), while prod's ``MAX_ORDERS_PER_ENTRY`` /
+      ``LIMIT_VALID_BARS`` / ``MAX_SL_PER_DAY`` counters belong to the order
+      lifecycle of the backtester (Э5');
+    * ``sl_buffer_pip`` - prod's ``SL_BUFFER_PIP_RANGE = (5, 20)``, v1 takes the
+      lower end (5) so the SL sits just beyond the swept extreme; ``min_sl_pip`` -
+      ``MIN_SL_PIP_RANGE = (5, 12)``, v1 takes 5;
+    * ``min_sl_realistic_pip`` / ``max_sl_realistic_pip`` -
+      ``MIN_SL_REALISTIC_PIP = 20`` / ``MAX_SL_REALISTIC_PIP = 60``: the realistic
+      SL band C7's arithmetic is built on (20-60 pips = 2-6 % of $1000 at 0.1 lot).
+
+    ``pip_size`` and ``contract_size`` are *not* fields here: they are the C7
+    numbers of :class:`RiskConfig`, and this class reads them through the
+    read-only properties of the same name (one copy of every broker number, so
+    that the risk gate can price an order from the risk profile alone).
+    ``pip_size`` converts the pip-denominated prod parameters at the *strategy*
+    boundary - indicators never see a pip - and ``contract_size`` feeds the
+    margin/risk arithmetic of :mod:`smc_zero.strategy.risk_gate`.
+
+    ``displacement`` is the formal impulse gate of §7.5 that the chain applies to
+    the CHoCH bar (§7.8 п.40), and ``use_displacement`` switches it off for
+    experiments.  The defaults of :class:`DisplacementConfig` are inert by design,
+    so a run that wants the gate to bite sets its thresholds explicitly.
+
+    ``risk`` is the C7 profile used by the risk gate (lot, leverage, warning
+    threshold); the cost fields of the same class are the backtester's business, so
+    both may be wired from one instance.
+
+    ``bias`` is the C5 hierarchy (H1 + H4 + D1) the entry chain asks for a
+    direction, and its ``structure`` field is also the swing / CHoCH configuration
+    of the M15 entry frame - prod had a single global structure parameter set, so
+    the strategy does not keep a second copy of it.  ``max_spread_pct_of_sl`` is
+    prod's ``DEFAULT_MAX_SPREAD_PCT_OF_SL``: the spread may not exceed this
+    fraction of the stop distance (it is inert while ``RiskConfig.spread`` is zero,
+    which is the Э3' default - costs arrive with Э5').
+    """
+
+    setup_type: SetupType = "fresh"
+    use_displacement: bool = True
+    displacement: DisplacementConfig = field(default_factory=DisplacementConfig)
+    signal_max_age_bars: int = 60
+    sweep_buffer_pip: float = 1.0
+    min_fvg_pip: float = 1.0
+    fvg_lookback: int = 20
+    max_fvg_age_bars: int = 12
+    choch_wait_bars: int = 20
+    fvg_select: FVGSelect = "first"
+    max_setups_per_level_per_day: int = 1
+    sl_buffer_pip: float = 5.0
+    min_sl_pip: float = 5.0
+    min_sl_realistic_pip: float = 20.0
+    max_sl_realistic_pip: float = 60.0
+    entry: EntryConfig = field(default_factory=EntryConfig)
+    take_profit: TPConfig = field(default_factory=TPConfig)
+    bias: BiasConfig = field(default_factory=BiasConfig)
+    fvg: FVGConfig = field(default_factory=FVGConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
+    liquidity: LiquidityConfig = field(default_factory=LiquidityConfig)
+    levels: LevelConfig = field(default_factory=LevelConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    max_spread_pct_of_sl: float = 0.12
+
+    @property
+    def pip_size(self) -> float:
+        """The FX pip of the traded pair, read from the C7 profile (one copy)."""
+        return self.risk.pip_size
+
+    @property
+    def contract_size(self) -> float:
+        """The contract size of the traded pair, read from the C7 profile."""
+        return self.risk.contract_size
+
+    def __post_init__(self) -> None:
+        if self.signal_max_age_bars < 0:
+            raise ValueError("signal_max_age_bars must be >= 0")
+        if self.fvg_lookback < 1:
+            raise ValueError("fvg_lookback must be >= 1")
+        if self.max_fvg_age_bars < 0:
+            raise ValueError("max_fvg_age_bars must be >= 0")
+        if self.choch_wait_bars < 1:
+            raise ValueError("choch_wait_bars must be >= 1")
+        if self.max_setups_per_level_per_day < 1:
+            raise ValueError("max_setups_per_level_per_day must be >= 1")
+        if min(self.sweep_buffer_pip, self.min_fvg_pip, self.sl_buffer_pip, self.min_sl_pip) < 0:
+            raise ValueError(
+                "sweep_buffer_pip, min_fvg_pip, sl_buffer_pip and min_sl_pip must be >= 0"
+            )
+        if self.min_sl_realistic_pip <= 0:
+            raise ValueError("min_sl_realistic_pip must be > 0")
+        if self.max_spread_pct_of_sl < 0:
+            raise ValueError("max_spread_pct_of_sl must be >= 0")
+        if self.max_sl_realistic_pip <= self.min_sl_realistic_pip:
+            raise ValueError(
+                "max_sl_realistic_pip must be > min_sl_realistic_pip, "
+                f"got {self.max_sl_realistic_pip} <= {self.min_sl_realistic_pip}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

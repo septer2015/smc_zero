@@ -61,6 +61,10 @@ LEVEL_COLUMNS: tuple[str, ...] = (
     LEVEL_SOURCE_WINDOW_COLUMN,
 )
 BROKEN_AT_COLUMN = "broken_at"
+# The instant an instance is replaced by the next instance of the same name (its successor's
+# ``available_at``); attached by :func:`retired_at` in the entry chain, because prod rebuilt its
+# level list every day and kept only the current instance (SPEC_SMC.md §7.8 п.35).
+LEVEL_RETIRED_AT_COLUMN = "retired_at"
 IDL_DYN_COLUMN = "idl_dyn"
 IDH_DYN_COLUMN = "idh_dyn"
 
@@ -451,18 +455,61 @@ def level_lifecycle(
     return lifecycle
 
 
+def retired_at(levels: pd.DataFrame) -> pd.Series:
+    """Return the instant each instance is replaced by the next one of the same name.
+
+    A level instance is the *current* one of its name only until the next instance of that name
+    becomes available: prod rebuilt its level list every day and kept the current PDH/PDL (and
+    the current week's PWH/PWL) only, so without this column a last year's high would stay
+    tradable forever (SPEC_SMC.md §7.8 п.35).  The value is the successor's ``available_at`` -
+    the first instant the new range is a fact - so the replacing bar's own open still belongs to
+    the old instance, and it is ``NaT`` for the last instance of a name.
+
+    The returned :class:`~pandas.Series` is aligned with ``levels``; attach it as
+    :data:`LEVEL_RETIRED_AT_COLUMN` and :func:`fresh_at` honours it, so "is this level alive at
+    ``t``" stays one question with one answer.  Successors are picked per name in chronological
+    order of ``available_at``, not in row order, so a shuffled book retires the same instances.
+    """
+    missing = [
+        column
+        for column in (LEVEL_NAME_COLUMN, LEVEL_AVAILABLE_AT_COLUMN)
+        if column not in levels.columns
+    ]
+    if missing:
+        raise ValueError(f"levels are missing the {missing} column(s)")
+    if levels.empty:
+        return pd.Series(pd.NaT, index=levels.index, dtype="datetime64[ns, UTC]")
+    # positional labels (reset_index) so a book with duplicate index values still works
+    work = levels.reset_index(drop=True)
+    order = work.sort_values([LEVEL_NAME_COLUMN, LEVEL_AVAILABLE_AT_COLUMN], kind="stable").index
+    successors = work.loc[order].groupby(LEVEL_NAME_COLUMN, sort=False)[
+        LEVEL_AVAILABLE_AT_COLUMN
+    ].shift(-1)
+    retired = successors.reindex(work.index).astype("datetime64[ns, UTC]")
+    retired.index = levels.index
+    return retired
+
+
 def fresh_at(row: Mapping[str, object] | pd.Series, t: pd.Timestamp) -> bool:
     """Return whether the level instance in ``row`` is still fresh at instant ``t``.
 
     ``t`` is the decision instant of an M15 bar - its ``open_time``, the key
     :func:`smc_zero.indicators.bias.bias_frames` hands to consumers.  A level is fresh while it
-    exists (``available_at <= t``) and its break is not known yet (``t < broken_at``); a row with
-    a ``NaT`` break stays fresh forever, and a row without the ``broken_at`` column is treated as
-    unbroken.  Since ``broken_at`` is the breaking bar's close time, the breaking bar itself is
-    still fresh at its own open - its close is not known at that instant.
+    exists (``available_at <= t``) and neither of the two ways to lose it has happened yet: its
+    break is not known (``t < broken_at``) and a successor has not appeared
+    (``t < retired_at``).  Either limit wins, hence the ``min`` - an instance replaced by the
+    next period's range is gone even though nothing broke it.  ``NaT`` limits (or missing
+    ``broken_at`` / ``retired_at`` columns, i.e. a book straight from
+    :func:`static_levels`) leave the corresponding check out, and a row without both is fresh
+    forever.  Since both limits are close-time instants of the bar that produced them, that bar
+    itself still belongs to the old instance - its close is not known at its own open.
     """
     available_at = pd.Timestamp(row[LEVEL_AVAILABLE_AT_COLUMN])
-    broken_at = row.get(BROKEN_AT_COLUMN)
-    if broken_at is None or pd.isna(broken_at):
+    limits = [
+        pd.Timestamp(limit)
+        for limit in (row.get(BROKEN_AT_COLUMN), row.get(LEVEL_RETIRED_AT_COLUMN))
+        if limit is not None and not pd.isna(limit)
+    ]
+    if not limits:
         return bool(available_at <= t)
-    return bool(available_at <= t < pd.Timestamp(broken_at))
+    return bool(available_at <= t < min(limits))

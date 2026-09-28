@@ -222,7 +222,9 @@ class OBConfig:
 class LiquidityConfig:
     """Liquidity levels and sweep detection parameters.
 
-    ``equal_tol`` clusters equal highs/lows (Э3').  ``sweep_buffer`` is the price
+    ``equal_tol`` clusters equal highs/lows; the clustering itself is deferred with
+    the breaker setup (SPEC_SMC.md §7.7), so ``equal_tol`` is inert in v1 - only the
+    level maps below exist so far.  ``sweep_buffer`` is the price
     distance a wick must exceed a level by, in *price units* like
     ``RiskConfig.spread`` (prod feeds ``sweep_buffer_pip * pip_size``);
     ``sweep_lookback`` is the prod search window (``sweep_lookback``, default 48),
@@ -243,6 +245,50 @@ class LiquidityConfig:
             raise ValueError("sweep_buffer must be >= 0")
         if self.sweep_lookback < 1:
             raise ValueError("sweep_lookback must be >= 1")
+
+
+@dataclass(frozen=True, slots=True)
+class LevelConfig:
+    """Liquidity level-map parameters (SPEC_SMC.md, п.3-п.4).
+
+    ``break_buffer_pip`` is the distance a *close* has to clear a level by before the
+    level counts as broken (``close > level + buffer`` / ``close < level - buffer``).
+    It keeps the prod name and default of ``BOS_MIN_BREAK_PIP`` for traceability and,
+    exactly like ``LiquidityConfig.sweep_buffer``, is compared in *price units*: prod
+    multiplies the pip value by ``pip_size`` at its call site, so that conversion
+    belongs to the broker layer (``BrokerSpec``, C6) and the indicator never needs to
+    know what a pip is.  A wick through the level is *not* a break - п.5 keeps the
+    wick rule for sweeps, while п.4 wants the decisive close.
+
+    ``asian_window_utc`` is the fixed UTC window of the Asian range (prod's
+    ``hour < 8``).  Asia does not switch clocks, so the season table of
+    :mod:`smc_zero.indicators.sessions` is deliberately *not* applied to it, while the
+    London and New York maps take their MSK windows from that very table and own no
+    window of their own (C1).
+
+    ``week_convention`` is prod's week key (``"%Y-%W"``) used to group bars into
+    weeks.  It has to stay year-qualified (``"%Y"``): the weekly grouping sorts the
+    labels and relies on ``"%Y-%W"`` being zero-padded, so a year-less format would
+    merge the same week number of different years into one group.
+    """
+
+    break_buffer_pip: float = 2.0
+    asian_window_utc: HourWindow = (0, 8)
+    week_convention: str = "%Y-%W"
+
+    def __post_init__(self) -> None:
+        if self.break_buffer_pip < 0:
+            raise ValueError("break_buffer_pip must be >= 0")
+        start, end = self.asian_window_utc
+        if not 0 <= start < end <= 24:
+            raise ValueError(
+                f"asian_window_utc must satisfy 0 <= start < end <= 24, got {self.asian_window_utc}"
+            )
+        if "%Y" not in self.week_convention:
+            raise ValueError(
+                "week_convention must be year-qualified (contain '%Y'), "
+                f"got {self.week_convention!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

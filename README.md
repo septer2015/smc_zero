@@ -27,5 +27,6 @@ pytest
 Implemented so far: the data layer (`data_loader.py`: open_time convention, closed-bar
 HTF -> LTF stitching) and the indicator layer (`indicators/structure.py` swings and BOS/CHoCH,
 `fvg.py`, `liquidity.py` sweeps, `impulse.py` displacement gate, `sessions.py` killzones,
-`bias.py` H1/H4/D1 bias). The strategy, backtester and level-map layers are still documented
-stubs. Data files live in `./data/`.
+`bias.py` H1/H4/D1 bias, `levels.py` PDH/PDL, PWH/PWL, PMH/PML and the Asian/London/NY session
+ranges with their availability gates and fresh/broken lifecycle). The strategy and backtester
+layers are still documented stubs. Data files live in `./data/`.

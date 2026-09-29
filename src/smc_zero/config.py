@@ -820,8 +820,10 @@ class OptunaConfig:
 
     The defaults are sized for a first real run over four years of M15: the 49 folds of
     ``./data/EURUSD_M15.csv`` at 100 trials single-threaded are an estimated 10-20
-    minutes (the estimate of the Э7' sketch - the tape is not in the repository, so the
-    number is not measured).
+    minutes - still the estimate of the Э7' sketch, not a measurement: the tape *is*
+    tracked with the repository (``./data/``), but the test suite runs on synthetic tapes
+    and never spends ten minutes on a full study, so the honest figure comes from the
+    first real run.
     """
 
     n_trials: int = 100

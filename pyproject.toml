@@ -22,12 +22,23 @@ dev = ["pytest", "ruff", "black", "mypy"]
 # Pinned below 5.x: optuna 5 turns TPESampler's constant_liar/multivariate TPE on by default.
 optimize = ["optuna>=4.9,<5"]
 
+[project.scripts]
+# Э8': the two console faces of the project. ``scripts`` is a top-level package beside ``src``,
+# so the package discovery below has to look in the repository root as well - otherwise the
+# entry points would be registered and unimportable after an editable install.
+smc-backtest = "scripts.run_backtest:main"
+smc-optimize = "scripts.run_optimization:main"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["smc_zero*", "scripts*"]
+exclude = ["tests*", "reference*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# ``src`` for the package, ``.`` for the Э8' runners (``import scripts.run_backtest``), so the
+# tests need neither an install nor a ``conftest.py`` that patches ``sys.path``.
+pythonpath = ["src", "."]
 addopts = "-q"
 
 [tool.ruff]

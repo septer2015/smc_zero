@@ -24,6 +24,51 @@ without it:
 pip install -e ".[dev,optimize]"
 ```
 
+## Quick start
+
+Install with the checks and the optimizer:
+
+```bash
+pip install -e ".[dev,optimize]"
+```
+
+One backtest over the window you name - every threshold is the project's own, the window is the
+whole UTC days of `--start` .. `--end`:
+
+```bash
+smc-backtest --symbol EURUSD --start 2022-08-15 --end 2022-09-15
+```
+
+Without the install, the same run from the repository root (`Python` needs both the package of
+`src` and the runner package on its path):
+
+```bash
+PYTHONPATH=src python -m scripts.run_backtest --symbol EURUSD --start 2022-08-15 --end 2022-09-15
+```
+
+The search over the walk-forward folds, then the winner reported as one run:
+
+```bash
+smc-optimize --symbol EURUSD --n-trials 100 --jobs 4
+```
+
+Reports land in `./reports/`:
+
+* `backtest_<symbol>_<tf>_<start>_<end>/` - `trades.csv` / `trades.parquet` and `summary.txt`;
+* `optimization_<symbol>_<tf>_<start>_<end>_n<trials>/` - the same two files for the winner, plus
+  `best_params.json` (parameters, score, fold aggregates) and `fold_metrics.csv` (train and test
+  table of every fold, with their mean and sigma rows).
+
+Every run is stamped by rule 4: while `RiskConfig` carries no commission and no slippage, the
+summary says so on the page and the curve must not be read as a profit (C6 / §5 п.10).
+
+The window is a cost, not a detail: the entry chain of Э4' walks every level of the window bar by
+bar, so its time grows roughly with the square of the window - measured on `./data/EURUSD_M15.csv`:
+5 days 0.3 s, 1 month 6 s, 3 months 58 s, 1 year 16 min (`937.9 s`, 42 intents, 17 trades). The
+shipped four-year default window is the same run at ~4 h by extrapolation, and an optimization over
+it is not affordable before the chain is vectorized (§7.12 п.75). Start with a month or a quarter -
+and with the costs of your profile, because rule 4 stamps a run without them.
+
 ## Checks
 
 ```bash
@@ -57,5 +102,9 @@ out-of-sample folds - the leading metric of the walk-forward aggregate, throttle
 and by how much of the in-sample profit survived - `run_optimization` maximizes that score with a
 seeded TPE study over the ranges of `PARAM_RANGES` and re-evaluates the winner over every fold from
 scratch, while `cache_mismatches` refuses a configuration the cache was not built from; optuna is
-imported lazily by the study factory, so the layer - and its tests - run without it). Data files
-live in `./data/`, reports land in `./reports/`.
+imported lazily by the study factory, so the layer - and its tests - run without it) and the console
+layer (`scripts/` - the Э8' runners: `smc-backtest` runs one fixed configuration over a window of
+`./data` and writes its report, `smc-optimize` runs the Э7' study over a walk-forward and then
+reports the winner; both are `./reports` writers with an argparse contract of their own, and neither
+defines a threshold or recomputes a metric - SPEC_SMC.md §7.12). Data files live in `./data/`,
+reports land in `./reports/`.

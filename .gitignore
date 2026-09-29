@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 *.log
 .env
+reports/
 reference/
 .git-remote.env
 *.egg-info/

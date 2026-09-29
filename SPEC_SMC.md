@@ -1016,3 +1016,193 @@ margin-check до ордера: `lot * contract_size * price / leverage <= free_
     `min_train_bars` под 6–10 фолдов (п.62). Отложено и сознательно не сделано: экспорт фолдов
     отчётом (`reports/` — презентация, отдельный шаг), M5 (вне рамок, §6).
 
+### 7.11 Оптимизатор (Э7') — OOS-ворота поверх walk-forward, ленивый optuna, один кэш разметки
+
+68. **Слой Э7' — это фолды Э6' без изменений, два плеча оценки и один прогон на набор параметров.**
+    Пакет `optimizer/` — цепочка односторонних импортов: `score.py` держит число, `ranges.py` —
+    пространство поиска, `marks.py` — кэш разметки, `optimize.py` — обвязку триалов;
+    `optimizer/__init__.py` реэкспортирует весь публичный фасад. Прогон
+    `run_optimization(df, cfg_opt, cfg_wf, backtest, instrument, *, base=..., marks=...,
+    evaluate=..., study_factory=...)` делает три вещи по порядку: строит (или принимает) кэш
+    разметки **один раз**, создаёт исследование фабрикой (по умолчанию `_create_study` — optuna
+    TPE с `seed=cfg_opt.seed`, `direction="maximize"`, `constant_liar=True` при `n_jobs > 1`, без
+    storage: готовое исследование уезжает в памяти на `OptunaResult`), гоняет `cfg_opt.n_trials`
+    триалов в `cfg_opt.n_jobs` потоков и **заново** переоценивает победителя по всем фолдам.
+    `evaluate_params(df, marks, cfg, cfg_wf, backtest, instrument)` — мера одного набора: OOS-плечо
+    это `run_walkforward` без изменений (интенты взведены на test-окне фолда, §7.10 п.65),
+    in-sample-плечо — тот же движок Э5' с теми же издержками на **train**-окне того же фолда;
+    списки выравниваются по фолду, потому что фолды режутся `split_walkforward` дважды
+    детерминированно (позиционные срезы), а `backtester/walkforward.py` остаётся read-only.
+    `FoldEvaluation` несёт обе таблицы фолдов и оба агрегата Э6'. `OptunaResult` держит целое
+    исследование (триалы, их параметры, `attrs`), `best_params` = `study.best_trial.params`,
+    `best_score` = значение, которое вернул объектив, `strategy` = база с применёнными лучшими
+    параметрами и `best_evaluation` = свежий прогон именно этой конфигурации: метрики победителя
+    не читаются обратно из исследования, а считаются снова. Триал, все триалы которого упали,
+    роняет прогон ошибкой optuna, а не отдаёт пустой результат, который выглядит успехом.
+    optuna импортируется ровно в одном месте — внутри `_create_study`, поэтому слой, его
+    пространство и его объектив работают и тестируются без библиотеки (extra `optimize` в
+    `pyproject.toml`); без optuna падает ровно создание реального исследования.
+    Чем подтверждено: `test_the_study_ranks_its_trials_by_the_out_of_sample_window` (три триала с
+    расписанием 1/5/3 по `sweep_buffer_pip` → счёт 0.18/0.9/0.54, победитель — средний триал,
+    `best_params[sweep_buffer_pip] == 5`, `strategy.sweep_buffer_pip == 5.0`, `best_score` == 0.9
+    == `score_from_aggregates` по таблицам `best_evaluation`),
+    `test_a_seeded_optuna_study_is_reproducible` (`TPESampler`, направление `MAXIMIZE` (сравнение
+    по `study.direction.name`: `StudyDirection` — `IntEnum`, и на Python 3.11+ `str()` даёт `"2"`),
+    тот же seed/лента/пространство → те же `best_params` и `best_score`; тест помечен
+    `pytest.importorskip("optuna")` и в окружении без библиотеки скипается — единственный такой
+    тест в слое), `test_the_objective_scores_the_out_of_sample_side_of_the_folds`,
+    `test_the_objective_records_both_aggregates_on_the_trial`,
+    `test_the_objective_applies_the_suggested_parameters_to_the_base_configuration`.
+
+69. **Счёт триала: предметная метрика OOS × просадка × распад train→test.**
+    `score_from_aggregates(train_aggregated, test_aggregated, cfg)` считает
+    `<score_metric>_mean(test) * (1 - max_dd_mean(test)/100) * min(1, profit_mean(test) /
+    profit_mean(train)) ** penalty_power`, где `score_metric` — `"sharpe"` (дефолт) или
+    `"profit"`, а `penalty_power` — вес гейта распада. Ведущая метрика читается **только из
+    test-половины**: вневыборочность счёта — смысл всего слоя. Краевые правила
+    (`drawdown_factor` / `degradation_factor`): убыточный test → 0 (набор, теряющий вне выборки,
+    не может получить положительный счёт); убыточный train → фактор 1 (нет in-sample-эджа, распад
+    которого можно измерить, — наказывать за несделанное нельзя); `test > train` не даёт бонуса
+    (кламп в `[0, 1]`: превзойти фит-окно — это удача по определению, и исследование, гонящееся
+    за ней, оптимизирует шум); `max_dd_mean >= 100 %` → 0 (убыточный счёт нельзя сделать *лучше*,
+    потеряв больше). Отношение распада всегда по `profit_mean`, даже когда ведущая метрика —
+    шарп: проценты сравнимы между фолдами, шарп — нет. Функции чистые и не знают ни optuna, ни
+    движка, ни стратегии. Таблица без нужного ключа или с non-finite значением → `ValueError`:
+    счёт из отсутствующей метрики ранжировал бы триалы ни по чему.
+    Чем подтверждено (9 тестов): `test_the_score_is_the_product_of_the_three_factors` (руками:
+    `2.0 * (1 - 0.10) * min(1, 50/100) = 0.9` на таблицах TRAIN/TEST),
+    `test_the_score_reads_the_out_of_sample_side_of_the_folds` (обмен окон даёт 1.8 — тест
+    красный при мутации m1 «читать train»),
+    `test_the_score_metric_picks_the_leading_number_of_the_test_window`,
+    `test_the_decay_gate_always_measures_profit_not_the_leading_metric`,
+    `test_the_penalty_power_weighs_the_decay`,
+    `test_the_drawdown_factor_spans_zero_to_one_and_never_goes_negative`,
+    `test_a_losing_test_window_scores_zero_and_a_losing_train_window_is_not_penalised`,
+    `test_outperforming_the_train_window_earns_no_bonus`,
+    `test_a_table_without_the_leading_metric_is_refused`, `test_a_non_finite_metric_is_refused`.
+
+70. **Пространство поиска: 11 путей `PARAM_RANGES`, и A/B-фактор — один из них.**
+    Диапазон — маленький frozen dataclass (`IntRange` / `FloatRange` / `ChoiceRange`), который
+    отдаёт значение через `suggest(trial, name)` и говорит не с optuna, а с протоколом
+    `TrialLike` (три `suggest_*` + `set_user_attr`), поэтому пространство описываемо, ревьюабельно
+    и тестируемо без библиотеки. Границы — как у optuna: включительные, `low < high` всегда (не
+    варьируемый диапазон — это константа конфига, а не размерность поиска); `IntRange` возвращает
+    `int` (пороги в пипсах — float-поля конфига, но сетка поиска целая, и это осознанно: пип —
+    единица решения, а не непрерывная ручка). Путь — dotted-имя поля `StrategyConfig`
+    (`"take_profit.rr_fallback"`), `resolve_path` читает его обратно и падает `KeyError` с именем
+    непрошедшей части; `suggest_params(trial)` отдаёт `{path: value}` — ровно форму `trial.params`
+    / `study.best_params`, поэтому лучшие параметры воспроизводимы без знания слоя, а
+    `apply_params(cfg, params)` копирует конфиг уровень за уровнем через `dataclasses.replace`
+    (вход не трогается, новые объекты — только на изменённом пути). Фитить разрешено:
+    `sweep_buffer_pip` 1–5, `sl_buffer_pip` 3–15, `min_fvg_pip` 1–5, `fvg_lookback` 10–30,
+    `max_fvg_age_bars` 5–20, `signal_max_age_bars` 20–100, `take_profit.rr_fallback` 1.5–3.0,
+    `take_profit.min_tp_rr` 0.8–1.5, `displacement.atr_mult_min` 0.5–2.0,
+    `displacement.body_frac_min` 0.3–0.8 и **A/B-фактор `bias.agreement`** (§7.6 п.25) — три
+    варианта `AGREEMENTS`. Два порога displacement при этом едут в проде выключенными (`0.0`,
+    §7.5 п.12): диапазон их *включает*, то есть исследование — это в том числе решение «нужен ли
+    формальный displacement вообще», и дефолт `0.0` намеренно лежит вне диапазона. Вне
+    пространства осознанно оставлены карта уровней и таблица сессий: это входы кэша разметки
+    (п.71), их изменение сделало бы разметку чужой. Значения, с которыми стратегия едет по
+    умолчанию, лежат внутри своих диапазонов, так что исследование стартует в той области, о
+    которой рассуждала спека.
+    Чем подтверждено: `test_every_range_names_a_real_field_of_the_configuration` (каждый путь
+    разрешается, и значение, которое вернул бы диапазон, проходит валидацию поля),
+    `test_every_range_brackets_the_value_the_strategy_ships_with`,
+    `test_the_only_categorical_knob_is_the_ab_factor_of_the_bias`,
+    `test_the_search_space_leaves_the_inputs_of_the_cache_alone`,
+    `test_resolve_path_refuses_a_field_the_configuration_does_not_have`,
+    `test_applying_parameters_copies_the_configuration_level_by_level`,
+    `test_applying_parameters_refuses_an_unknown_path`,
+    `test_a_suggested_mapping_round_trips_through_the_configuration`,
+    `test_a_trial_that_varies_the_whole_space_is_served_by_the_cache`.
+
+71. **Кэш разметки: шесть тяжёлых вызовов один раз на прогон, `bias_frame` под A/B, `cache_mismatches` как охрана.**
+    Цепочка входов Э4' читает, кроме самих баров, два артефакта на всю ленту — разметку bias'а
+    старших ТФ и книгу уровней со штампами `broken_at`, — и ни один из них не зависит от того,
+    что предлагает триал. Считать их на триал значило бы 100 × 6 тяжёлых вызовов по одной и той
+    же ленте, поэтому `build_tape_marks(df, cfg=None)` строит их **один раз на прогон** и раздаёт
+    одну и ту же пару кадров всем триалам: `TapeMarks(trends, levels, config)`, где `trends` —
+    вывод `bias_frames`, `levels` — книга `level_lifecycle`, а `config` — та конфигурация, из
+    которой они построены (запись для охраны). Шесть вызовов — это три `resample_to_timeframe`
+    (по одному на ТФ bias'а), `bias_frames`, `static_levels` и `level_lifecycle`; счётчик в тесте
+    фиксирует их число, чтобы рефакторинг не вернул их в путь «на триал» (100 триалов — это 600
+    вызовов).
+    Почему кэш не ломает нулевой lookahead: тренды склеиваются `bias_frames` по **времени
+    закрытия** (правило 2) — колонка бара резюмирует только бары, закрывшиеся до него, поэтому
+    бар за границей фолда не может изменить то, что читает бар внутри фолда; `broken_at` в книге
+    уровней — это *таймстемп*, поэтому поздний пробой оставляет уровень свежим на более раннем
+    баре, ровно как локальный расчёт внутри фолда; кэш добавляет прогрев истории, которого не
+    хватило бы изолированному окну, но не будущее. Хвостовой (ещё формирующийся) бар ленты
+    снимается `drop_unclosed` **до** ресэмплинга (правило 2b): живой край не попадает ни в кэш,
+    ни в ХТФ-кадры. Пересчитывается на триал только строчный *вердикт* bias'а, и это дёшево:
+    `TapeMarks.bias_frame(agreement=None)` переклассифицирует уже кэшированный матричный кадр
+    трендов (`classify_trends` / `trend_column`), поэтому A/B-фактор `bias.agreement` — это
+    размерность поиска, а не цена разметки. `cache_mismatches(marks, cfg)` — охрана разделения:
+    конфигурация сравнивается с `marks.config` по всем leaf-путям (`_leaf_paths` разворачивает
+    вложенные frozen dataclass'ы, поэтому позже добавленное в конфиг поле попадает под охрану
+    само), и каждый путь вне `PARAM_RANGES`, значение которого изменилось, возвращается именем в
+    кортеже: такой прогон падает **до** создания исследования, а не ранжирует триалы по чужой
+    разметке. Осознанное исключение одно — `bias.agreement`, потому что именно он
+    пересчитывается на триал.
+    Чем подтверждено: `test_the_markup_of_a_run_is_built_once_for_every_trial` (счётчик по
+    `resample_to_timeframe` / `bias_frames` / `static_levels` / `level_lifecycle` равен 1 за
+    прогон при трёх триалах и четырёх оценках),
+    `test_a_frozen_field_makes_the_cache_stale` (`choch_wait_bars`, `min_sl_pip`, вложенный
+    `bias.structure.swing_lookback`, `session.use_kz` → их имена в кортеже; `sweep_buffer_pip` /
+    `sl_buffer_pip` → пусто), `test_the_ab_factor_is_allowed_to_differ_from_the_cache`,
+    `test_a_trial_that_varies_the_whole_space_is_served_by_the_cache`,
+    `test_a_run_refuses_a_stale_cache_before_creating_its_study`,
+    `test_a_base_configuration_the_cache_does_not_cover_is_refused`.
+
+72. **Интеграция Э7' и границы честности: что проверено прогоном, а что — проводкой.**
+    `tests/test_optimize_integration.py` гоняет прогон на синтетической ленте (400 закрытых M15
+    баров: детерминированное блуждание с шагом 15 пипсов, `seed 7`, `is_closed=True` на всех
+    барах) с `WalkForwardConfig(min_train_bars=200, test_period_bars=100)` (расширяющееся окно
+    Э6' по умолчанию) и `bias.timeframes=("H1",)` — 400 баров M15 не несут структуры H4/D1,
+    за которую могла бы поручиться синтетика, а неопределённый bias оставил бы цепочку входов без
+    предмета. Издержки, сайзинг и риск-профиль — дефолты Э5'. Кэш и `evaluate_params` здесь
+    настоящие; исследование и оценщик в двух тестах — заглушки (`_StubStudy` / `_StubEvaluator`),
+    чтобы цикл поиска проверялся без optuna, а ранжирование читалось руками: расписание
+    `sweep_buffer_pip = 1, 5, 3`, test-профит заглушки пропорционален параметру, отсюда счёт
+    `0.18, 0.9, 0.54` (`2 × 0.9 × min(1, 10·sweep/100) = 0.18 × sweep`).
+    * `test_every_fold_is_simulated_on_its_own_test_window` — фолды соседние и не перекрываются:
+      `int(train.index.max()) + 1 == int(test.index.min())`, длина train-окна
+      `min_train_bars + номер · test_period_bars` (то есть 200 и 300 баров), длина test-окна —
+      `test_period_bars`; таблица каждого фолда сверяется с прямым
+      `run_backtest(окно, build_intents(окно, ...), BACKTEST, DEFAULT_INSTRUMENT).metrics`, то
+      есть движку отдано ровно окно фолда, а не лента (мутация m3 — «симулировать фолд на ленте
+      или на его же фит-окне» — делает тест красным); там же проверены непустая книга уровней,
+      определённый bias (`agree_long` / `agree_short`) и согласие агрегатов Э6' с
+      `aggregate_fold_metrics` (включая `folds == 2.0`).
+    * `test_the_study_ranks_its_trials_by_the_out_of_sample_window` — триалы ранжируются по
+      OOS-половине: победитель — средний триал (`best_trial_number == 1`,
+      `best_params[sweep_buffer_pip] == 5`, `strategy.sweep_buffer_pip == 5.0`, `best_score ==
+      0.9`), метрики победителя пересчитаны после исследования
+      (`best_evaluation.test_aggregated["profit_mean"] == 50.0`, `best_score ==
+      score_from_aggregates(...)`), последняя оценка прогона — конфигурация победителя. Мутация
+      m1 «считать счёт по train-таблице» уравнивает триалы и ломает тест; отсутствие множителя
+      распада уравнивает их на 1.8 и отдаёт победу триалу 0.
+    * `test_the_markup_of_a_run_is_built_once_for_every_trial` — на настоящем прогоне с настоящим
+      `evaluate_params` счётчик тяжёлых вызовов по `resample_to_timeframe` / `bias_frames` /
+      `static_levels` / `level_lifecycle` равен 1 за прогон при трёх триалах и четырёх оценках
+      (три триала + свежая оценка победителя), то есть шесть тяжёлых вызовов на весь прогон
+      вместо `n_trials × 6`; мутация m2 «пересобирать разметку на триал» ломает тест.
+    * `test_a_seeded_optuna_study_is_reproducible` — слой и без библиотеки работоспособен, а с ней
+      фабрика по умолчанию поднимает `TPESampler` с направлением `MAXIMIZE` и тем же seed; тест
+      начинается с `pytest.importorskip("optuna")` и в окружении без optuna скипается — это
+      единственный такой тест в слое. Проверено на optuna **4.9.0**: extra `optimize`
+      (`pip install -e ".[optimize]"`) тянет `optuna>=4.9,<5`. Верхняя граница `<5` держится
+      сознательно: optuna 5 включает `constant_liar` и multivariate TPE по умолчанию, а п.68 и
+      докстринг `_create_study` описывают поведение 4.x (лиар только при `n_jobs > 1`). Итог
+      прогона с установленной библиотекой: два прогона трёх триалов с seed 7 подряд дают те же
+      `best_params` и `best_score`, тест **проходит, а не скипается**.
+    Границы честности: настоящая цепочка входов Э4' на синтетическом блуждании **не находит
+    сетапов** (журнал отказов пробы: уровень недоступен / bias-пропуск / CHoCH не найден / уровень
+    пробит), поэтому интеграционный тест проверяет проводку — кэш, фолды, окно, отданное движку,
+    и ранжирование по OOS, — а не «сигнал → сделка»; синтетика на разметку уровней и сессий
+    проверяется фикстурами тестов Э4', а проверка прибыльности — на реальной ленте
+    `./data/EURUSD_M15.csv`, которой в репозитории нет (§7.10 п.62). Итог Э7' на optuna 4.9.0:
+    `ruff check ./src ./tests` чист, `pytest` — **355 passed**, 0 skipped, 0 errors (355 собранных
+    тестов: 325 было после Э6' + 30 Э7' — 26 в `tests/test_optimize.py`, 4 в
+    `tests/test_optimize_integration.py`).
+

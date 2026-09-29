@@ -17,6 +17,13 @@ lookahead on the live edge.
 pip install -e ".[dev]"
 ```
 
+The Э7' optimizer needs optuna, which is an optional extra - the layer and its tests import cleanly
+without it:
+
+```bash
+pip install -e ".[dev,optimize]"
+```
+
 ## Checks
 
 ```bash
@@ -43,5 +50,12 @@ of one tape (Э6'): `split_walkforward` cuts anchored expanding folds by default
 with `anchored=False`, as positional views of the caller's frame, so a fold never shares a bar with
 its own train window; `aggregate_fold_metrics` reports the mean *and* the population sigma of the
 six headline metrics, and `run_walkforward` joins the folds to the Э5' engine with fixed costs and
-no optimization - fitting the parameters is Э7'). Data files live in `./data/`, reports land in
-`./reports/`.
+no optimization - fitting the parameters is Э7') and the optimizer layer (`optimizer/` - the search
+of SPEC_SMC.md §7.11, Э7': `build_tape_marks` caches the HTF bias markup and the level book **once
+per run** for every trial of a study, `score_from_aggregates` ranks one parameter set by its
+out-of-sample folds - the leading metric of the walk-forward aggregate, throttled by the drawdown
+and by how much of the in-sample profit survived - `run_optimization` maximizes that score with a
+seeded TPE study over the ranges of `PARAM_RANGES` and re-evaluates the winner over every fold from
+scratch, while `cache_mismatches` refuses a configuration the cache was not built from; optuna is
+imported lazily by the study factory, so the layer - and its tests - run without it). Data files
+live in `./data/`, reports land in `./reports/`.

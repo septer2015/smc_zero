@@ -18,6 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "black", "mypy"]
+# The optimizer layer (Э7') is importable without optuna: only a real study needs the library.
+# Pinned below 5.x: optuna 5 turns TPESampler's constant_liar/multivariate TPE on by default.
+optimize = ["optuna>=4.9,<5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

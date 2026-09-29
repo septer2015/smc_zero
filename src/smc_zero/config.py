@@ -24,9 +24,24 @@ BreakEvent: TypeAlias = Literal["bos", "choch"]
 # ``reduced_risk`` is a deferred decision (SPEC_SMC.md §7.6) and is not implemented
 # by v1 - :func:`smc_zero.indicators.bias.bias_frames` raises for it.
 ConflictPolicy: TypeAlias = Literal["no_trade", "reduced_risk"]
-# Per-bar verdict of the multi-timeframe bias: all timeframes agree long / short,
-# they disagree (``conflict``) or at least one of them has no trend yet (``undefined``).
-BiasState: TypeAlias = Literal["agree_long", "agree_short", "conflict", "undefined"]
+# How many timeframes have to point the same way for a direction: ``unanimous`` is the
+# owner ruling of v1 (SPEC_SMC.md §7.6 п.24 - a 2-1 split is a conflict, not a signal),
+# ``majority`` accepts a *strict* majority of a 2-1 split as well; it is the A/B factor
+# of Э7' (SPEC_SMC.md §7.11 п.70) and changes nothing else about the bias.
+Agreement: TypeAlias = Literal["unanimous", "majority"]
+#: The agreement modes as a value, for runtime validation and for the optimizer's range.
+AGREEMENTS: tuple[Agreement, ...] = ("unanimous", "majority")
+# Per-bar verdict of the multi-timeframe bias: every timeframe agrees long / short
+# (``agree_*``), a strict majority does (``majority_*``, reachable under ``majority``
+# only), they disagree (``conflict``) or at least one has no trend yet (``undefined``).
+BiasState: TypeAlias = Literal[
+    "agree_long", "agree_short", "majority_long", "majority_short", "conflict", "undefined"
+]
+# Headline metric of the out-of-sample folds the optimizer maximises (SPEC_SMC.md §7.11
+# п.69): the fold mean of the Sharpe ratio or of the profit percentage of a fold.
+ScoreMetric: TypeAlias = Literal["sharpe", "profit"]
+#: The two score metrics as a value, for runtime validation of :class:`OptunaConfig`.
+SCORE_METRICS: tuple[ScoreMetric, ...] = ("sharpe", "profit")
 # Where a limit order sits inside an entry gap: ``proximal`` = the edge price
 # reaches first (top of a bullish gap, bottom of a bearish one), ``mid`` = centre.
 FVGEntryMode: TypeAlias = Literal["proximal", "mid"]
@@ -166,15 +181,19 @@ class StructureConfig:
 class BiasConfig:
     """Multi-timeframe bias hierarchy and its conflict policy (SPEC_SMC.md, C5).
 
-    ``timeframes`` lists the frames whose *closed* trends have to agree; the bias
-    direction is only non-zero when every single one of them points the same way,
-    so a longer list is strictly more conservative.  Unanimity is the owner ruling
-    for v1 (SPEC_SMC.md §7.6 п.24): a 2-1 split is a conflict, not a majority
-    direction, and an undefined trend outranks a conflict.  A ``majority`` mode is
-    deferred to Э7' (``BiasConfig.agreement``, §7.6 п.25) and is not implemented.
-    The tuple is also the order in which the trend columns are attached
-    (``trend_h1``, ``trend_h4``, ``trend_d1``) and must therefore be non-empty and
-    duplicate free.
+    ``timeframes`` lists the frames whose *closed* trends decide the bias; the tuple is
+    also the order in which the trend columns are attached (``trend_h1``, ``trend_h4``,
+    ``trend_d1``) and must therefore be non-empty and duplicate free.
+
+    ``agreement`` decides how many of them have to point the same way.  ``unanimous``
+    (the v1 default, the owner ruling of SPEC_SMC.md §7.6 п.24) needs every frame, so a
+    2-1 split is a conflict and never a direction; ``majority`` accepts a *strict*
+    majority as well and reports it as ``majority_long`` / ``majority_short``, so the
+    weaker verdict stays visible in the markup.  Both modes rank the verdicts the same
+    way: an undefined trend (``NaN`` or ``0``) outranks everything, a tie of defined
+    trends is ``conflict``.  The A/B factor of Э7' (SPEC_SMC.md §7.11 п.70) is the
+    categorical parameter that switches between the two, and it is the only bias field an
+    optimization trial may vary - the trends behind it are cached for the whole run.
 
     ``on_conflict`` decides what ``bias_dir`` does when the timeframes disagree:
     ``no_trade`` (default, the conservative SMC ruling) forces ``bias_dir = 0`` while
@@ -188,6 +207,7 @@ class BiasConfig:
 
     timeframes: tuple[Timeframe, ...] = ("H1", "H4", "D1")
     on_conflict: ConflictPolicy = "no_trade"
+    agreement: Agreement = "unanimous"
     structure: StructureConfig = field(default_factory=StructureConfig)
 
     def __post_init__(self) -> None:
@@ -195,6 +215,8 @@ class BiasConfig:
             raise ValueError("timeframes must not be empty")
         if len(set(self.timeframes)) != len(self.timeframes):
             raise ValueError(f"timeframes must be unique, got {self.timeframes}")
+        if self.agreement not in AGREEMENTS:
+            raise ValueError(f"agreement must be one of {AGREEMENTS}, got {self.agreement!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,3 +799,45 @@ class WalkForwardConfig:
             raise ValueError("min_train_bars must be >= 1")
         if self.train_period_bars < 1:
             raise ValueError("train_period_bars must be >= 1")
+
+
+@dataclass(frozen=True, slots=True)
+class OptunaConfig:
+    """Search budget and score of the Э7' optimizer (SPEC_SMC.md §7.11).
+
+    ``n_trials`` is how many parameter sets the study evaluates; ``n_jobs`` how many of
+    them run at once (optuna threads - the default ``1`` is the honest setting for the
+    TPE sampler, which is otherwise asked to guess at trials it cannot see yet); ``seed``
+    seeds that sampler, so a run is reproducible.
+
+    ``score_metric`` names the headline metric of the *out-of-sample* half of the folds
+    that the study maximises - ``sharpe`` (the default) or ``profit`` - and
+    ``penalty_power`` weighs the third factor of the score: the train -> test degradation
+    (:func:`smc_zero.optimizer.score.score_from_aggregates`).  The plain product of
+    SPEC_SMC.md §7.11 п.69 is ``penalty_power = 1.0``; a larger power punishes a trial
+    that only looks good in sample harder, i.e. pulls the study towards parameters whose
+    in-sample edge survives out of sample.
+
+    The defaults are sized for a first real run over four years of M15: the 49 folds of
+    ``./data/EURUSD_M15.csv`` at 100 trials single-threaded are an estimated 10-20
+    minutes (the estimate of the Э7' sketch - the tape is not in the repository, so the
+    number is not measured).
+    """
+
+    n_trials: int = 100
+    n_jobs: int = 1
+    seed: int = 42
+    score_metric: ScoreMetric = "sharpe"
+    penalty_power: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.n_trials < 1:
+            raise ValueError("n_trials must be >= 1")
+        if self.n_jobs < 1:
+            raise ValueError("n_jobs must be >= 1")
+        if self.score_metric not in SCORE_METRICS:
+            raise ValueError(
+                f"score_metric must be one of {SCORE_METRICS}, got {self.score_metric!r}"
+            )
+        if self.penalty_power <= 0:
+            raise ValueError("penalty_power must be > 0")

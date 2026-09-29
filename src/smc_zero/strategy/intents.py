@@ -76,15 +76,16 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import replace
+from functools import partial
 from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
-from smc_zero.config import Side, SLType, StrategyConfig
+from smc_zero.config import FVGEntryMode, Side, StrategyConfig
 from smc_zero.data_loader import TIMESTAMP_COLUMN, drop_unclosed
 from smc_zero.indicators.bias import BIAS_DIR_COLUMN
-from smc_zero.indicators.fvg import entry_level, fair_value_gaps
+from smc_zero.indicators.fvg import ENTRY_MODES, fair_value_gaps
 from smc_zero.indicators.impulse import displacement_gate
 from smc_zero.indicators.levels import (
     ASIAN_HIGH,
@@ -107,10 +108,8 @@ from smc_zero.indicators.levels import (
     PML,
     PWH,
     PWL,
-    fresh_at,
     retired_at,
 )
-from smc_zero.indicators.liquidity import sweep_index
 from smc_zero.indicators.sessions import alfa_trading_mask, killzone_mask
 from smc_zero.indicators.structure import structure_breaks
 from smc_zero.strategy.base import TradeIntent, utc_stamps
@@ -184,6 +183,10 @@ UNKNOWN_LEVEL_PRIORITY = 99
 # before it exists (``fair_value_gaps`` marks it from ``k + 1``), so two bars after the CHoCH are
 # the earliest a lookup can succeed - prod rejects earlier attempts instead of looking.
 FVG_READY_BARS = 2
+#: What a missing stamp becomes on the integer clock of Э9': ``NaT`` is ``iNaT``, the smallest
+#: ``int64``, so one comparison recognises a missing ``available_at`` (never fresh) and a missing
+#: ``broken_at`` / ``retired_at`` (no limit) without a second ``isna`` pass over the column.
+MISSING_STAMP = np.iinfo("int64").min
 
 
 class EntryChain(NamedTuple):
@@ -293,131 +296,200 @@ def _price_groups(book: pd.DataFrame, pip_size: float) -> dict[tuple[int, bool],
     return groups
 
 
-def _owns_price(
-    rows: list[dict[str, object]],
-    position: int,
-    t: pd.Timestamp,
-    groups: dict[tuple[int, bool], list[int]],
-    pip_size: float,
-) -> bool:
-    """Return whether the instance at ``position`` owns its price at ``t`` (gate 2).
+def _first_in_window(events: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Return the first event inside ``[lower, upper]`` for every element, or ``-1``.
 
-    The instance has to be fresh *and* outrank every other fresh instance of the same price and
-    side - prod's priority table applied to its active list, with a stable sort, so the earlier
-    book row wins a priority tie.  Without this one sweep would produce two orders at one price,
-    which is what ``deduplicate_levels`` exists to prevent.
+    ``events`` holds ascending bar positions (the break bars of one direction, the gaps of one
+    side), so "the first one in a window" is a pair of ``searchsorted`` calls instead of the
+    scan the Э4' walk ran per attempt.  An empty window (``upper < lower``) and a window without
+    an event answer the same ``-1``, which is how the scalar rules of that walk spelled ``None``
+    (§7.8 п.35, gates 6 and 9).
     """
-    row = rows[position]
-    if not fresh_at(row, t):
-        return False
-    key = (round(float(row[LEVEL_PRICE_COLUMN]) / pip_size), bool(row[LEVEL_IS_UPPER_COLUMN]))
-    own = _priority_key(rows, position)
-    for member in groups[key]:
-        if member == position:
+    if events.size == 0:
+        return np.full(lower.shape, -1, dtype="int64")
+    position = np.searchsorted(events, lower, side="left")
+    candidate = events[np.minimum(position, events.size - 1)]
+    found = (position < events.size) & (candidate <= upper)
+    return np.where(found, candidate, -1)
+
+
+def _sparse_tables(values: np.ndarray, keys: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build the range-query tables of ``(value, key)`` maxima over ascending ``keys``.
+
+    Table ``t`` holds, for every block of ``2**t`` events, the best value of the block and the key
+    carrying it; a tie stays on the left, and the left block always holds the smaller keys.  This
+    is the structure that makes "the most extreme qualifying bar of the window" a constant number
+    of lookups, i.e. it is what removes the per-bar rescan of the Э4' sweep search.  The caller
+    negates its values to ask for a *minimum*; negation is exact and does not touch the tie rule.
+    """
+    tables = [(values, keys)]
+    step = 1
+    while 2 * step <= values.size:
+        previous_values, previous_keys = tables[-1]
+        length = previous_values.size - step
+        left_values, left_keys = previous_values[:length], previous_keys[:length]
+        right_values = previous_values[step : step + length]
+        right_keys = previous_keys[step : step + length]
+        left_wins = left_values >= right_values
+        tables.append(
+            (np.where(left_wins, left_values, right_values), np.where(left_wins, left_keys, right_keys))
+        )
+        step *= 2
+    return tables
+
+
+def _range_best(
+    tables: list[tuple[np.ndarray, np.ndarray]], lower: np.ndarray, upper: np.ndarray
+) -> np.ndarray:
+    """Return the key of the best event in ``[lower, upper]`` (event positions, inclusive).
+
+    Two overlapping blocks cover every window, so one lookup per side answers the query: the left
+    block wins a tie because its keys are the smaller ones, which is the "earliest on a tie" rule
+    of :func:`smc_zero.indicators.liquidity.sweep_index`.  ``-1`` marks a window without an event.
+    """
+    keys = np.full(lower.shape, -1, dtype="int64")
+    valid = upper >= lower
+    if not valid.any():
+        return keys
+    span = np.where(valid, upper - lower + 1, 1)
+    level = np.minimum(np.floor(np.log2(span)).astype("int64"), len(tables) - 1)
+    for depth, (table_values, table_keys) in enumerate(tables):
+        selected = valid & (level == depth)
+        if not selected.any():
             continue
-        if not fresh_at(rows[member], t):
-            continue
-        if _priority_key(rows, member) < own:
-            return False
-    return True
+        left = lower[selected]
+        right = upper[selected] - ((1 << depth) - 1)
+        left_values, left_keys = table_values[left], table_keys[left]
+        right_values, right_keys = table_values[right], table_keys[right]
+        left_wins = left_values >= right_values
+        keys[selected] = np.where(left_wins, left_keys, right_keys)
+    return keys
 
 
-def _priority_key(rows: list[dict[str, object]], position: int) -> tuple[int, int]:
-    """Rank an instance against the rest of its price: priority first, then the book order.
+def _attempt_bars(events: np.ndarray, lookback: int, bars: int) -> np.ndarray:
+    """Return the bars whose sweep window holds a qualifying event, ascending.
 
-    ``LEVEL_PRIORITY`` alone cannot break a tie, and a tie must still leave exactly one owner of
-    the price (prod sorted its active list once and kept the head), so the position in the book
-    - the instance the Э3' build emitted first - is the second key.
+    An attempt exists exactly where the Э4' walk found a sweep, and that is where the window
+    ``[bar - lookback, bar]`` contains a bar that pierced the buffered level *and* closed back
+    inside: the windows of those events cover the attempt set and nothing else.  The bars that
+    only pierced the level - the ones ``sweep_index`` answers ``None`` for - are outside it, so
+    the ledger stays free of them (§7.8 п.35).
     """
-    row = rows[position]
-    return LEVEL_PRIORITY.get(str(row[LEVEL_NAME_COLUMN]), UNKNOWN_LEVEL_PRIORITY), position
+    if events.size == 0:
+        return np.empty(0, dtype="int64")
+    ends = np.minimum(events + lookback, bars - 1)
+    # Two consecutive windows are one interval exactly while the next event starts inside the
+    # previous window, so the runs of the union are found without touching the bars themselves.
+    new_run = events[1:] > ends[:-1]
+    starts = np.concatenate(([events[0]], events[1:][new_run]))
+    stops = np.concatenate((ends[:-1][new_run], [ends[-1]]))
+    lengths = stops - starts + 1
+    repeated_starts = np.repeat(starts, lengths)
+    completed = np.repeat(np.cumsum(lengths) - lengths, lengths)
+    return repeated_starts + np.arange(int(lengths.sum()), dtype="int64") - completed
 
 
-def _choch_bar(break_dir: np.ndarray, sweep_bar: int, i: int, wait: int, upper: bool) -> int | None:
-    """Return the first counter-trend break in ``[sweep_bar, sweep_bar + wait]`` up to ``i``.
+def _sweep_bars(
+    high: np.ndarray,
+    low: np.ndarray,
+    events: np.ndarray,
+    attempts: np.ndarray,
+    lookback: int,
+    upper: bool,
+) -> np.ndarray:
+    """Return the sweep bar of every attempt: the most extreme qualifying bar of its window.
 
-    A swept *upper* level needs a downward break (``-1``) and vice versa, prod allows the CHoCH
-    on the sweep bar and on the decision bar itself, hence the inclusive window
-    (``find_choch_in_window_pre``, core.py lines 660-680).  ``i`` caps the right end because the
-    break of the decision bar is only known once that bar has closed.
+    ``events`` are the ascending bars at which the level was swept - the pierce of the buffered
+    price plus the close back inside - and the window of an attempt is
+    ``[attempt - lookback, attempt]``.  Inside it the rule is the one of
+    :func:`smc_zero.indicators.liquidity.sweep_index`: the highest high (the lowest low) among
+    those bars, the earliest bar winning a tie.  The event table answers every attempt of the
+    instance at once, which is the change Э9' is built on.
     """
-    want = -1 if upper else 1
-    stop = min(i, sweep_bar + wait)
-    window = break_dir[sweep_bar : stop + 1]
-    hits = np.flatnonzero(window == want)
-    if hits.size == 0:
-        return None
-    return sweep_bar + int(hits[0])
+    values = high[events] if upper else -low[events]
+    tables = _sparse_tables(values, events)
+    lower = np.searchsorted(events, np.maximum(attempts - lookback, 0), side="left")
+    upper_position = np.searchsorted(events, attempts, side="right") - 1
+    return _range_best(tables, lower, upper_position)
 
 
-def _displacement_ok(
-    ok: np.ndarray, known_at: np.ndarray, choch_bar: int, i: int
-) -> bool:
-    """Return whether the CHoCH break is a formal impulse *knowable* at the decision bar.
+def _stamp_ns(stamps: pd.Series, *, source: str) -> np.ndarray:
+    """Return a stamp column as UTC nanoseconds: the integer clock the walk compares on.
 
-    ``displacement_gate`` marks the break with ``disp_known_at = choch_bar + no_return_bars``
-    (§7.5 п.20): while the no-return window still reaches past the decision bar the outcome is
-    not a fact yet, so the gate answers ``False`` and the attempt leaves ``displacement_skip``.
-    Reading ``disp_ok`` without that test would let a bar decide on a return it cannot see yet -
-    the mutation m2 of §7.8 п.40 - which is why the leak test walks this window.
+    Both the bars and the level book are localized to UTC first (the convention of
+    :func:`smc_zero.strategy.base.utc_stamps`, which the level layer follows as well), so
+    freshness and age become integer comparisons instead of Timestamp arithmetic - that is what
+    lets gates (1), (2) and (5) answer a whole instance at once.
     """
-    known = known_at[choch_bar]
-    return bool(ok[choch_bar] and np.isfinite(known) and known <= i)
+    normalized = utc_stamps(stamps, source=source).dt.tz_localize(None)
+    return normalized.to_numpy(dtype="datetime64[ns]").astype("int64")
 
 
-def _gap_bar(gaps: pd.DataFrame, choch_bar: int, i: int, lookback: int, upper: bool) -> int | None:
-    """Return the first gap inside ``(choch_bar, choch_bar + lookback]``, i.e. the order host.
+def _fresh_limits(book: pd.DataFrame) -> np.ndarray:
+    """Return the instant every instance stops being fresh, ``+inf`` when nothing limits it.
 
-    The window is capped at ``i - 1``: a gap is confirmed by the bar after its middle candle
-    (``fair_value_gaps``), so the newest usable gap is the one marked on ``i - 1``.  An upper
-    level is sold into a *bearish* gap and a lower level bought in a bullish one; ``first`` is
-    prod's ``DEFAULT_FVG_SELECT`` and the only value v1 implements (§7.8 п.33).
+    Mirrors :func:`smc_zero.indicators.levels.fresh_at`: an instance is fresh until the earlier of
+    its two limits, and a missing limit is no limit - so ``NaT`` in ``broken_at`` / ``retired_at``
+    leaves the corresponding check out instead of retiring the instance at once.
     """
-    flags = gaps["bearish" if upper else "bullish"].to_numpy(dtype=bool)
-    start = choch_bar + 1
-    stop = min(choch_bar + lookback, i - 1)
-    if stop < start:
-        return None
-    hits = np.flatnonzero(flags[start : stop + 1])
-    if hits.size == 0:
-        return None
-    return start + int(hits[0])
+    infinite = np.iinfo("int64").max
+    limits = np.full(len(book), infinite, dtype="int64")
+    for column in (BROKEN_AT_COLUMN, LEVEL_RETIRED_AT_COLUMN):
+        stamps = _stamp_ns(book[column], source="the level book")
+        limits = np.minimum(limits, np.where(stamps == MISSING_STAMP, infinite, stamps))
+    return limits
 
 
-def _sl_geometry(
-    entry: float,
-    extreme: float,
-    top: float,
-    bottom: float,
+def _entry_prices(
+    top: np.ndarray, bottom: np.ndarray, mode: FVGEntryMode, *, upper: bool
+) -> np.ndarray:
+    """Return the limit price of every attempt that reaches gate (11): prod's gap edge or the mid.
+
+    The refusal of :func:`smc_zero.indicators.fvg.entry_level` travels with the rule: a mode v1
+    does not implement raises instead of being read as another one, and the chain asks only when
+    an attempt is actually at the gate - exactly where the Э4' walk called the scalar rule.
+    """
+    if mode not in ENTRY_MODES:
+        raise ValueError(f"unsupported entry mode {mode!r}; expected one of {ENTRY_MODES}")
+    if mode == "mid":
+        return (top + bottom) / 2.0
+    return bottom if upper else top
+
+
+def _sl_arrays(
+    entry: np.ndarray,
+    extreme: np.ndarray,
+    top: np.ndarray,
+    bottom: np.ndarray,
     *,
     upper: bool,
     sl_buffer: float,
     min_sl_realistic: float,
     max_sl_realistic: float,
-) -> tuple[float, float, SLType] | str:
-    """Return ``(sl, sl_size, sl_source)`` or the rejection reason of gate (11).
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(sl, sl_size, from_edge, rejected_all, rejected_wide)`` of gate (12), per attempt.
 
-    Ported from prod's ``try_open_trade`` (core.py lines 748-781): the stop sits ``sl_buffer_pip``
-    beyond the swept extreme, and when that distance is narrower than ``min_sl_realistic_pip``
-    prod retries with the far edge of the entry gap.  The 20-60 pip band is applied *after* that
-    fallback, so an attempt outside it leaves ``sl_rejected_all`` (neither anchor fits) or
-    ``sl_rejected_wide`` (the swept extreme alone is too wide).
-
-    The fallback only helps when the gap's far edge lies *beyond* the swept extreme
-    (``edge_size > source_size``), which is exactly the geometry the module docstring describes;
-    otherwise a too-narrow source is rejected.  Both outcomes are exercised by the tests.
+    Ported expression by expression from prod's ``try_open_trade`` (core.py lines 748-781): the
+    stop sits ``sl_buffer_pip`` beyond the swept extreme, and when that distance is narrower than
+    ``min_sl_realistic_pip`` prod retries with the far edge of the entry gap.  The 20-60 pip band
+    is applied *after* that fallback, so an attempt outside it is ``sl_rejected_all`` (neither
+    anchor fits) or ``sl_rejected_wide`` (the swept extreme alone is too wide).
     """
     source = extreme + sl_buffer if upper else extreme - sl_buffer
     edge = top + sl_buffer if upper else bottom - sl_buffer
     source_size = source - entry if upper else entry - source
     edge_size = edge - entry if upper else entry - edge
-    if source_size < min_sl_realistic:
-        if min_sl_realistic <= edge_size <= max_sl_realistic:
-            return edge, edge_size, "fvg_edge"
-        return REASON_SL_REJECTED_ALL
-    if source_size > max_sl_realistic:
-        return REASON_SL_REJECTED_WIDE
-    return source, source_size, "sweep_extreme"
+    narrow = source_size < min_sl_realistic
+    edge_fits = (min_sl_realistic <= edge_size) & (edge_size <= max_sl_realistic)
+    from_edge = narrow & edge_fits
+    return (
+        np.where(from_edge, edge, source),
+        np.where(from_edge, edge_size, source_size),
+        from_edge,
+        narrow & ~edge_fits,
+        ~narrow & (source_size > max_sl_realistic),
+    )
+
 
 
 def _check_deferred(cfg: StrategyConfig) -> None:
@@ -446,34 +518,24 @@ def _check_deferred(cfg: StrategyConfig) -> None:
             )
 
 
-def _rejection(
-    bar: int,
-    open_time: pd.Timestamp,
-    name: str,
-    level_date: pd.Timestamp,
-    price: float,
-    side: Side,
-    reason: str,
-) -> dict[str, object]:
-    """One ledger row: the decision bar, the level instance and the reason (§7.8 п.38)."""
-    return {
-        "bar": int(bar),
-        "open_time": open_time,
-        "name": name,
-        "date": pd.Timestamp(level_date),
-        "price": float(price),
-        "side": side,
-        "reason": reason,
-    }
+def _reject(reason: np.ndarray, pending: np.ndarray, mask: np.ndarray, code: str) -> None:
+    """Write ``code`` on the pending attempts the mask selects and clear them (§7.8 п.35).
 
-
-def _ledger(rows: list[dict[str, object]]) -> pd.DataFrame:
-    """Return the rejection ledger, sorted by ``(bar, name, date)`` and typed.
-
-    The order is part of the contract: instance-major acceptance order is not, but a reader (and a
-    test) has to get the same frame twice, so ties break on the level instance.
+    The order of the gates is the order of the calls: an attempt already answered by an earlier
+    gate keeps its first reason, which is what the ledger of the walk records.
     """
-    frame = pd.DataFrame(rows, columns=list(REJECTION_COLUMNS))
+    hit = pending & mask
+    reason[hit] = code
+    pending[hit] = False
+
+
+def _finalize_ledger(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a ledger frame typed and ordered: the contract of §7.8 п.38.
+
+    The columns, the dtypes and the sort live here so that the row-at-a-time ledger of Э4' and the
+    column-wise one of Э9' cannot drift apart on any of them.
+    """
+    frame = frame.loc[:, list(REJECTION_COLUMNS)].copy()
     frame["bar"] = frame["bar"].astype("int64")
     frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True).astype("datetime64[ns, UTC]")
     frame["date"] = pd.to_datetime(frame["date"]).astype("datetime64[ns]")
@@ -481,6 +543,33 @@ def _ledger(rows: list[dict[str, object]]) -> pd.DataFrame:
     if len(frame):
         frame = frame.sort_values(["bar", "name", "date"], kind="stable").reset_index(drop=True)
     return frame
+
+
+def _ledger(rows: list[dict[str, object]]) -> pd.DataFrame:
+    """Return the ledger of a list of row dicts - the shape the refusing paths answer with."""
+    return _finalize_ledger(pd.DataFrame(rows, columns=list(REJECTION_COLUMNS)))
+
+
+def _ledger_frame(fragments: dict[str, list[np.ndarray]]) -> pd.DataFrame:
+    """Return the ledger of column-wise fragments: one concatenation per column.
+
+    The walk of Э9' emits the rows of an instance as a handful of small arrays (the bars, their
+    stamps expanded as nanoseconds and the constant level fields), so the ledger is built by
+    concatenating each column once instead of materialising a dict per row.
+    """
+    return _finalize_ledger(
+        pd.DataFrame(
+            {
+                "bar": np.concatenate(fragments["bar"]),
+                "open_time": pd.to_datetime(np.concatenate(fragments["open_time"]), utc=True),
+                "name": np.concatenate(fragments["name"]),
+                "date": pd.to_datetime(np.concatenate(fragments["date"])),
+                "price": np.concatenate(fragments["price"]),
+                "side": np.concatenate(fragments["side"]),
+                "reason": np.concatenate(fragments["reason"]),
+            }
+        )
+    )
 
 
 def build_intents(
@@ -499,9 +588,14 @@ def build_intents(
     :class:`~smc_zero.strategy.base.TradeIntent` per accepted attempt and exactly one ledger row
     per rejected one (п.35).
 
-    The walk is instance-major (level instance by level instance, bar by bar), and the rolling
-    max/min test in front of the sweep search is the optimization п.35 allows: a window that never
-    pierced the buffered price cannot contain a sweep, so skipping it loses no attempt.
+    The walk stays instance-major - level instance by level instance, as in Э4' - but every gate of
+    one instance answers *all* of its decision bars at once (Э9', SPEC_SMC.md §7.13).  An attempt
+    exists where a sweep exists, and a sweep is a bar that pierced the buffered level and closed
+    back inside (п.5, п.35), so the attempt set of an instance is the union of the
+    ``[event, event + sweep_lookback]`` windows of those bars: bars that only pierced the level
+    produce no attempt at all and no ledger row, exactly as the skipping prefilter of Э4' made
+    sure.  The sweep bar of an attempt, the counter-trend break, the gap and the stop are then
+    range lookups and arithmetic over the whole instance.
     """
     config = StrategyConfig() if cfg is None else cfg
     _check_deferred(config)
@@ -514,6 +608,9 @@ def build_intents(
     max_sl_realistic = config.max_sl_realistic_pip * pip
     spread = config.risk.spread
     max_spread_pct = config.max_spread_pct_of_sl
+    lookback = config.liquidity.sweep_lookback
+    cap = config.max_setups_per_level_per_day
+    close_back_inside = config.liquidity.sweep_mode == "wick_close_inside"
 
     bars = _entry_bars(ltf)
     book = _level_book(levels)
@@ -524,130 +621,136 @@ def build_intents(
     low = bars["low"].to_numpy(dtype="float64")
     close = bars["close"].to_numpy(dtype="float64")
     stamps = bars[TIMESTAMP_COLUMN]
+    stamp_ns = _stamp_ns(stamps, source="the entry frame")
     tradable = alfa_trading_mask(stamps, config.session).to_numpy(dtype=bool) & killzone_mask(
         stamps, config.session
     ).to_numpy(dtype=bool)
     breaks = structure_breaks(bars, config.bias.structure)
     break_dir = breaks["break_dir"].to_numpy(dtype="int8")
+    # Gate (6) reads the break of one direction only: an upper level needs a downward break.
+    down_breaks = np.flatnonzero(break_dir == -1)
+    up_breaks = np.flatnonzero(break_dir == 1)
     # Gate (7): the impulse of the CHoCH break, read from its own ``disp_known_at`` (§7.8 п.40).
     impulse = displacement_gate(bars, breaks, config.displacement)
     disp_ok = impulse["disp_ok"].to_numpy(dtype=bool)
     disp_known = impulse["disp_known_at"].to_numpy(dtype="float64", na_value=np.nan)
     gaps = fair_value_gaps(bars, replace(config.fvg, min_gap_size=config.min_fvg_pip * pip))
+    bearish_gaps = np.flatnonzero(gaps["bearish"].to_numpy(dtype=bool))
+    bullish_gaps = np.flatnonzero(gaps["bullish"].to_numpy(dtype=bool))
     bearish_top = gaps["bearish_top"].to_numpy(dtype="float64")
     bearish_bottom = gaps["bearish_bottom"].to_numpy(dtype="float64")
     bullish_top = gaps["bullish_top"].to_numpy(dtype="float64")
     bullish_bottom = gaps["bullish_bottom"].to_numpy(dtype="float64")
-    liquidity_cfg = replace(config.liquidity, sweep_buffer=sweep_buffer)
-    roll_max = (
-        pd.Series(high).rolling(liquidity_cfg.sweep_lookback + 1, min_periods=1).max().to_numpy()
-    )
-    roll_min = (
-        pd.Series(low).rolling(liquidity_cfg.sweep_lookback + 1, min_periods=1).min().to_numpy()
-    )
 
-    rows = book.to_dict("records")
+    # The book as arrays: every gate of the walk compares columns instead of rows (Э9').
     groups = _price_groups(book, pip)
     names = book[LEVEL_NAME_COLUMN].to_list()
     prices = book[LEVEL_PRICE_COLUMN].to_numpy(dtype="float64")
     uppers = book[LEVEL_IS_UPPER_COLUMN].to_numpy(dtype=bool)
     dates = book[LEVEL_DATE_COLUMN].to_list()
-    available = book[LEVEL_AVAILABLE_AT_COLUMN].to_list()
+    available = _stamp_ns(book[LEVEL_AVAILABLE_AT_COLUMN], source="the level book")
+    limits = _fresh_limits(book)
+    priorities = np.array(
+        [LEVEL_PRIORITY.get(str(name), UNKNOWN_LEVEL_PRIORITY) for name in names], dtype="int64"
+    )
     intents: list[TradeIntent] = []
-    rejections: list[dict[str, object]] = []
     # п.38: the cap counts setups per (name, date) instance, not per price like prod did.
-    used: defaultdict[tuple[str, pd.Timestamp], int] = defaultdict(int)
+    ledger: dict[str, list[np.ndarray]] = {column: [] for column in REJECTION_COLUMNS}
 
     for position in range(len(book)):
         upper = bool(uppers[position])
         price = float(prices[position])
         name = str(names[position])
-        level_date = pd.Timestamp(dates[position])
-        available_at = available[position]
+        level_date = dates[position]
         side: Side = "short" if upper else "long"
-        # п.35's prefilter: only bars whose sweep window pierced the buffered level.
-        if upper:
-            candidates = np.flatnonzero(roll_max > price + sweep_buffer)
-        else:
-            candidates = np.flatnonzero(roll_min < price - sweep_buffer)
-        for i in candidates.tolist():
-            if not tradable[i]:
-                continue  # bar gate: outside Alfa hours / killzone no attempt exists at all
-            sweep_bar = sweep_index(
-                bars, level=price, upper=upper, current_idx=i, cfg=liquidity_cfg
+        threshold = price + sweep_buffer if upper else price - sweep_buffer
+        # The swept bars of this instance: the pierce of the buffered level and the close back
+        # inside, i.e. the two conditions ``sweep_index`` reads inside its window (§7.8 п.35).
+        # The cheap half of the pair runs over the whole frame, the close test only over the
+        # pierces - the same two passes per level the Э4' walk spent per (level, bar) pair.
+        pierced = high > threshold if upper else low < threshold
+        events = np.flatnonzero(pierced)
+        if events.size and close_back_inside:
+            inside = close[events] < threshold if upper else close[events] > threshold
+            events = events[inside]
+        attempts = _attempt_bars(events, lookback, len(bars))
+        if attempts.size == 0:
+            continue  # no sweep anywhere -> no attempt, hence no ledger row either
+        attempts = attempts[tradable[attempts]]
+        if attempts.size == 0:
+            continue  # bar gate: outside Alfa hours / killzone no attempt exists at all
+        sweep = _sweep_bars(high, low, events, attempts, lookback, upper)
+        t_ns = stamp_ns[attempts]
+        reason = np.empty(attempts.size, dtype=object)
+        pending = np.ones(attempts.size, dtype=bool)
+        refuse = partial(_reject, reason, pending)
+        # (1) the price is not a fact yet.  ``NaT`` in ``available_at`` fails this test like it
+        # fails the comparison of ``fresh_at``: such an instance is never fresh, not never known.
+        known = (available[position] != MISSING_STAMP) & (t_ns < available[position])
+        refuse(known, REASON_LEVEL_NOT_AVAILABLE)
+        # (2) the instance owns its price: it has to be fresh itself - available, not broken, not
+        # replaced by its successor - and outrank every fresh same-price / same-side member of the
+        # book, priorities first and the book order as the tie-break.
+        fresh = (t_ns >= available[position]) & (t_ns < limits[position])
+        fresh &= available[position] != MISSING_STAMP
+        shadow = np.zeros(attempts.size, dtype=bool)
+        for member in groups[(round(price / pip), upper)]:
+            if member == position or (priorities[member], member) >= (priorities[position], position):
+                continue
+            rival = (t_ns >= available[member]) & (t_ns < limits[member])
+            shadow |= rival & (available[member] != MISSING_STAMP)
+        broken = ~fresh | shadow
+        refuse(broken, REASON_LEVEL_BROKEN)
+        live = ~known & ~broken  # the attempts that reach gate (3) and can still be traded
+        # (4) the side is against the closed HTF bias.  (5) the sweep is older than the age cap.
+        refuse(direction[attempts] != (-1 if upper else 1), REASON_BIAS_SKIP)
+        refuse(attempts - sweep > config.signal_max_age_bars, REASON_STALE_SIGNAL)
+        # (6) the counter-trend break inside ``[sweep, sweep + choch_wait]``, nowhere after ``i``
+        choch = _first_in_window(
+            down_breaks if upper else up_breaks,
+            sweep,
+            np.minimum(attempts, sweep + config.choch_wait_bars),
+        )
+        refuse(choch < 0, REASON_CHOCH_NOT_FOUND)
+        # (7) the impulse of that break, readable only from its own ``disp_known_at`` (§7.8 п.40)
+        if config.use_displacement:
+            reachable = np.where(choch >= 0, choch, 0)
+            impulse_ok = (
+                disp_ok[reachable]
+                & np.isfinite(disp_known[reachable])
+                & (disp_known[reachable] <= attempts)
             )
-            if sweep_bar is None:
-                continue  # no sweep found -> no attempt, hence no ledger row
-            t = stamps.iloc[i]
-            if t < available_at:  # (1)
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_LEVEL_NOT_AVAILABLE)
-                )
-                continue
-            if not _owns_price(rows, position, t, groups, pip):  # (2)
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_LEVEL_BROKEN)
-                )
-                continue
-            if used[(name, level_date)] >= config.max_setups_per_level_per_day:  # (3)
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_LEVEL_USED_TODAY)
-                )
-                continue
-            if direction[i] != (-1 if upper else 1):  # (4)
-                rejections.append(_rejection(i, t, name, level_date, price, side, REASON_BIAS_SKIP))
-                continue
-            if i - sweep_bar > config.signal_max_age_bars:  # (5)
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_STALE_SIGNAL)
-                )
-                continue
-            choch_bar = _choch_bar(break_dir, sweep_bar, i, config.choch_wait_bars, upper)  # (6)
-            if choch_bar is None:
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_CHOCH_NOT_FOUND)
-                )
-                continue
-            if config.use_displacement and not _displacement_ok(  # (7)
-                disp_ok, disp_known, choch_bar, i
-            ):
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_DISPLACEMENT_SKIP)
-                )
-                continue
-            if i - choch_bar < FVG_READY_BARS:  # (8)
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_FVG_NOT_READY)
-                )
-                continue
-            fvg_bar = _gap_bar(gaps, choch_bar, i, config.fvg_lookback, upper)  # (9)
-            if fvg_bar is None:
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_FVG_NOT_FOUND)
-                )
-                continue
-            if i - fvg_bar > config.max_fvg_age_bars:  # (10)
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_FVG_TOO_OLD)
-                )
-                continue
+            refuse(~impulse_ok, REASON_DISPLACEMENT_SKIP)
+        # (8) a gap needs the bar after its middle candle before it can exist at all
+        refuse(attempts - choch < FVG_READY_BARS, REASON_FVG_NOT_READY)
+        # (9) the first gap inside ``(choch, choch + fvg_lookback]``, nowhere later than ``i - 1``
+        fvg = _first_in_window(
+            bearish_gaps if upper else bullish_gaps,
+            np.maximum(choch + 1, 0),
+            np.minimum(choch + config.fvg_lookback, attempts - 1),
+        )
+        refuse(fvg < 0, REASON_FVG_NOT_FOUND)
+        # (10) the gap is older than ``max_fvg_age_bars``
+        refuse(attempts - fvg > config.max_fvg_age_bars, REASON_FVG_TOO_OLD)
+        # (11)..(14) and the acceptance: the limit, the stop band, the minimum stop, the spread
+        if pending.any():
             if upper:
-                top = float(bearish_top[fvg_bar])
-                bottom = float(bearish_bottom[fvg_bar])
+                top = bearish_top[fvg]
+                bottom = bearish_bottom[fvg]
             else:
-                top = float(bullish_top[fvg_bar])
-                bottom = float(bullish_bottom[fvg_bar])
-            entry = entry_level(top, bottom, config.entry.edge, bullish=not upper)
+                top = bullish_top[fvg]
+                bottom = bullish_bottom[fvg]
+            entry = _entry_prices(top, bottom, config.entry.edge, upper=upper)
             # (11) prod lines 739-746: the limit may not hug the close of the signal bar.
-            wrong_side = entry < close[i] + limit_stop if upper else entry > close[i] - limit_stop
-            if wrong_side:
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_WRONG_SIDE_LIMIT)
-                )
-                continue
-            # (12) prod's ``source_extreme``: the extreme of the sweep bar sweep_index picked.
-            extreme = float(high[sweep_bar]) if upper else float(low[sweep_bar])
-            geometry = _sl_geometry(
+            wrong_side = (
+                entry < close[attempts] + limit_stop
+                if upper
+                else entry > close[attempts] - limit_stop
+            )
+            refuse(wrong_side, REASON_WRONG_SIDE_LIMIT)
+            # (12) prod's ``source_extreme``: the extreme of the bar the sweep search picked.
+            extreme = high[sweep] if upper else low[sweep]
+            sl, sl_size, from_edge, rejected_all, rejected_wide = _sl_arrays(
                 entry,
                 extreme,
                 top,
@@ -657,42 +760,56 @@ def build_intents(
                 min_sl_realistic=min_sl_realistic,
                 max_sl_realistic=max_sl_realistic,
             )
-            if isinstance(geometry, str):
-                rejections.append(_rejection(i, t, name, level_date, price, side, geometry))
-                continue
-            sl, sl_size, sl_source = geometry
-            if sl_size <= 0 or sl_size < min_sl:  # (13) prod lines 785-787
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_MIN_SL_SKIP)
-                )
-                continue
-            # (14) prod lines 797-800: inert while RiskConfig.spread is zero (Э3' default).
-            if max_spread_pct > 0 and spread > sl_size * max_spread_pct:
-                rejections.append(
-                    _rejection(i, t, name, level_date, price, side, REASON_SPREAD_PCT_SKIP)
-                )
-                continue
-            tp, tp_source, rr = take_profit_for(entry, sl, side, book, t, config.take_profit)
+            refuse(rejected_all, REASON_SL_REJECTED_ALL)
+            refuse(rejected_wide, REASON_SL_REJECTED_WIDE)
+            refuse((sl_size <= 0) | (sl_size < min_sl), REASON_MIN_SL_SKIP)  # (13)
+            if max_spread_pct > 0:  # (14) inert while RiskConfig.spread is zero (Э3' default)
+                refuse(spread > sl_size * max_spread_pct, REASON_SPREAD_PCT_SKIP)
+        # (3) the cap of §7.8 п.38: the counter is per instance, so once the cap-th setup is taken
+        # gate (3) answers before every later gate and a bar past that setup keeps that very reason.
+        accepted = np.flatnonzero(pending)
+        if accepted.size >= cap:
+            cutoff = attempts[accepted[cap - 1]]
+            reached = live & (attempts > cutoff)
+            reason[reached] = REASON_LEVEL_USED_TODAY
+            pending[reached] = False
+            accepted = accepted[:cap]
+        for index in accepted:
+            bar = int(attempts[index])
+            t = stamps.iloc[bar]
+            tp, tp_source, rr = take_profit_for(
+                float(entry[index]), float(sl[index]), side, book, t, config.take_profit
+            )
             intents.append(
                 TradeIntent(
                     open_time=t,
-                    bar=i,
+                    bar=bar,
                     side=side,
-                    entry=float(entry),
-                    sl=float(sl),
+                    entry=float(entry[index]),
+                    sl=float(sl[index]),
                     tp=float(tp),
                     tp_source=tp_source,
-                    sl_source=sl_source,
-                    sl_pips=float(sl_size / pip),
+                    sl_source="fvg_edge" if from_edge[index] else "sweep_extreme",
+                    sl_pips=float(sl_size[index] / pip),
                     rr=float(rr),
                     level_name=name,
-                    level_date=level_date,
+                    level_date=pd.Timestamp(level_date),
                     level_price=price,
                     setup_type=config.setup_type,
-                    sweep_bar=int(sweep_bar),
-                    choch_bar=int(choch_bar),
-                    fvg_bar=int(fvg_bar),
+                    sweep_bar=int(sweep[index]),
+                    choch_bar=int(choch[index]),
+                    fvg_bar=int(fvg[index]),
                 )
             )
-            used[(name, level_date)] += 1
-    return EntryChain(tuple(intents), _ledger(rejections))
+        # The ledger rows of the instance, column by column: one array per column per instance.
+        refused = ~pending
+        if refused.any():
+            rows_at = attempts[refused]
+            ledger["bar"].append(rows_at)
+            ledger["open_time"].append(stamp_ns[rows_at])
+            ledger["name"].append(np.full(rows_at.size, name, dtype=object))
+            ledger["date"].append(np.full(rows_at.size, np.int64(pd.Timestamp(level_date).value)))
+            ledger["price"].append(np.full(rows_at.size, price, dtype="float64"))
+            ledger["side"].append(np.full(rows_at.size, side, dtype=object))
+            ledger["reason"].append(reason[refused])
+    return EntryChain(tuple(intents), _ledger_frame(ledger) if ledger["bar"] else _ledger([]))

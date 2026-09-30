@@ -56,18 +56,21 @@ Reports land in `./reports/`:
 
 * `backtest_<symbol>_<tf>_<start>_<end>/` - `trades.csv` / `trades.parquet` and `summary.txt`;
 * `optimization_<symbol>_<tf>_<start>_<end>_n<trials>/` - the same two files for the winner, plus
-  `best_params.json` (parameters, score, fold aggregates) and `fold_metrics.csv` (train and test
-  table of every fold, with their mean and sigma rows).
+  `best_params.json` (parameters, score, its `score_metric` and `penalty_power`, fold aggregates) and
+  `fold_metrics.csv` (train and test table of every fold, with their mean and sigma rows - the `mean`
+  rows also carry the run's `train_profit_mean`, `test_profit_mean` and `degradation_ratio`).
 
 Every run is stamped by rule 4: while `RiskConfig` carries no commission and no slippage, the
 summary says so on the page and the curve must not be read as a profit (C6 / §5 п.10).
 
 The window is a cost, not a detail: the entry chain of Э4' walks every level of the window bar by
-bar, so its time grows roughly with the square of the window - measured on `./data/EURUSD_M15.csv`:
-5 days 0.3 s, 1 month 6 s, 3 months 58 s, 1 year 16 min (`937.9 s`, 42 intents, 17 trades). The
-shipped four-year default window is the same run at ~4 h by extrapolation, and an optimization over
-it is not affordable before the chain is vectorized (§7.12 п.75). Start with a month or a quarter -
-and with the costs of your profile, because rule 4 stamps a run without them.
+bar, so its time used to grow roughly with the square of the window - measured on
+`./data/EURUSD_M15.csv` before Э9' that was 5 days 0.3 s, 1 month 6 s, 3 months 58 s, 1 year 16 min
+(`937.9 s`). The vectorised chain of Э9' (SPEC_SMC.md §7.13) answers the same rules far faster: the
+same year takes 1.2-1.9 s and the full four-year tape 9.7-17.3 s, so the shipped window and the
+optimization over it are affordable - what a study costs is measured by the first real run, and the
+fold grid is 15 folds of 60 days by default (SPEC_SMC.md §7.10 п.62). Start with a month or a
+quarter anyway - and with the costs of your profile, because rule 4 stamps a run without them.
 
 ## Checks
 
@@ -82,7 +85,8 @@ HTF -> LTF stitching), the indicator layer (`indicators/structure.py` swings and
 `bias.py` H1/H4/D1 bias, `levels.py` PDH/PDL, PWH/PWL, PMH/PML and the Asian/London/NY session
 ranges with their availability gates and fresh/broken lifecycle) and the strategy layer
 (`strategy/intents.py` - the M15 entry chain of SPEC_SMC.md §7.8 with `sweep -> CHoCH ->
-displacement -> FVG limit`, one intent per accepted setup and a rejection ledger;
+displacement -> FVG limit`, one intent per accepted bar (the most significant level of a bar wins)
+and a rejection ledger;
 `strategy/take_profit.py` - the nearest visible liquidity level with the RR fallback;
 `strategy/risk_gate.py` - the C7 margin check and the risk percentage of a batch of intents)
 and the backtester layer (`backtester/engine.py` - the event-driven engine of SPEC_SMC.md §7.9:
@@ -98,8 +102,9 @@ six headline metrics, and `run_walkforward` joins the folds to the Э5' engine w
 no optimization - fitting the parameters is Э7') and the optimizer layer (`optimizer/` - the search
 of SPEC_SMC.md §7.11, Э7': `build_tape_marks` caches the HTF bias markup and the level book **once
 per run** for every trial of a study, `score_from_aggregates` ranks one parameter set by its
-out-of-sample folds - the leading metric of the walk-forward aggregate, throttled by the drawdown
-and by how much of the in-sample profit survived - `run_optimization` maximizes that score with a
+out-of-sample folds - the leading metric of the walk-forward aggregate times the out-of-sample
+profit, divided by the drawdown, and - at the operator's `penalty_power` - throttled by how much of
+the in-sample profit survived - `run_optimization` maximizes that score with a
 seeded TPE study over the ranges of `PARAM_RANGES` and re-evaluates the winner over every fold from
 scratch, while `cache_mismatches` refuses a configuration the cache was not built from; optuna is
 imported lazily by the study factory, so the layer - and its tests - run without it) and the console

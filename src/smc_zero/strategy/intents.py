@@ -13,6 +13,14 @@ Second, the **bar gates** filter the *bar* (``alfa_trading_mask`` and ``in_killz
 them a signal does not exist, it is not "rejected"), while the **attempt gates** filter the
 *attempt* and always leave exactly one ledger row.
 
+Third, **one bar carries at most one intent**: prod left its loop over the level instances of a
+bar at the first accepted setup, so the setups of the levels it had not reached yet were never
+evaluated.  v1 places all of them (п.51) and keeps the one prod would have reached first - the
+instance standing higher in :data:`LEVEL_PRIORITY` (PDH/PDL > PWH/PWL > PMH/PML > Asian > London >
+NY), the earliest instance of the walk winning a tie.  A setup dropped there is *not* a refused
+attempt (prod never evaluated it either), so it leaves no ledger row; every attempt that reaches
+a gate still does.
+
 ===  =============================  ===========================================================
 (1)  ``level_not_available``        ``t < available_at`` - the price is not a fact yet
 (2)  ``level_broken``               the instance does not own its price at ``t``: broken,
@@ -572,6 +580,30 @@ def _ledger_frame(fragments: dict[str, list[np.ndarray]]) -> pd.DataFrame:
     )
 
 
+def _one_intent_per_bar(intents: list[TradeIntent]) -> tuple[TradeIntent, ...]:
+    """Return the accepted intents of the walk with the same-bar duplicates dropped (§7.8 п.35).
+
+    prod left its loop over the level instances of a bar at the first accepted setup (``break`` in
+    ``core.py``), so a bar never carried two orders and the setups of the levels it had not reached
+    yet were never evaluated.  v1 places all of them (§7.8 п.51) and keeps here exactly the one
+    prod would have reached first: the instance whose name stands higher in :data:`LEVEL_PRIORITY`
+    (PDH/PDL > PWH/PWL > PMH/PML > Asian > London > NY), the instance coming first in the walk
+    winning a tie.  The survivors keep the order they were accepted in - the order the engine is
+    handed them in.
+
+    A setup dropped here leaves no ledger row: it is not an attempt this chain *refused* (prod
+    never evaluated it), so the ledger's promise - one row per rejected attempt - stays intact.
+    """
+    winner: dict[int, int] = {}
+    rank: dict[int, int] = {}
+    for index, intent in enumerate(intents):
+        priority = LEVEL_PRIORITY.get(str(intent.level_name), UNKNOWN_LEVEL_PRIORITY)
+        if intent.bar not in winner or priority < rank[intent.bar]:
+            winner[intent.bar] = index
+            rank[intent.bar] = priority
+    return tuple(intent for index, intent in enumerate(intents) if winner[intent.bar] == index)
+
+
 def build_intents(
     ltf: pd.DataFrame,
     bias: pd.DataFrame,
@@ -585,8 +617,9 @@ def build_intents(
     (the chain only joins on ``open_time``, so alignment stays the loader's business), and
     ``levels`` a book carrying ``broken_at`` (:func:`smc_zero.indicators.levels.level_lifecycle`);
     ``retired_at`` is derived here.  The result is an :class:`EntryChain` - one
-    :class:`~smc_zero.strategy.base.TradeIntent` per accepted attempt and exactly one ledger row
-    per rejected one (п.35).
+    :class:`~smc_zero.strategy.base.TradeIntent` per accepted *bar* (:func:`_one_intent_per_bar`
+    keeps the most significant level of a bar, п.35) and exactly one ledger row per rejected one
+    (п.35).
 
     The walk stays instance-major - level instance by level instance, as in Э4' - but every gate of
     one instance answers *all* of its decision bars at once (Э9', SPEC_SMC.md §7.13).  An attempt
@@ -812,4 +845,7 @@ def build_intents(
             ledger["price"].append(np.full(rows_at.size, price, dtype="float64"))
             ledger["side"].append(np.full(rows_at.size, side, dtype=object))
             ledger["reason"].append(reason[refused])
-    return EntryChain(tuple(intents), _ledger_frame(ledger) if ledger["bar"] else _ledger([]))
+    return EntryChain(
+        _one_intent_per_bar(intents),
+        _ledger_frame(ledger) if ledger["bar"] else _ledger([]),
+    )

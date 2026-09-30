@@ -22,6 +22,14 @@ What is compared, and how:
 * the worktree is removed after the run, and nothing of the old implementation is copied into
   the tree.
 
+The one place the two chains are *meant* to disagree is the same-bar rule Э9''.1 added to п.35:
+prod - and therefore the pinned head - placed every setup of a bar, while the new chain keeps the
+most significant level of it (:func:`smc_zero.strategy.intents._one_intent_per_bar`).  The record
+of the old walk is therefore filtered by an independent statement of that rule
+(:func:`_one_intent_per_bar` below, written out here rather than imported from the chain, so that
+the two statements can disagree) and *then* compared; the ledger is compared unfiltered, because a
+setup dropped by the rule is not a refused attempt and the new chain writes no row for it either.
+
 The mutation this file is built to catch, and the test that must break:
 
 * m3 "comment out the comparison" - the oracle would then be a recorder, so
@@ -46,6 +54,20 @@ from typing import Any
 
 from pandas.testing import assert_frame_equal
 
+from smc_zero.indicators.levels import (
+    ASIAN_HIGH,
+    ASIAN_LOW,
+    LONDON_HIGH,
+    LONDON_LOW,
+    NY_HIGH,
+    NY_LOW,
+    PDH,
+    PDL,
+    PMH,
+    PML,
+    PWH,
+    PWL,
+)
 from smc_zero.strategy.base import intents_frame
 from smc_zero.strategy.intents import build_intents
 
@@ -236,16 +258,56 @@ def _record_pristine_cases(tmp_path: Path) -> list[dict[str, Any]]:
     return [pickle.loads(path.read_bytes()) for path in sorted(cases.glob("*.pkl"))]
 
 
+#: The level significance of prod's ``LEVEL_PRIORITY`` table (``core.py`` lines 122-138), as an
+#: order the oracle states for itself: PDH/PDL above PWH/PWL above PMH/PML above the session
+#: ranges, Asian before London before NY.
+LEVEL_SIGNIFICANCE: dict[str, int] = {
+    PDH: 1,
+    PDL: 1,
+    PWH: 2,
+    PWL: 2,
+    PMH: 3,
+    PML: 3,
+    ASIAN_HIGH: 4,
+    ASIAN_LOW: 4,
+    LONDON_HIGH: 5,
+    LONDON_LOW: 5,
+    NY_HIGH: 6,
+    NY_LOW: 6,
+}
+
+
+def _one_intent_per_bar(intents: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Return ``intents`` with the same-bar duplicates of п.35 dropped - the Э9''.1 rule, restated.
+
+    prod left its loop over a bar at the first accepted setup, so a bar carried one order at most;
+    the new chain keeps the instance standing higher in ``LEVEL_PRIORITY``, the instance the walk met
+    first winning a tie, and leaves the survivors in the order they were accepted in.  The statement
+    is deliberately this file's own: an oracle that imported the rule from the chain would agree with
+    any bug in it.
+    """
+    best: dict[int, tuple[int, int]] = {}
+    for index, intent in enumerate(intents):
+        rank = LEVEL_SIGNIFICANCE.get(str(intent.level_name), 99)
+        seen = best.get(intent.bar)
+        if seen is None or rank < seen[0]:
+            best[intent.bar] = (rank, index)
+    keep = {index for _, index in best.values()}
+    return tuple(intent for index, intent in enumerate(intents) if index in keep)
+
+
 def _replay(case: dict[str, Any]) -> None:
     """Run the current chain on the recorded arguments and compare both faces of the verdict.
 
     The intents are compared as frames, which keeps the acceptance order (the frame is built in the
-    order of the tuple) as well as every value and dtype; the ledger is compared frame for frame.
-    Nothing is normalised and nothing is allowed to be "close enough": this is the gate Э9' is
-    accepted on (SPEC_SMC.md §7.13).
+    order of the tuple) as well as every value and dtype; the recorded intents are filtered by the
+    same-bar rule of Э9''.1 first (:func:`_one_intent_per_bar`), the ledger is not.  Nothing is
+    normalised and nothing is allowed to be "close enough": this is the gate Э9' is accepted on
+    (SPEC_SMC.md §7.13).
     """
     out = build_intents(*case["args"], **case["kwargs"])
-    assert_frame_equal(intents_frame(out.intents), intents_frame(case["intents"]))
+    expected = _one_intent_per_bar(case["intents"])
+    assert_frame_equal(intents_frame(out.intents), intents_frame(expected))
     assert_frame_equal(out.rejections, case["rejections"])
 
 

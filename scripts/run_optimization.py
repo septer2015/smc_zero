@@ -19,14 +19,15 @@ parameter sets, prints the ten best finished trials and then the winner, and re-
 a single backtest over the whole window.  Four files land in
 ``./reports/optimization_<symbol>_<tf>_<start>_<end>_n<t>/``:
 
-* ``best_params.json`` - the winner's parameters, its study score, the fold counts and the
-  aggregates of both windows: the audit line of the run, and the only place the in-sample numbers
-  are written down;
+* ``best_params.json`` - the winner's parameters, its study score, the two weights that produced it
+  (``score_metric`` / ``penalty_power``), the fold counts and the aggregates of both windows: the
+  audit line of the run, and the only place the in-sample numbers are written down;
 * ``trades.csv`` / ``trades.parquet`` - the trade log of the winner's full-window run;
 * ``summary.txt`` - the metric table of that run (the costs of rule 4 included);
 * ``fold_metrics.csv`` - one long table: ``fold`` / ``window`` / the six fields of
   :data:`~smc_zero.backtester.FOLD_METRIC_FIELDS`, two rows per fold (its fit window and its
-  out-of-sample window) and four summary rows labelled ``mean`` and ``std``.
+  out-of-sample window) and four summary rows labelled ``mean`` and ``std``; the ``mean`` rows
+  additionally carry the three score inputs of :data:`SCORE_COLUMNS`.
 
 The winner is *reported* on the full window on purpose: the fold tables say what the score was
 computed on, the summary says what those parameters do over the whole tape with all their trades.
@@ -57,11 +58,20 @@ from smc_zero.backtester import (
     split_walkforward,
 )
 from smc_zero.config import BacktestConfig, OptunaConfig, StrategyConfig, WalkForwardConfig
-from smc_zero.optimizer import FoldEvaluation, OptunaResult, build_tape_marks, run_optimization
+from smc_zero.optimizer import (
+    FoldEvaluation,
+    OptunaResult,
+    build_tape_marks,
+    degradation_factor,
+    run_optimization,
+)
 from smc_zero.strategy.intents import build_intents
 
 #: How many finished trials the console prints, best first.
 TOP_TRIALS = 10
+#: The score inputs of §7.11 п.69 that ``fold_metrics.csv`` repeats on its ``mean`` rows: the
+#: aggregate profit of each window and the ratio the decay gate weighs.
+SCORE_COLUMNS: tuple[str, ...] = ("train_profit_mean", "test_profit_mean", "degradation_ratio")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,7 +106,8 @@ def _walk_forward_config(args: argparse.Namespace) -> WalkForwardConfig:
 
     ``--min-train-bars`` and ``--test-period-bars`` are what makes a short window hold a fold at
     all (§7.10 п.61), which is what a smoke run or a test needs; leaving both alone keeps the
-    defaults of :class:`~smc_zero.config.WalkForwardConfig` (5760 / 1920 bars).  The config
+    defaults of :class:`~smc_zero.config.WalkForwardConfig` (11 520 / 5 760 bars - a 120 day
+    warm-up and the 60 day out-of-sample window of the study).  The config
     validates the pair itself, so ``--min-train-bars 0`` is a ``ValueError`` and not a silent
     default.
     """
@@ -130,15 +141,31 @@ def _fold_frame(evaluation: FoldEvaluation) -> pd.DataFrame:
     simulated) and four summary rows: ``mean`` and ``std`` of each window's column, read straight
     from the aggregates :func:`~smc_zero.optimizer.evaluate_params` already reported - so the table
     a reader opens and the score a trial was ranked by cannot disagree.
+
+    The two ``mean`` rows also carry the three numbers the score of §7.11 п.69 reads beside its
+    metrics (:data:`SCORE_COLUMNS`): the aggregate profit of each window and their ratio - the
+    factor :func:`~smc_zero.optimizer.degradation_factor` hands the study (whether or not
+    ``penalty_power`` applies it).  Every other row leaves them empty: a fold's own profit is
+    already its ``profit`` column, and a run-level number repeated beside it would read as that
+    fold's.
     """
     rows: list[dict[str, Any]] = []
+    blank: dict[str, float] = dict.fromkeys(SCORE_COLUMNS, float("nan"))
     for index, (train, test) in enumerate(
         zip(evaluation.fold_metrics_train, evaluation.fold_metrics_test, strict=True)
     ):
         for window, table in (("train", train), ("test", test)):
             row: dict[str, Any] = {"fold": index, "window": window}
             row.update({field: table[field] for field in FOLD_METRIC_FIELDS})
+            row.update(blank)
             rows.append(row)
+    train_profit = float(evaluation.train_aggregated["profit_mean"])
+    test_profit = float(evaluation.test_aggregated["profit_mean"])
+    score_inputs: dict[str, float] = {
+        "train_profit_mean": train_profit,
+        "test_profit_mean": test_profit,
+        "degradation_ratio": degradation_factor(train_profit, test_profit),
+    }
     for window, aggregate in (
         ("train", evaluation.train_aggregated),
         ("test", evaluation.test_aggregated),
@@ -146,6 +173,7 @@ def _fold_frame(evaluation: FoldEvaluation) -> pd.DataFrame:
         for label in ("mean", "std"):
             row = {"fold": label, "window": window}
             row.update({field: aggregate[f"{field}_{label}"] for field in FOLD_METRIC_FIELDS})
+            row.update(score_inputs if label == "mean" else blank)
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -177,6 +205,7 @@ def _report_payload(
         "n_jobs": int(study_config.n_jobs),
         "seed": int(study_config.seed),
         "score_metric": study_config.score_metric,
+        "penalty_power": float(study_config.penalty_power),
         "min_train_bars": int(walk_config.min_train_bars),
         "test_period_bars": int(walk_config.test_period_bars),
         "best_trial_number": int(outcome.best_trial_number),

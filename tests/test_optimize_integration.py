@@ -12,7 +12,8 @@ trials and the parameters of the winner), not a profit.
 
 Two runs are driven by a stub study and a stub evaluator instead of optuna, so the search loop is
 tested without the library: the trial schedule of the fixture makes the ranking of the trials
-observable by hand (``sweep_buffer_pip`` 1, 5, 3 -> 0.18, 0.9, 0.54).
+observable by hand (``sweep_buffer_pip`` 1, 5, 3 -> 1.82, 9.09, 5.45 - the score of §7.11 п.69
+grows with the test window's profit).
 
 The mutations the layer is one line away from, and the test each one must break:
 
@@ -170,7 +171,8 @@ class _StubEvaluator:
     It stands in for :func:`~smc_zero.optimizer.evaluate_params` where the point of a test is the
     *study* rather than the simulation: the test window's profit is proportional to the parameter
     the fixture searches, so the score of a trial is
-    ``2 * (1 - 10/100) * min(1, 10 * sweep / 100) = 0.18 * sweep`` - a ranking a reader can redo.
+    ``2 * (10 * sweep) / (1 + 10) = 1.818 * sweep`` - a ranking a reader can redo (the decay gate
+    is off at the default ``penalty_power``, and the fixture's train window is a constant).
     """
 
     def __init__(self) -> None:
@@ -310,15 +312,18 @@ def test_the_study_ranks_its_trials_by_the_out_of_sample_window() -> None:
         study_factory=_stub_study,
     )
 
-    # The schedule proposes sweep_buffer_pip 1, 5, 3; the score grows with it, so the middle
-    # trial wins. An objective reading the train side would tie all three (m1), one without the
-    # decay factor would tie them at 1.8 - and the runner would report trial 0 (m2).
+    # The schedule proposes sweep_buffer_pip 1, 5, 3; the score grows with the test window's
+    # profit, so the middle trial wins. An objective reading the train side would tie all three
+    # (m1), one without the profit factor would tie them at 2/11 - and the runner would report
+    # trial 0 (m2).
     assert [trial.params[SWEEP] for trial in result.study.trials] == [1, 5, 3]
-    assert [trial.value for trial in result.study.trials] == pytest.approx([0.18, 0.9, 0.54])
+    assert [trial.value for trial in result.study.trials] == pytest.approx(
+        [2.0 * 10.0 * sweep / 11.0 for sweep in (1, 5, 3)]
+    )
     assert result.best_trial_number == 1
     assert result.best_params[SWEEP] == 5
     assert result.strategy.sweep_buffer_pip == 5.0
-    assert result.best_score == pytest.approx(0.9)
+    assert result.best_score == pytest.approx(2.0 * 50.0 / 11.0)
     # The reported metrics are the winner's own, recomputed after the study.
     assert result.best_evaluation.test_aggregated["profit_mean"] == 50.0
     assert result.best_score == pytest.approx(
@@ -356,4 +361,6 @@ def test_a_seeded_optuna_study_is_reproducible() -> None:
     # The same seed, tape and space give the same run: an optimization report is auditable.
     assert result.best_params == again.best_params
     assert result.best_score == again.best_score
-    assert result.best_score == pytest.approx(0.18 * float(result.best_params[SWEEP]))
+    assert result.best_score == pytest.approx(
+        2.0 * 10.0 * float(result.best_params[SWEEP]) / 11.0
+    )

@@ -17,7 +17,12 @@ What is pinned here:
   (``sweep_index``) - which is the mutation m2 of §7.13;
 * the *equivalence* of the vectorised sweep with the scalar rule that is still shipped in
   :mod:`smc_zero.indicators.liquidity`: on random tapes every bar is asked both ways, and the
-  attempt set has to be exactly "the bars where ``sweep_index`` answers a bar".
+  attempt set has to be exactly "the bars where ``sweep_index`` answers a bar";
+* the *same-bar rule* of п.35 (Э9''.1): two setups that reach the same bar leave one intent - the
+  one whose level stands higher in ``LEVEL_PRIORITY`` - and the dropped setup writes no ledger row,
+  because prod never evaluated it either.  Its mutation m3 of Э9''.1 ("keep every accepted intent",
+  i.e. no dedup at all) turns
+  :func:`test_one_bar_carries_the_most_significant_level_of_two_setups` red.
 
 The scalar rule is the reference implementation of the sweep *window* (it stays the module's single
 statement of the rule), and the random comparison is what makes the vectorised replacement of it
@@ -44,6 +49,7 @@ from smc_zero.indicators.levels import (
     LEVEL_NAME_COLUMN,
     LEVEL_PRICE_COLUMN,
     LEVEL_SOURCE_WINDOW_COLUMN,
+    LONDON_HIGH,
     PDH,
 )
 from smc_zero.indicators.liquidity import sweep_index
@@ -279,3 +285,24 @@ def test_the_vectorized_sweep_answers_exactly_what_the_scalar_rule_answers(upper
     )
     assert attempts.tolist() == np.flatnonzero(scalar >= 0).tolist()
     assert sweep.tolist() == scalar[attempts].tolist()
+
+
+def test_one_bar_carries_the_most_significant_level_of_two_setups() -> None:
+    """Two levels swept into one bar leave one intent, and the dropped one is no rejection (m3).
+
+    ``PDH = 100.50`` and ``LondonH = 100.30`` are both swept, both are broken by the CHoCH of bar 29
+    and both reach the same gap on bar 32 - so the Э4' walk placed two orders on that bar, and the
+    rule of п.35 keeps prod's one: the level standing higher in ``LEVEL_PRIORITY`` (PDH, 1) outranks
+    the session range (LondonH, 5), whatever the order of the book is.  The dropped setup is *not* a
+    refusal - prod never evaluated it - so it leaves no ledger row, while every refused attempt of
+    both instances is still written down.
+    """
+    for book in (
+        _book((LONDON_HIGH, 100.30, True, None, None), (PDH, LEVEL, True, None, None)),
+        _book((PDH, LEVEL, True, None, None), (LONDON_HIGH, 100.30, True, None, None)),
+    ):
+        chain = _chain(_REVERSAL, levels=book)
+
+        assert [(intent.bar, intent.level_name) for intent in chain.intents] == [(32, PDH)]
+        assert 32 not in set(chain.rejections["bar"].tolist()), "the dropped setup is no refusal"
+        assert set(chain.rejections["name"]) == {PDH, LONDON_HIGH}

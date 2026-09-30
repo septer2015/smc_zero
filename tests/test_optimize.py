@@ -10,9 +10,10 @@ The mutations the layer is one line away from, and the test each one must break:
 * m1 "read the score out of the *train* half of the tables" (``score_from_aggregates`` called
   with the weight window swapped) - a study that optimizes in sample, which is the whole point
   of the gate; breaks :func:`test_the_score_reads_the_out_of_sample_side_of_the_folds`;
-* m2 "drop the decay factor" (return the leading metric times the drawdown factor) - an
-  overfitted parameter set scores as high as one that held up; breaks
-  :func:`test_the_score_is_the_product_of_the_three_factors`;
+* m2 "drop a factor of the product" (the leading metric, the profit of the test window or its
+  drawdown divisor) - a trial that made nothing, or lost money out of sample, would then rank
+  by its headline metric alone; breaks
+  :func:`test_the_score_is_the_product_of_the_test_window_factors`;
 * m3 "penalise a losing train window as if its edge had decayed" (a negative train profit
   makes the ratio negative) - a trial is punished for a reference that carries no edge; breaks
   :func:`test_a_losing_train_window_is_not_penalised`;
@@ -20,6 +21,9 @@ The mutations the layer is one line away from, and the test each one must break:
   nothing, or treats ``bias.agreement`` as a stale field) - trials are scored against a markup
   of another strategy; breaks :func:`test_a_frozen_field_makes_the_cache_stale` and
   :func:`test_the_ab_factor_is_allowed_to_differ_from_the_cache`.
+* m5 "ignore ``penalty_power``" (the decay factor is applied once whatever the run asked for) -
+  a study run with the gate off would silently rank by the old ungated product; breaks
+  :func:`test_the_penalty_power_weighs_the_decay_and_zero_switches_it_off`.
 """
 
 from __future__ import annotations
@@ -49,10 +53,13 @@ from smc_zero.optimizer import (
 )
 
 #: The aggregate tables of the worked example, and the score they must produce by hand:
-#: ``2.0 * (1 - 0.10) * min(1, 50 / 100) = 0.9``.
+#: ``2.0 * 50 / (1 + 10) = 9.0909...`` - the metric, the profit and the drawdown of the test
+#: window, with the decay gate off (``penalty_power = 0``, the default).
 TRAIN = {"profit_mean": 100.0, "max_dd_mean": 40.0, "sharpe_mean": 3.0}
 TEST = {"profit_mean": 50.0, "max_dd_mean": 10.0, "sharpe_mean": 2.0}
-HAND_CALC = 0.9
+HAND_CALC = 2.0 * 50.0 / 11.0
+#: The same score with the plain decay gate of п.69 on: half of the train profit survived.
+HAND_CALC_GATED = HAND_CALC * 0.5
 
 
 class _StubTrial:
@@ -112,74 +119,92 @@ def _marks(config: StrategyConfig | None = None) -> TapeMarks:
     )
 
 
-def test_the_score_is_the_product_of_the_three_factors() -> None:
-    """The score is ``leading * drawdown * decay`` - and dropping the gate inflates it (m2)."""
+def test_the_score_is_the_product_of_the_test_window_factors() -> None:
+    """The score is ``metric * profit / (1 + drawdown)``: dropping a factor breaks it (m2)."""
     score = score_from_aggregates(TRAIN, TEST)
 
-    assert score == pytest.approx(2.0 * (1 - 0.10) * (50.0 / 100.0))
+    assert score == pytest.approx(2.0 * 50.0 / (1.0 + 10.0))
     assert score == pytest.approx(HAND_CALC)
-    # m2: without the decay factor the overfit trial above would score 1.8 instead of 0.9.
-    assert score != pytest.approx(HAND_CALC / (50.0 / 100.0))
+    # m2: the leading metric alone would score 2.0, and the profit without its divisor 100.0.
+    assert score != pytest.approx(2.0)
+    assert score != pytest.approx(2.0 * 50.0)
 
 
 def test_the_score_reads_the_out_of_sample_side_of_the_folds() -> None:
-    """Swapping the two tables scores the fit window, i.e. exactly what the gate forbids (m1)."""
+    """Swapping the two tables scores the fit window, i.e. exactly what the layer forbids (m1)."""
     assert score_from_aggregates(TRAIN, TEST) == pytest.approx(HAND_CALC)
-    assert score_from_aggregates(TEST, TRAIN) == pytest.approx(3.0 * (1 - 0.40))
+    assert score_from_aggregates(TEST, TRAIN) == pytest.approx(3.0 * 100.0 / 41.0)
 
 
 def test_the_score_metric_picks_the_leading_number_of_the_test_window() -> None:
-    """``score_metric`` names the headline number; the profit gate is used either way."""
+    """``score_metric`` names the headline number; the profit factor is used either way."""
     by_profit = score_from_aggregates(TRAIN, TEST, OptunaConfig(score_metric="profit"))
     by_sharpe = score_from_aggregates(TRAIN, TEST, OptunaConfig(score_metric="sharpe"))
 
-    assert by_profit == pytest.approx(50.0 * 0.90 * 0.50)
-    assert by_sharpe == pytest.approx(2.0 * 0.90 * 0.50)
+    assert by_profit == pytest.approx(50.0 * 50.0 / 11.0)
+    assert by_sharpe == pytest.approx(2.0 * 50.0 / 11.0)
+
+
+def test_the_penalty_power_weighs_the_decay_and_zero_switches_it_off() -> None:
+    """The gate is off at ``penalty_power = 0`` (the default) and applies the ratio when on (m5)."""
+    off = score_from_aggregates(TRAIN, TEST)
+    once = score_from_aggregates(TRAIN, TEST, OptunaConfig(penalty_power=1.0))
+    twice = score_from_aggregates(TRAIN, TEST, OptunaConfig(penalty_power=2.0))
+
+    assert OptunaConfig().penalty_power == 0.0
+    assert off == pytest.approx(HAND_CALC)
+    assert once == pytest.approx(HAND_CALC_GATED)
+    assert twice == pytest.approx(HAND_CALC_GATED * 0.5)
 
 
 def test_the_decay_gate_always_measures_profit_not_the_leading_metric() -> None:
     """A train window with a brilliant Sharpe ratio still only gates through its profit."""
     rich_train = {**TRAIN, "sharpe_mean": 100.0}
+    gate = OptunaConfig(penalty_power=1.0)
 
-    assert score_from_aggregates(rich_train, TEST) == pytest.approx(HAND_CALC)
-
-
-def test_the_penalty_power_weighs_the_decay() -> None:
-    """``penalty_power`` squares / cubes the shortfall instead of applying it once."""
-    once = score_from_aggregates(TRAIN, TEST, OptunaConfig(penalty_power=1.0))
-    twice = score_from_aggregates(TRAIN, TEST, OptunaConfig(penalty_power=2.0))
-
-    assert once == pytest.approx(1.8 * 0.5)
-    assert twice == pytest.approx(1.8 * 0.25)
+    assert score_from_aggregates(rich_train, TEST, gate) == pytest.approx(HAND_CALC_GATED)
 
 
-def test_the_drawdown_factor_spans_zero_to_one_and_never_goes_negative() -> None:
-    """The factor is the untouched score at a flat curve and zero at a wiped-out account."""
+def test_the_drawdown_divisor_shrinks_with_the_drawdown_and_never_reaches_zero() -> None:
+    """The factor is ``1 / (1 + dd)``: a flat curve keeps its score, a deep one keeps a share."""
     assert drawdown_factor(0.0) == 1.0
-    assert drawdown_factor(5.0) == pytest.approx(0.95)
-    assert drawdown_factor(50.0) == pytest.approx(0.5)
-    assert drawdown_factor(100.0) == 0.0
-    # Beyond full drawdown the factor stays at zero: losing more cannot *raise* the score.
-    assert drawdown_factor(150.0) == 0.0
+    assert drawdown_factor(5.0) == pytest.approx(1.0 / 6.0)
+    assert drawdown_factor(50.0) == pytest.approx(1.0 / 51.0)
+    assert drawdown_factor(100.0) == pytest.approx(1.0 / 101.0)
+    # A curve cannot draw down *upwards*: a negative reading is a flat one, never a bonus.
+    assert drawdown_factor(-5.0) == 1.0
 
 
-def test_a_losing_test_window_scores_zero_and_a_losing_train_window_is_not_penalised() -> None:
-    """The two edges of the gate: no OOS profit is no score, a losing reference has no edge (m3)."""
-    losing_test = score_from_aggregates(TRAIN, {**TEST, "profit_mean": -25.0})
-    losing_train = score_from_aggregates({**TRAIN, "profit_mean": -20.0}, TEST)
+def test_a_losing_train_window_is_not_penalised() -> None:
+    """A reference without an edge is no degradation to measure: the gate stays at one (m3)."""
+    gate = OptunaConfig(penalty_power=1.0)
 
-    assert losing_test == 0.0
-    assert degradation_factor(100.0, -25.0) == 0.0
     assert degradation_factor(0.0, -25.0) == 1.0
     assert degradation_factor(-20.0, 50.0) == 1.0
-    # A reference without an edge leaves the trial judged by what it made out of sample (m3).
-    assert losing_train == pytest.approx(1.8)
+    # With the gate on the score is the test window's own - not the half the ratio would take.
+    assert score_from_aggregates({**TRAIN, "profit_mean": -20.0}, TEST, gate) == pytest.approx(
+        HAND_CALC
+    )
+
+
+def test_a_losing_test_window_scores_zero_with_the_gate_and_negative_without_it() -> None:
+    """The gate clamps a losing out-of-sample window at zero; without it the profit keeps the sign."""
+    losing_test = {**TEST, "profit_mean": -25.0}
+
+    assert degradation_factor(100.0, -25.0) == 0.0
+    assert score_from_aggregates(TRAIN, losing_test, OptunaConfig(penalty_power=1.0)) == 0.0
+    # With the gate off the profit factor carries the sign: the trial ranks below every winner.
+    assert score_from_aggregates(TRAIN, losing_test) < 0.0
 
 
 def test_outperforming_the_train_window_earns_no_bonus() -> None:
     """The ratio is clamped: doubling the in-sample result is luck, not a better score."""
+    gate = OptunaConfig(penalty_power=1.0)
+
     assert degradation_factor(50.0, 100.0) == 1.0
-    assert score_from_aggregates(TRAIN, {**TEST, "profit_mean": 400.0}) == pytest.approx(1.8)
+    assert score_from_aggregates(TRAIN, {**TEST, "profit_mean": 400.0}, gate) == pytest.approx(
+        2.0 * 400.0 / 11.0
+    )
 
 
 def test_a_table_without_the_leading_metric_is_refused() -> None:
@@ -400,7 +425,7 @@ class _RecordingEvaluator:
 
 
 def test_the_objective_scores_the_out_of_sample_side_of_the_folds() -> None:
-    """The objective returns the OOS score of the trial - in-sample would score 1.8 here (m1)."""
+    """The objective returns the OOS score of the trial - in-sample would score 7.32 here (m1)."""
     evaluator = _RecordingEvaluator()
     objective = make_objective(pd.DataFrame(), marks=_marks(), evaluate=evaluator)
 

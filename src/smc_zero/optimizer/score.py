@@ -2,21 +2,25 @@
 
 One number has to rank two parameter sets of the same walk-forward, and it is built from
 the *aggregated fold tables* of Э6' - never from a single fold and never from the train
-window alone.  The score is a product of three factors (SPEC_SMC.md §7.11 п.69):
+window alone.  The score is a product of four factors (SPEC_SMC.md §7.11 п.69, ред. Э9''.1):
 
 ============== ==================================================================
 leading        the headline metric of the out-of-sample folds the study maximises
                (``sharpe_mean`` or ``profit_mean``), i.e. what a trial actually earned;
-drawdown       ``1 - max_dd_mean/100``: what the equity did on the way there;
+profit         ``profit_mean(test)``: the same window's result in percent, so a trial
+               that scores by Sharpe still has to *make* money to rank high;
+drawdown       ``1 / (1 + max_dd_mean(test))``: what the equity paid on the way there;
 decay gate     ``min(1, profit_mean(test) / profit_mean(train)) ** penalty_power``:
                how much of the in-sample edge survived the out-of-sample window.
 ============== ==================================================================
 
-The third factor is the **OOS gate**: a parameter set that fits its train window better
-than its test window is scaled down by exactly how much it fell short, so a study
-maximising the score cannot buy rank by overfitting.  The edge rules of the factors (a
-losing train window has no edge to decay, a losing test window scores zero, a 100 %
-drawdown scores zero) are stated on the functions below and pinned by tests.
+The last factor is the **OOS gate**, and it is the one factor an operator can switch off:
+``penalty_power = 0`` (the default) leaves the pure out-of-sample reading - the metric,
+the profit and the drawdown of the *test* window - while ``1.0`` is the plain product of
+the sketch and a larger value is stricter about a parameter set that only fits its past.
+The edge rules of the factors (a losing train window has no edge to decay, a losing test
+window cannot flip the sign of the ratio, a curve that never drew down is not rewarded)
+are stated on the functions below and pinned by tests.
 
 The module is a pair of pure functions over ``dict`` tables: it knows nothing about
 optuna, the engine or the strategy, so the formula can be read, argued about and tested
@@ -45,14 +49,16 @@ def _metric(table: Mapping[str, float], key: str) -> float:
 
 
 def drawdown_factor(max_dd_mean: float) -> float:
-    """Return ``1 - max_dd_mean/100``, floored at zero.
+    """Return ``1 / (1 + max_dd_mean)``: the share of the score a drawdown leaves.
 
-    The factor throttles a curve that reaches its result by way of a deep drawdown: 5 %
-    of mean drawdown keeps 95 % of the score, 50 % keeps half.  At 100 % - and beyond -
-    the factor is ``0`` rather than negative, so a losing account cannot be turned into a
-    *better* score by losing more.
+    The factor throttles a trial that reaches its result by way of a deep drawdown: 5 % of
+    mean drawdown keeps ``1/6`` of the score, 10 % keeps ``1/11``, 50 % keeps ``1/51``.  A
+    divisor and not a subtraction, because it must never run out of range: it stays inside
+    ``(0, 1]`` for every reading, so *losing* more can only ever lower a score, and a curve
+    that never drew down (a negative reading cannot happen, but a zero one can) is simply
+    not throttled.
     """
-    return max(0.0, 1.0 - min(float(max_dd_mean), 100.0) / 100.0)
+    return 1.0 / (1.0 + max(0.0, float(max_dd_mean)))
 
 
 def degradation_factor(
@@ -72,8 +78,10 @@ def degradation_factor(
     A **losing train window** (``train_profit_mean <= 0``) returns ``1.0``: there is no
     in-sample edge whose decay could be measured, so the trial is judged by what it made
     out of sample - punishing it here would mean inventing a degradation that was never
-    observed.  ``power`` (``OptunaConfig.penalty_power``) weighs the factor: ``1.0`` is the
-    plain ratio of the sketch, a larger value is stricter about decay.
+    observed.  ``power`` (``OptunaConfig.penalty_power``) weighs the factor: ``0.0``
+    switches the gate off - the factor is ``1`` whatever the ratio - ``1.0`` (this
+    function's own default, the plain ratio of the sketch) applies it once, and a larger
+    value is stricter about decay.
     """
     if train_profit_mean <= 0.0:
         return 1.0
@@ -94,15 +102,20 @@ def score_from_aggregates(
     them and never recomputed::
 
         score = <score_metric>_mean(test)
-                * (1 - max_dd_mean(test) / 100)
+                * profit_mean(test)
+                / (1 + max_dd_mean(test))
                 * min(1, profit_mean(test) / profit_mean(train)) ** penalty_power
 
     ``cfg`` supplies the two decisions of :class:`~smc_zero.config.OptunaConfig`:
     :attr:`~smc_zero.config.OptunaConfig.score_metric` names the leading metric
     (``"sharpe"`` or ``"profit"``) and
-    :attr:`~smc_zero.config.OptunaConfig.penalty_power` the weight of the OOS gate.  The
-    profit ratio of the gate is always the *profit* one, whatever the leading metric is:
-    it measures how much of the in-sample result survived, and percentages are comparable
+    :attr:`~smc_zero.config.OptunaConfig.penalty_power` the weight of the OOS gate -
+    ``0.0`` (the default) switches the gate off and reads the test window alone.  Every
+    other factor is read from the *test* half as well: out-of-sample is what the layer
+    ranks, so a trial that only fits its past cannot buy rank here.  The profit factor
+    carries the sign: a losing test window scores below every profitable one.  The profit
+    ratio of the gate is always the *profit* one, whatever the leading metric is: it
+    measures how much of the in-sample result survived, and percentages are comparable
     across folds in a way a Sharpe ratio is not.
 
     A table without one of the needed entries - or with a non-finite number in it - raises
@@ -110,10 +123,11 @@ def score_from_aggregates(
     """
     config = OptunaConfig() if cfg is None else cfg
     leading = _metric(test_aggregated, f"{config.score_metric}_mean")
+    profit = _metric(test_aggregated, "profit_mean")
     drawdown = drawdown_factor(_metric(test_aggregated, "max_dd_mean"))
     decay = degradation_factor(
         _metric(train_aggregated, "profit_mean"),
-        _metric(test_aggregated, "profit_mean"),
+        profit,
         config.penalty_power,
     )
-    return leading * drawdown * decay
+    return leading * profit * drawdown * decay

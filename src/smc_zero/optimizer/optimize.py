@@ -16,9 +16,10 @@ run is:
 
 Nothing is simulated on a window that had not closed before it started: the fold split is
 Э6' unchanged, the intents of a fold are armed on that fold's test window only (the
-contract of §7.10 п.65) and the score gate compares a trial's own out-of-sample result
-with its in-sample one, so a parameter set that only fits the past is penalised instead of
-being picked.
+contract of §7.10 п.65) and the score reads the trial's own *out-of-sample* folds; the gate
+that weighs them against the in-sample result is the operator's and is **off** at the
+default ``penalty_power = 0`` (Э9''.1), so the layer as shipped never ranks a trial on the
+past.
 
 optuna is imported lazily by :func:`_create_study`, which is why this module - and its
 tests - work without the library installed: the search space, the score and the trial
@@ -183,7 +184,7 @@ def make_objective(
         )
 
     def objective(trial: TrialLike) -> float:
-        """Score one trial: suggest, apply, evaluate on both windows, gate."""
+        """Score one trial: suggest, apply, evaluate on both windows, weigh them."""
         params = suggest_params(trial)
         cfg_strategy = apply_params(base_cfg, params)
         evaluation = evaluate(df, cache, cfg_strategy, walk_cfg, backtest_cfg, spec)

@@ -179,6 +179,9 @@ def test_the_optimization_runner_returns_zero_and_writes_its_report(
     assert payload["best_params"] == PARAMS
     assert payload["best_score"] == pytest.approx(SCORE)
     assert payload["folds"] == 2
+    # The report records how the score was computed: its metric and the weight of the decay gate.
+    assert payload["score_metric"] == "sharpe"
+    assert payload["penalty_power"] == pytest.approx(0.0)
     assert payload["test"]["profit_mean"] == pytest.approx(0.6)
     assert payload["train"]["profit_mean"] == pytest.approx(1.5)
     assert (folder / "summary.txt").read_text(encoding="utf-8").startswith("SMC backtest")
@@ -203,6 +206,17 @@ def test_the_fold_table_of_the_report_holds_both_windows_and_their_means(
     means = table.loc[table["fold"] == "mean"]
     test_mean = float(means.loc[means["window"] == "test", "profit"].iloc[0])
     assert test_mean == pytest.approx(0.6)
+    # The ``mean`` rows also carry the score inputs of §7.11 п.69: the aggregate profit of each
+    # window and the ratio the decay gate weighs.
+    for window in ("train", "test"):
+        row = means.loc[means["window"] == window].iloc[0]
+        assert float(row["train_profit_mean"]) == pytest.approx(1.5)
+        assert float(row["test_profit_mean"]) == pytest.approx(0.6)
+        assert float(row["degradation_ratio"]) == pytest.approx(0.4)
+    # Every other row leaves them empty: a fold's own profit is its ``profit`` column, and the
+    # spread rows are a reading of those columns, not of the run.
+    other = table.loc[~table["fold"].eq("mean")]
+    assert other["degradation_ratio"].isna().all()
 
 
 def test_the_runner_prints_only_the_ten_best_finished_trials(

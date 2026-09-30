@@ -118,23 +118,23 @@ def test_a_tape_too_short_for_one_fold_has_no_folds() -> None:
 
 
 def test_the_default_windows_are_the_m15_units_of_the_project() -> None:
-    """The default config is the 60 / 20 / 120 day triple in M15 bars of 96 bars a day."""
+    """The default config is the 120 / 60 / 120 day triple in M15 bars of 96 bars a day."""
     config = WalkForwardConfig()
 
     assert config.anchored is True
-    assert config.test_period_bars == 96 * 20
-    assert config.min_train_bars == 96 * 60
+    assert config.test_period_bars == 96 * 60
+    assert config.min_train_bars == 96 * 120
     assert config.train_period_bars == 96 * 120
 
 
-def test_the_default_windows_cut_four_years_into_a_fine_grained_grid() -> None:
-    """On four years of M15 bars the defaults make 47 folds - the arithmetic of §7.10 п.62."""
+def test_the_default_windows_cut_four_years_into_a_grid_of_fourteen_folds() -> None:
+    """On four years of M15 bars the defaults make 14 folds - the arithmetic of §7.10 п.62."""
     four_years = 96 * 250 * 4
     folds = split_walkforward(_frame(four_years), WalkForwardConfig())
 
-    assert len(folds) == 47
-    assert (len(folds[0][0]), len(folds[0][1])) == (96 * 60, 96 * 20)
-    assert (len(folds[-1][0]), len(folds[-1][1])) == (96 * 60 + 46 * 96 * 20, 96 * 20)
+    assert len(folds) == 14
+    assert (len(folds[0][0]), len(folds[0][1])) == (96 * 120, 96 * 60)
+    assert (len(folds[-1][0]), len(folds[-1][1])) == (96 * 120 + 13 * 96 * 60, 96 * 60)
 
 
 @pytest.mark.parametrize("field", ["min_train_bars", "test_period_bars", "train_period_bars"])

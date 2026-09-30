@@ -777,19 +777,17 @@ class WalkForwardConfig:
     tape of ``n`` bars is ``max(0, (n - min_train_bars) // test_period_bars)`` - the same
     number for both schemes, only the train window differs between them.
 
-    The defaults are the M15 units of the project (96 bars a day): a 60 day warm-up, a 20 day
-    out-of-sample window and a 120 day rolling window.  They cut the 100 111 M15 bars of
-    ``./data/EURUSD_M15.csv`` (4.1 years, 2022-08-15 .. 2026-09-22) into **49 folds** - a
-    fine-grained grid, *not* the 6-10 fold span the Э6' sketch expected from them: a 60 day
-    warm-up is 1.6 % of the tape, so the grid is set by ``test_period_bars``, and reaching
-    6-10 folds at a 20 day test window needs a warm-up of about 3.5 years.  The span is
-    therefore a decision about ``min_train_bars`` (SPEC_SMC.md §7.10 п.62 records the
-    arithmetic); the window lengths below stay as specified.
+    The defaults are the M15 units of the project (96 bars a day): a 120 day warm-up, a
+    **60 day** out-of-sample window and a 120 day rolling window.  The 60 day window is the
+    unit an optimization fold is read through (SPEC_SMC.md §7.11 п.69), so a study sees 15
+    folds on the 100 111 M15 bars of ``./data/EURUSD_M15.csv`` (4.1 years, 2022-08-15 ..
+    2026-09-22); SPEC_SMC.md §7.10 п.62 records the arithmetic of both.  The fold count is
+    a decision about ``min_train_bars`` - the window lengths below are what a run is about.
     """
 
     anchored: bool = True
-    test_period_bars: int = 96 * 20
-    min_train_bars: int = 96 * 60
+    test_period_bars: int = 96 * 60
+    min_train_bars: int = 96 * 120
     train_period_bars: int = 96 * 120
 
     def __post_init__(self) -> None:
@@ -812,25 +810,25 @@ class OptunaConfig:
 
     ``score_metric`` names the headline metric of the *out-of-sample* half of the folds
     that the study maximises - ``sharpe`` (the default) or ``profit`` - and
-    ``penalty_power`` weighs the third factor of the score: the train -> test degradation
-    (:func:`smc_zero.optimizer.score.score_from_aggregates`).  The plain product of
-    SPEC_SMC.md §7.11 п.69 is ``penalty_power = 1.0``; a larger power punishes a trial
-    that only looks good in sample harder, i.e. pulls the study towards parameters whose
-    in-sample edge survives out of sample.
+    ``penalty_power`` weighs the last factor of the score: the train -> test degradation
+    (:func:`smc_zero.optimizer.score.score_from_aggregates`).  ``0.0`` (the default)
+    switches that gate off, so the score is the pure out-of-sample reading of the test
+    window; ``1.0`` is the plain product of SPEC_SMC.md §7.11 п.69, and a larger power
+    punishes a trial that only looks good in sample harder, i.e. pulls the study towards
+    parameters whose in-sample edge survives out of sample.
 
-    The defaults are sized for a first real run over four years of M15: the 49 folds of
-    ``./data/EURUSD_M15.csv`` at 100 trials single-threaded are an estimated 10-20
-    minutes - still the estimate of the Э7' sketch, not a measurement: the tape *is*
-    tracked with the repository (``./data/``), but the test suite runs on synthetic tapes
-    and never spends ten minutes on a full study, so the honest figure comes from the
-    first real run.
+    The defaults are sized for a first real run over four years of M15 with the 60 day
+    out-of-sample window of :class:`WalkForwardConfig` - 15 folds of
+    ``./data/EURUSD_M15.csv``; what such a study costs is measured on the run itself and
+    never estimated here, because the test suite runs on synthetic tapes and never spends
+    minutes on a full study.
     """
 
     n_trials: int = 100
     n_jobs: int = 1
     seed: int = 42
     score_metric: ScoreMetric = "sharpe"
-    penalty_power: float = 1.0
+    penalty_power: float = 0.0
 
     def __post_init__(self) -> None:
         if self.n_trials < 1:
@@ -841,5 +839,5 @@ class OptunaConfig:
             raise ValueError(
                 f"score_metric must be one of {SCORE_METRICS}, got {self.score_metric!r}"
             )
-        if self.penalty_power <= 0:
-            raise ValueError("penalty_power must be > 0")
+        if self.penalty_power < 0:
+            raise ValueError("penalty_power must be >= 0 (0 switches the decay gate off)")

@@ -8,11 +8,21 @@ window alone.  The score is a product of four factors (SPEC_SMC.md §7.11 п.69,
 leading        the headline metric of the out-of-sample folds the study maximises
                (``sharpe_mean`` or ``profit_mean``), i.e. what a trial actually earned;
 profit         ``profit_mean(test)``: the same window's result in percent, so a trial
-               that scores by Sharpe still has to *make* money to rank high;
+               that scores by Sharpe still has to *make* money to rank high - and a
+               window that made none (``<= 0``) scores a flat zero, never a magnitude;
 drawdown       ``1 / (1 + max_dd_mean(test))``: what the equity paid on the way there;
 decay gate     ``min(1, profit_mean(test) / profit_mean(train)) ** penalty_power``:
                how much of the in-sample edge survived the out-of-sample window.
 ============== ==================================================================
+
+The product is only taken for a **profitable** out-of-sample window: ``profit_mean(test) <= 0``
+returns ``0.0`` before the factors are multiplied (Э9''.2).  The guard exists because two of the
+factors can be negative at once - a losing window has a negative Sharpe *and* a negative profit -
+and their product is **positive**: without the guard, the worst run of a study was its winner
+(measured: ``sharpe_mean(test) = -0.19`` and ``profit_mean(test) = -127.53`` scored ``+9.6154``).
+A flat window already scored zero, so the guard changes no honest number, it only puts every
+loser at the flat zero of the bottom - below every profitable set, which is the whole ranking
+contract.
 
 The last factor is the **OOS gate**, and it is the one factor an operator can switch off:
 ``penalty_power = 0`` (the default) leaves the pure out-of-sample reading - the metric,
@@ -105,6 +115,7 @@ def score_from_aggregates(
                 * profit_mean(test)
                 / (1 + max_dd_mean(test))
                 * min(1, profit_mean(test) / profit_mean(train)) ** penalty_power
+              = 0                                if profit_mean(test) <= 0
 
     ``cfg`` supplies the two decisions of :class:`~smc_zero.config.OptunaConfig`:
     :attr:`~smc_zero.config.OptunaConfig.score_metric` names the leading metric
@@ -112,11 +123,17 @@ def score_from_aggregates(
     :attr:`~smc_zero.config.OptunaConfig.penalty_power` the weight of the OOS gate -
     ``0.0`` (the default) switches the gate off and reads the test window alone.  Every
     other factor is read from the *test* half as well: out-of-sample is what the layer
-    ranks, so a trial that only fits its past cannot buy rank here.  The profit factor
-    carries the sign: a losing test window scores below every profitable one.  The profit
+    ranks, so a trial that only fits its past cannot buy rank here.  The profit
     ratio of the gate is always the *profit* one, whatever the leading metric is: it
     measures how much of the in-sample result survived, and percentages are comparable
     across folds in a way a Sharpe ratio is not.
+
+    A **losing or flat test window** (``profit_mean(test) <= 0``) scores ``0.0`` whatever its
+    other numbers say (п.69): the leading metric and the profit are both negative there, and
+    their product is positive, so without the guard the study would rank a losing parameter set
+    *above* a profitable one - the exact inversion the layer exists to prevent.  ``0.0`` is the
+    same reading a window with no trades gets, so a loser never outranks a winner and neither of
+    them outranks a profitable set.
 
     A table without one of the needed entries - or with a non-finite number in it - raises
     ``ValueError``: a score assembled from a missing metric would rank trials by nothing.
@@ -124,10 +141,9 @@ def score_from_aggregates(
     config = OptunaConfig() if cfg is None else cfg
     leading = _metric(test_aggregated, f"{config.score_metric}_mean")
     profit = _metric(test_aggregated, "profit_mean")
+    train_profit = _metric(train_aggregated, "profit_mean")
+    if profit <= 0.0:
+        return 0.0
     drawdown = drawdown_factor(_metric(test_aggregated, "max_dd_mean"))
-    decay = degradation_factor(
-        _metric(train_aggregated, "profit_mean"),
-        profit,
-        config.penalty_power,
-    )
+    decay = degradation_factor(train_profit, profit, config.penalty_power)
     return leading * profit * drawdown * decay

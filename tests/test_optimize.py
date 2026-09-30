@@ -11,9 +11,8 @@ The mutations the layer is one line away from, and the test each one must break:
   with the weight window swapped) - a study that optimizes in sample, which is the whole point
   of the gate; breaks :func:`test_the_score_reads_the_out_of_sample_side_of_the_folds`;
 * m2 "drop a factor of the product" (the leading metric, the profit of the test window or its
-  drawdown divisor) - a trial that made nothing, or lost money out of sample, would then rank
-  by its headline metric alone; breaks
-  :func:`test_the_score_is_the_product_of_the_test_window_factors`;
+  drawdown divisor) - a trial that made nothing would then rank by its headline metric alone;
+  breaks :func:`test_the_score_is_the_product_of_the_test_window_factors`;
 * m3 "penalise a losing train window as if its edge had decayed" (a negative train profit
   makes the ratio negative) - a trial is punished for a reference that carries no edge; breaks
   :func:`test_a_losing_train_window_is_not_penalised`;
@@ -24,6 +23,12 @@ The mutations the layer is one line away from, and the test each one must break:
 * m5 "ignore ``penalty_power``" (the decay factor is applied once whatever the run asked for) -
   a study run with the gate off would silently rank by the old ungated product; breaks
   :func:`test_the_penalty_power_weighs_the_decay_and_zero_switches_it_off`.
+* m6 "rank a losing out-of-sample window by the size of its loss" (the guard at
+  ``profit_mean(test) <= 0`` is dropped, or written as ``abs(...)``) - two negative factors
+  multiply into a *positive* score, and the worst run of a study becomes its winner (measured:
+  dropped → ``+1.8181`` instead of ``0``, ``abs()`` → ``-1.8181`` instead of ``0``; the same drop
+  on the first real run scored ``+9.6154``); breaks
+  :func:`test_a_losing_test_window_scores_zero_whatever_the_gate_and_its_metric`.
 """
 
 from __future__ import annotations
@@ -187,14 +192,26 @@ def test_a_losing_train_window_is_not_penalised() -> None:
     )
 
 
-def test_a_losing_test_window_scores_zero_with_the_gate_and_negative_without_it() -> None:
-    """The gate clamps a losing out-of-sample window at zero; without it the profit keeps the sign."""
-    losing_test = {**TEST, "profit_mean": -25.0}
+def test_a_losing_test_window_scores_zero_whatever_the_gate_and_its_metric() -> None:
+    """Two negative factors (Sharpe and profit) must not multiply into a positive score (m6).
 
-    assert degradation_factor(100.0, -25.0) == 0.0
-    assert score_from_aggregates(TRAIN, losing_test, OptunaConfig(penalty_power=1.0)) == 0.0
-    # With the gate off the profit factor carries the sign: the trial ranks below every winner.
-    assert score_from_aggregates(TRAIN, losing_test) < 0.0
+    The case is the first real run: ``sharpe_mean(test) = -0.19`` and ``profit_mean(test) =
+    -127.53`` scored ``+9.6154`` without the guard, i.e. a losing parameter set beat every
+    profitable one.  The gate cannot save that - it is off at the default ``penalty_power`` - so
+    the zero has to come from the score itself, and it is the same zero a window without trades
+    scores.
+    """
+    losing = {"sharpe_mean": -0.2, "profit_mean": -100.0, "max_dd_mean": 10.0}
+    profitable = {"sharpe_mean": 0.2, "profit_mean": 100.0, "max_dd_mean": 10.0}
+
+    assert degradation_factor(100.0, -100.0) == 0.0
+    assert score_from_aggregates(TRAIN, losing) == 0.0
+    assert score_from_aggregates(TRAIN, losing, OptunaConfig(penalty_power=1.0)) == 0.0
+    assert score_from_aggregates(TRAIN, {**losing, "max_dd_mean": 50.0}) == 0.0
+    # The profitable twin of the very same shape is read normally: 0.2 * 100 / 11.
+    assert score_from_aggregates(TRAIN, profitable) == pytest.approx(0.2 * 100.0 / 11.0)
+    # ... and a window without a single trade is that same flat zero.
+    assert score_from_aggregates(TRAIN, {**TEST, "profit_mean": 0.0}) == 0.0
 
 
 def test_outperforming_the_train_window_earns_no_bonus() -> None:

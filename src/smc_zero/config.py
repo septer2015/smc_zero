@@ -815,7 +815,9 @@ class OptunaConfig:
     switches that gate off, so the score is the pure out-of-sample reading of the test
     window; ``1.0`` is the plain product of SPEC_SMC.md §7.11 п.69, and a larger power
     punishes a trial that only looks good in sample harder, i.e. pulls the study towards
-    parameters whose in-sample edge survives out of sample.
+    parameters whose in-sample edge survives out of sample.  A test window that made no
+    money (``profit_mean(test) <= 0``) scores a flat ``0.0`` whatever the rest of its
+    numbers say, so no weight here can let a losing parameter set outrank a profitable one.
 
     The defaults are sized for a first real run over four years of M15 with the 60 day
     out-of-sample window of :class:`WalkForwardConfig` - 15 folds of

@@ -10,7 +10,8 @@ below are the whole public surface:
 * :func:`make_objective` is the objective on its own (one trial in, one score out) for a
   caller that owns the study;
 * :func:`score_from_aggregates` is the score: the out-of-sample metric, profit and drawdown of the
-  folds, times the (weighted) train -> test decay of the parameter set;
+  folds, times the (weighted) train -> test decay of the parameter set, and a flat zero for a test
+  window that made no money;
 * :func:`build_tape_marks` / :func:`cache_mismatches` are the cache built once per run and the
   guard that refuses a configuration it does not cover;
 * :data:`PARAM_RANGES` / :func:`suggest_params` / :func:`apply_params` / :func:`resolve_path`

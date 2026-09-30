@@ -104,8 +104,9 @@ of SPEC_SMC.md §7.11, Э7': `build_tape_marks` caches the HTF bias markup and t
 per run** for every trial of a study, `score_from_aggregates` ranks one parameter set by its
 out-of-sample folds - the leading metric of the walk-forward aggregate times the out-of-sample
 profit, divided by the drawdown, and - at the operator's `penalty_power` - throttled by how much of
-the in-sample profit survived - `run_optimization` maximizes that score with a
-seeded TPE study over the ranges of `PARAM_RANGES` and re-evaluates the winner over every fold from
+the in-sample profit survived; an out-of-sample window that made no money scores a flat zero, so a
+losing parameter set can never outrank a profitable one - `run_optimization` maximizes that score with
+a seeded TPE study over the ranges of `PARAM_RANGES` and re-evaluates the winner over every fold from
 scratch, while `cache_mismatches` refuses a configuration the cache was not built from; optuna is
 imported lazily by the study factory, so the layer - and its tests - run without it) and the console
 layer (`scripts/` - the Э8' runners: `smc-backtest` runs one fixed configuration over a window of

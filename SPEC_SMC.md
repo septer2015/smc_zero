@@ -1732,6 +1732,35 @@ margin-check до ордера: `lot * contract_size * price / leverage <= free_
 
 
 
+### 7.18 Свод профиля брокера C6 в BrokerSpec (Э10'.1)
+
+Единый источник истины для издержек — dataclass BrokerSpec в config.py.
+Поля: spread_pip, commission_per_lot_usd, slippage_pip, swap_long_pip,
+swap_short_pip, contract_size, pip_size, leverage. Методы-формулы: money(),
+commission(lot), swap_abs(side, days), spread_abs, slippage_abs.
+
+Расхождения с прежней формой C6 (§3, строка 184):
+1. commission_per_lot_usd и slippage_pip отсутствовали в §3-форме C6 —
+   добавлены в Э10'.1 как обязательные поля BrokerSpec.
+2. leverage переехал из RiskConfig (C7) в BrokerSpec (C6) — плечо это
+   свойство брокера, не риск-профиля. RiskConfig.leverage остался как
+   read-only свойство от broker для обратной совместимости.
+3. Часы сессий (session_open_msk, session_close_msk) и limit_stop_level_pip
+   остались в SessionConfig и InstrumentSpec соответственно — это свойства
+   инструмента/расписания, не брокера. BrokerSpec не дублирует их.
+
+has_costs = spread_pip > 0 and commission_per_lot_usd > 0 and slippage_pip >= 0.
+Нулевой профиль разрешён для юнит-тестов; штамп правила 4 печатается при
+has_costs=False.
+
+Миграция: RiskConfig и InstrumentSpec принимают deprecated-ключи через ручной
+__init__ с DeprecationWarning, переносят значения в BrokerSpec. Обратная
+совместимость сохранена для пиклов оракула Э9' (pin 5a9e015).
+
+Движок читает издержки из cfg.risk.broker, не из instrument. Литералов
+издержек в src/ нет (проверено грепом).
+
+
 ### 7.19 Live-конфиг победителя Trial 42 и флаг `--config-path` (Э10'.2)
 
 89. **Что добавлено.** `configs/live_eurusd_m15.yaml` — числа победителя Trial 42 (прибыль +1584 без

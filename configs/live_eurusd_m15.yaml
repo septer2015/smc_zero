@@ -1,0 +1,37 @@
+# Параметры победителя Trial 42 оптимизации на EURUSD M15
+# Период: 2022-08-15 .. 2026-09-22 (100111 баров, 15 фолдов walk-forward)
+# Прибыль +1584 без издержек, около +1200 с учётом комиссии и слиппеджа
+# Не менять без повторной оптимизации на том же периоде
+
+symbol: EURUSD
+timeframe: M15
+
+strategy:
+  sweep_buffer_pip: 4
+  sl_buffer_pip: 10
+  min_fvg_pip: 1
+  fvg_lookback: 21
+  max_fvg_age_bars: 9
+  signal_max_age_bars: 94
+  displacement:
+    atr_mult_min: 0.7453013223207354
+    body_frac_min: 0.44988154849338813
+  bias:
+    agreement: majority
+  take_profit:
+    min_tp_rr: 1.1220531901171544
+    rr_fallback: 1.6091050846893695
+
+broker:
+  spread_pip: 1.4
+  commission_per_lot_usd: 7.0
+  slippage_pip: 0.2
+  swap_long_pip: -0.70
+  swap_short_pip: 0.00
+  contract_size: 100000
+  pip_size: 0.0001
+  leverage: 40
+
+backtest:
+  initial_capital: 10000.0
+  lot: 0.1

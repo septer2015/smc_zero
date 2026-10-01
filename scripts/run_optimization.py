@@ -37,6 +37,12 @@ A window that cannot hold a single fold is refused before the study starts, with
 stderr (§7.10 п.61: ``(bars - min_train_bars) // test_period_bars`` folds); so is a missing tape and
 an unpriced symbol.  optuna itself is optional: without the ``optimize`` extra the runner says so
 instead of failing with an import traceback.
+
+A ``--config-path`` file (§7.19) seeds the study instead of the project defaults: its ``strategy``
+block is the base configuration the trial parameters are applied to, its ``broker`` block is the
+account both windows are charged on and its ``backtest`` block is the run of the winner.  The file
+does not narrow the search space - a study over a subset of :data:`PARAM_RANGES` is a different
+call - so an optimized run re-decides every knop of the config it started from.
 """
 
 from __future__ import annotations
@@ -57,7 +63,7 @@ from smc_zero.backtester import (
     run_backtest,
     split_walkforward,
 )
-from smc_zero.config import BacktestConfig, OptunaConfig, StrategyConfig, WalkForwardConfig
+from smc_zero.config import OptunaConfig, WalkForwardConfig
 from smc_zero.optimizer import (
     FoldEvaluation,
     OptunaResult,
@@ -83,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _common.add_window_arguments(parser)
+    _common.add_config_argument(parser)
     parser.add_argument("--n-trials", type=int, default=100, help="parameter sets to evaluate")
     parser.add_argument("--jobs", type=int, default=1, help="parallel trials of the study")
     parser.add_argument("--seed", type=int, default=42, help="seed of the TPE sampler")
@@ -188,15 +195,21 @@ def _print_trials(outcome: OptunaResult, limit: int = TOP_TRIALS) -> None:
 
 def _report_payload(
     args: argparse.Namespace,
+    symbol: str,
+    timeframe: str,
     tape: pd.DataFrame,
     walk_config: WalkForwardConfig,
     study_config: OptunaConfig,
     outcome: OptunaResult,
 ) -> dict[str, Any]:
-    """Return the payload of ``best_params.json``: the winner, its score and its fold aggregates."""
+    """Return the payload of ``best_params.json``: the winner, its score and its fold aggregates.
+
+    ``symbol`` and ``timeframe`` are the *effective* pair of the run - the arguments of the caller
+    if it typed them, else the config's (Э10'.2) - so the audit line names the tape the study read.
+    """
     return {
-        "symbol": args.symbol.upper(),
-        "timeframe": args.timeframe.upper(),
+        "symbol": symbol.upper(),
+        "timeframe": timeframe.upper(),
         "start": f"{args.start:%Y-%m-%d}",
         "end": f"{args.end:%Y-%m-%d}",
         "bars": len(tape),
@@ -221,11 +234,12 @@ def _report_payload(
 def run(args: argparse.Namespace) -> int:
     """Search the parameters of ``args``, run the winner over the window and write its report."""
     try:
-        tape = _common.load_windowed_tape(args.symbol, args.timeframe, args.start, args.end)
-        instrument = _common.instrument_for(args.symbol)
+        symbol, timeframe, strategy, backtest = _common.live_inputs(args)
+        tape = _common.load_windowed_tape(symbol, timeframe, args.start, args.end)
+        instrument = _common.instrument_for(symbol)
         walk_config = _walk_forward_config(args)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)
-    except (FileNotFoundError, ValueError) as error:
+    except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
@@ -238,11 +252,13 @@ def run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    base = StrategyConfig()
+    # The config of the run is the base of the study: a trial moves the knobs of ``PARAM_RANGES``
+    # on top of it, and every fold is charged the account of the same config (Э10'.2).
+    base = strategy
     marks = build_tape_marks(tape, base)
     try:
         outcome = run_optimization(
-            tape, study_config, walk_config, BacktestConfig(), instrument, base=base, marks=marks
+            tape, study_config, walk_config, backtest, instrument, base=base, marks=marks
         )
     except ImportError as error:
         print(
@@ -268,15 +284,15 @@ def run(args: argparse.Namespace) -> int:
         marks.levels,
         outcome.strategy,
     )
-    result = run_backtest(tape, chain.intents, BacktestConfig(), instrument)
+    result = run_backtest(tape, chain.intents, backtest, instrument)
 
     folder = _common.report_folder(
         args.report_dir,
-        f"optimization_{_common.window_label(args.symbol, args.timeframe, args.start, args.end)}"
+        f"optimization_{_common.window_label(symbol, timeframe, args.start, args.end)}"
         f"_n{args.n_trials}",
     )
     summary = format_summary(result)
-    payload = _report_payload(args, tape, walk_config, study_config, outcome)
+    payload = _report_payload(args, symbol, timeframe, tape, walk_config, study_config, outcome)
     export_trades(result, folder, stem="trades")
     (folder / "summary.txt").write_text(summary + "\n", encoding="utf-8")
     (folder / "best_params.json").write_text(

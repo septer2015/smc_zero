@@ -17,17 +17,35 @@ Two conventions of the window:
 
 The date labels of a window come from the arguments, never from the data: a report folder says what
 was asked for, and the summary it holds says what the tape actually carried.
+
+The second shared thing is the live config (§7.19): the ``--config-path`` YAML that carries the
+strategy, the broker profile and the run of a real account.  :func:`live_inputs` is the one place
+that reads it, so neither face can apply a different half of the file, and the priority is fixed
+there once - what the caller typed wins over what the file says, and the project defaults fill what
+neither of them names.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
+from dataclasses import fields, replace
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+import yaml
 
-from smc_zero.config import ALFAFOREX_SPECS, InstrumentSpec
+from smc_zero.config import (
+    ALFAFOREX_SPECS,
+    BacktestConfig,
+    BrokerSpec,
+    InstrumentSpec,
+    RiskConfig,
+    StrategyConfig,
+)
 from smc_zero.data_loader import TIMESTAMP_COLUMN, load_csv
+from smc_zero.optimizer.ranges import ParamValue, apply_params
 
 #: Where the loader's CSVs live, relative to the working directory (rule 6: ``./`` paths).
 DATA_DIR = Path("./data")
@@ -40,6 +58,13 @@ DEFAULT_END = "2026-09-22"
 DEFAULT_TIMEFRAME = "M15"
 #: The symbol and the timeframe a run without arguments assumes.
 DEFAULT_SYMBOL = "EURUSD"
+#: The four blocks a live config has to carry: the pair, the strategy, the account and the run
+#: (§7.19).  A file without one of them is refused, because the missing half would have to be
+#: guessed (rule 5).
+CONFIG_KEYS: tuple[str, ...] = ("symbol", "strategy", "broker", "backtest")
+#: The two knobs the ``backtest`` block of a live config may set: the capital of the run and the
+#: lot it trades.  Every other number of a run stays a project default (§7.19).
+RUN_KEYS: tuple[str, ...] = ("initial_capital", "lot")
 
 
 def tape_path(symbol: str, timeframe: str) -> Path:
@@ -113,13 +138,174 @@ def report_folder(root: str | Path, name: str) -> Path:
     return folder
 
 
-def add_window_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the arguments both runners share: the tape selector and the report root."""
+def load_config(path: str | Path) -> dict[str, Any]:
+    """Return the live YAML config of ``path``, refusing a file without one of the four blocks.
+
+    The reader is ``yaml.safe_load``, because a config is data and never code.  A missing or
+    unreadable file raises :class:`FileNotFoundError` (or another :class:`OSError`) as it is, a text
+    that does not parse raises :class:`ValueError` naming the path, and so does a document that is
+    not a mapping or that lacks one of :data:`CONFIG_KEYS` - a run that would have to guess a block
+    is not a run (rule 5).
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            cfg = yaml.safe_load(handle)
+    except yaml.YAMLError as error:
+        raise ValueError(f"{path}: not a readable YAML config ({error})") from error
+    if not isinstance(cfg, Mapping):
+        raise ValueError(f"{path}: a live config is a mapping, got {type(cfg).__name__}")
+    for key in CONFIG_KEYS:
+        if key not in cfg:
+            raise ValueError(f"в конфиге нет обязательного ключа: {key}")
+    return dict(cfg)
+
+
+def block(cfg: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    """Return one block of a live config as a mapping; a block of another shape is refused."""
+    value = cfg[key]
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{key}: a live config block is a mapping, got {type(value).__name__}")
+    return value
+
+
+def flatten_block(block_: Mapping[str, Any], prefix: str = "") -> dict[str, ParamValue]:
+    """Return a nested YAML block as the dotted ``{path: value}`` mapping ``apply_params`` reads.
+
+    ``{"take_profit": {"min_tp_rr": 1.2}}`` becomes ``{"take_profit.min_tp_rr": 1.2}`` - the naming
+    of the search space of Э7' (:data:`~smc_zero.optimizer.ranges.PARAM_RANGES`), so the parameter
+    set of a winning trial is one dict away from the config a runner builds.  A leaf that is neither
+    a number nor a word is refused here: a list or a mapping that stopped being one would be written
+    into a field that expects a threshold, and a silent wrong number is the one thing a config must
+    not do (rules 1 and 5).
+    """
+    flat: dict[str, ParamValue] = {}
+    for name, value in block_.items():
+        path = f"{prefix}{name}"
+        if isinstance(value, Mapping):
+            flat.update(flatten_block(value, f"{path}."))
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError(
+                f"{path}: a threshold of the strategy is a number or a word, got {value!r}"
+            )
+        flat[path] = value
+    return flat
+
+
+def strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
+    """Return the strategy of the ``strategy`` block: the project defaults with those knobs set."""
+    params = flatten_block(block(cfg, "strategy"))
+    try:
+        return apply_params(StrategyConfig(), params)
+    except KeyError as error:
+        raise ValueError(f"strategy: {error}") from error
+
+
+def broker_from_config(cfg: Mapping[str, Any]) -> BrokerSpec:
+    """Return the :class:`BrokerSpec` of the ``broker`` block: every field by its name (C6, Э10').
+
+    The fields are the profile's own, so a config cannot invent a cost and cannot use one of the
+    deprecated Э5' names either: ``commission`` is refused, ``commission_per_lot_usd`` is the field
+    that exists and the money of the run is its number.  A symbol-level field of the block has to
+    agree with the price-list row of the traded pair anyway - the engine refuses the pair of them
+    when they disagree about the symbol (:func:`~smc_zero.backtester.engine.run_backtest`).
+    """
+    values = dict(block(cfg, "broker"))
+    known = sorted(field.name for field in fields(BrokerSpec))
+    unknown = sorted(set(values) - set(known))
+    if unknown:
+        raise ValueError(
+            f"broker: no such field(s) {', '.join(unknown)}: the profile has {', '.join(known)}"
+        )
+    try:
+        return BrokerSpec(**{name: float(value) for name, value in values.items()})
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"broker: {error}") from error
+
+
+def backtest_from_config(cfg: Mapping[str, Any]) -> BacktestConfig:
+    """Return the run of a live config: the ``backtest`` block over the account of ``broker``.
+
+    ``initial_capital`` and ``lot`` are the two knobs a live config sets, and the lot lands in
+    :class:`~smc_zero.config.RiskConfig` - that is the profile the engine reads its lot from - while
+    the capital is the backtester's own start (the two answer different questions, §7.9).  The
+    broker block is written into that same risk profile, which is the single home of the money
+    (Э10'), so the engine, the report and the optimizer price the account of the file.
+    """
+    values = dict(block(cfg, "backtest"))
+    unknown = sorted(set(values) - set(RUN_KEYS))
+    if unknown:
+        raise ValueError(
+            f"backtest: no such field(s) {', '.join(unknown)}: a live config sets "
+            f"{', '.join(RUN_KEYS)}"
+        )
+    defaults = BacktestConfig()
+    lot = float(values.get("lot", defaults.risk.lot))
+    risk = RiskConfig(broker=broker_from_config(cfg), lot=lot)
+    return replace(
+        defaults,
+        risk=risk,
+        initial_capital=float(values.get("initial_capital", defaults.initial_capital)),
+    )
+
+
+def resolve_selector(
+    argument: str | None, cfg: Mapping[str, Any] | None, key: str, fallback: str
+) -> str:
+    """Return the effective symbol / timeframe: the argument, else the config's, else the default.
+
+    One order, said once: what the caller typed wins over what the file says, and a run that names
+    neither keeps the project default of Э8'.  The two are never merged - a config that names
+    another pair than the argument is simply outranked by it.
+    """
+    if argument:
+        return argument.upper()
+    if cfg is not None and cfg.get(key):
+        return str(cfg[key]).upper()
+    return fallback
+
+
+def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, BacktestConfig]:
+    """Return the symbol, the timeframe and the two configs of a run: the file first, the arguments.
+
+    ``args`` carries ``--config-path`` (optional), ``--symbol`` and ``--timeframe`` (``None`` when
+    the caller typed none of them).  Without a config the result is the project defaults of Э8';
+    with one, the three blocks of §7.19 fill the two dataclasses and a typed argument still wins.
+    Both faces call this one function, so a rule about the file cannot hold in one of them only.
+    """
+    cfg = load_config(args.config_path) if args.config_path else None
+    symbol = resolve_selector(args.symbol, cfg, "symbol", DEFAULT_SYMBOL)
+    timeframe = resolve_selector(args.timeframe, cfg, "timeframe", DEFAULT_TIMEFRAME)
+    if cfg is None:
+        return symbol, timeframe, StrategyConfig(), BacktestConfig()
+    return symbol, timeframe, strategy_from_config(cfg), backtest_from_config(cfg)
+
+
+def add_config_argument(parser: argparse.ArgumentParser) -> None:
+    """Add ``--config-path``: the live YAML both faces take their numbers from (§7.19)."""
     parser.add_argument(
-        "--symbol", default=DEFAULT_SYMBOL, help="symbol of ./data/<SYMBOL>_<TIMEFRAME>.csv"
+        "--config-path",
+        default=None,
+        help="live YAML config (symbol / strategy / broker / backtest); a typed argument wins",
+    )
+
+
+def add_window_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the arguments both runners share: the tape selector and the report root.
+
+    ``--symbol`` and ``--timeframe`` default to ``None`` on purpose and not to the project pair:
+    with a ``--config-path`` the file names the traded pair, and a default would outrank it without
+    the caller ever typing it (Э8' default, §7.19 order).
+    """
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        help="symbol of ./data/<SYMBOL>_<TIMEFRAME>.csv (default: the config's, else EURUSD)",
     )
     parser.add_argument(
-        "--timeframe", default=DEFAULT_TIMEFRAME, help="entry timeframe of the tape (M15 for v1)"
+        "--timeframe",
+        default=None,
+        help="entry timeframe of the tape, M15 for v1 (default: the config's, else M15)",
     )
     parser.add_argument(
         "--start",

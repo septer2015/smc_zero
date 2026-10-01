@@ -33,6 +33,18 @@ second call would only copy numbers the report layer reads from the result (§7.
 A wrong request is refused, never guessed: a missing tape, an empty window and a symbol without a
 C6 price list all end as one line on stderr and exit code 2 (rule 4 - an uncosted run is not a
 result).
+
+A live run takes its numbers from the config of the winner instead of the project defaults (§7.19):
+
+.. code-block:: text
+
+    smc-backtest --config-path configs/live_eurusd_m15.yaml --start 2022-08-15 --end 2022-09-15
+
+The four blocks of that file (``symbol`` / ``strategy`` / ``broker`` / ``backtest``) fill
+:class:`~smc_zero.config.StrategyConfig` and :class:`~smc_zero.config.BacktestConfig` through
+:func:`scripts._common.live_inputs`, and an argument typed on the command line still wins over the
+file.  The bias frame is asked for the agreement mode of the run and not for the default one:
+the config may have moved that knob.
 """
 
 from __future__ import annotations
@@ -43,7 +55,6 @@ from collections.abc import Sequence
 
 from scripts import _common
 from smc_zero.backtester import export_trades, format_summary, run_backtest
-from smc_zero.config import BacktestConfig, StrategyConfig
 from smc_zero.optimizer import build_tape_marks
 from smc_zero.strategy.intents import build_intents
 
@@ -57,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _common.add_window_arguments(parser)
+    _common.add_config_argument(parser)
     parser.add_argument(
         "--n-trials",
         type=int,
@@ -73,25 +85,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    """Simulate the window of ``args`` with the project defaults and write its report."""
+    """Simulate the window of ``args`` with its config and write the report of the run."""
     try:
-        tape = _common.load_windowed_tape(args.symbol, args.timeframe, args.start, args.end)
-        instrument = _common.instrument_for(args.symbol)
-    except (FileNotFoundError, ValueError) as error:
+        symbol, timeframe, strategy, backtest = _common.live_inputs(args)
+        tape = _common.load_windowed_tape(symbol, timeframe, args.start, args.end)
+        instrument = _common.instrument_for(symbol)
+    except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    config = StrategyConfig()
     # The markup is built on the window and reused by everything below: the bias frame the chain
-    # asks for a direction and the level book it tries to sweep.
-    marks = build_tape_marks(tape, config)
-    chain = build_intents(tape, marks.bias_frame(), marks.levels, config)
-    result = run_backtest(tape, chain.intents, BacktestConfig(), instrument)
+    # asks for a direction and the level book it tries to sweep.  The agreement mode is the one the
+    # config of the run names, not the cache default: ``bias_frame`` is asked for it explicitly.
+    marks = build_tape_marks(tape, strategy)
+    chain = build_intents(tape, marks.bias_frame(strategy.bias.agreement), marks.levels, strategy)
+    result = run_backtest(tape, chain.intents, backtest, instrument)
 
     summary = format_summary(result)
     folder = _common.report_folder(
-        args.report_dir,
-        f"backtest_{_common.window_label(args.symbol, args.timeframe, args.start, args.end)}",
+        args.report_dir, f"backtest_{_common.window_label(symbol, timeframe, args.start, args.end)}"
     )
     export_trades(result, folder, stem="trades")
     (folder / "summary.txt").write_text(summary + "\n", encoding="utf-8")

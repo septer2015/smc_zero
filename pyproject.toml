@@ -14,6 +14,10 @@ dependencies = [
     "pyarrow",
     "matplotlib",
     "python-dotenv",
+    # Э10'.2: the live config of a run (``--config-path``) is YAML, and that face is the base
+    # install - ``smc-backtest`` may not need the ``optimize`` extra (which pulls PyYAML in
+    # through optuna) to read a config file.
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

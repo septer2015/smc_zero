@@ -1,116 +1,161 @@
 # smc-zero
 
-SMC backtest foundation with a strict three-timeframe hierarchy: **D1** = global bias, PDH/PDL
-and major order blocks; **H1** = working structure (BOS/CHoCH), premium/discount and sessions;
-**M15** = entry zone (sweep -> CHoCH -> entry into an M15 FVG/OB inside the H1 zone). M5 is
-intentionally not used. **H4** takes part in the HTF bias only: `BiasConfig.timeframes` defaults
-to `("H1", "H4", "D1")` (SPEC_SMC.md C5), and H4 is never an entry timeframe.
+Основа для бэктеста по SMC. Проект работает с тремя таймфреймами: **D1**, **H1**, **M15**.
 
-Time convention: the `datetime` column in `./data/*.csv` (M15/H1/D1) is an **open_time** stamp
-(UTC-naive, localized to UTC), so `close_time = timestamp + bar period`. The last bar of every
-timeframe is treated as still forming and dropped by default (`drop_unclosed=True`) to avoid thin
-lookahead on the live edge.
+**D1** задаёт общий bias — направление рынка. Здесь же живут PDH/PDL (максимум и минимум
+прошлого дня) и крупные order blocks — блоки ордеров.
 
-## Install
+**H1** — рабочая структура. Здесь ищем BOS (break of structure, пробой структуры по тренду) и
+CHoCH (change of character, смена характера — пробой против тренда). Здесь же действует правило
+premium/discount — дорогая и дешёвая половины диапазона. Сюда же относятся сессии.
+
+**M15** — зона входа. Цепочка такая: sweep (снятие ликвидности) → CHoCH → вход в FVG/OB (ценовой
+разрыв или блок ордеров) на M15 внутри зоны H1.
+
+**M5** не используется. **H4** участвует только в bias старших таймфреймов (HTF):
+`BiasConfig.timeframes` по умолчанию равен `("H1", "H4", "D1")` (SPEC_SMC.md C5). Как
+таймфрейм входа H4 не используется никогда.
+
+## Конвенция времени
+
+В файлах `./data/*.csv` (M15/H1/D1) колонка `datetime` — это штамп **open_time**, то есть момент
+открытия бара. Время в UTC, без зоны (UTC-naive). Значит, `close_time = timestamp + период бара`.
+Последний бар каждого таймфрейма считается ещё не закрытым и по умолчанию отбрасывается
+(`drop_unclosed=True`). Так мы защищаемся от тонкого lookahead — подглядывания в будущее — на
+живом крае.
+
+## Установка
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-The Э7' optimizer needs optuna, which is an optional extra - the layer and its tests import cleanly
-without it:
+Оптимизатор этапа Э7' требует optuna. Это дополнительный набор: сам слой и его тесты
+импортируются и без него.
 
 ```bash
 pip install -e ".[dev,optimize]"
 ```
 
-## Quick start
+## Быстрый старт
 
-Install with the checks and the optimizer:
+Ставим пакет с проверками и оптимизатором:
 
 ```bash
 pip install -e ".[dev,optimize]"
 ```
 
-One backtest over the window you name - every threshold is the project's own, the window is the
-whole UTC days of `--start` .. `--end`:
+Один бэктест по окну, которое вы задаёте. Все пороги — свои, проектные. Окно — целые сутки UTC
+от `--start` до `--end` включительно:
 
 ```bash
 smc-backtest --symbol EURUSD --start 2022-08-15 --end 2022-09-15
 ```
 
-Without the install, the same run from the repository root (`Python` needs both the package of
-`src` and the runner package on its path):
+Без установки тот же прогон запускается из корня репозитория. Python должен видеть и пакет
+`src`, и пакет раннеров:
 
 ```bash
 PYTHONPATH=src python -m scripts.run_backtest --symbol EURUSD --start 2022-08-15 --end 2022-09-15
 ```
 
-The search over the walk-forward folds, then the winner reported as one run:
+Поиск по walk-forward-фолдам (скользящим окнам обучения с проверкой на данных, которых модель не
+видела), затем прогон победителя одним отчётом:
 
 ```bash
 smc-optimize --symbol EURUSD --n-trials 100 --jobs 4
 ```
 
-Reports land in `./reports/`:
+Отчёты кладутся в `./reports/`:
 
-* `backtest_<symbol>_<tf>_<start>_<end>/` - `trades.csv` / `trades.parquet` and `summary.txt`;
-* `optimization_<symbol>_<tf>_<start>_<end>_n<trials>/` - the same two files for the winner, plus
-  `best_params.json` (parameters, score, its `score_metric` and `penalty_power`, fold aggregates) and
-  `fold_metrics.csv` (train and test table of every fold, with their mean and sigma rows - the `mean`
-  rows also carry the run's `train_profit_mean`, `test_profit_mean` and `degradation_ratio`).
+* `backtest_<symbol>_<tf>_<start>_<end>/` — `trades.csv` / `trades.parquet` и `summary.txt`;
+* `optimization_<symbol>_<tf>_<start>_<end>_n<trials>/` — те же два файла для победителя, плюс
+  `best_params.json` (параметры, счёт, его `score_metric` и `penalty_power`, агрегаты фолдов) и
+  `fold_metrics.csv` (таблица обучения и проверки по каждому фолду, со строками `mean` и `sigma` —
+  на строках `mean` лежат ещё `train_profit_mean`, `test_profit_mean` и
+  `degradation_ratio` прогона).
 
-Every run is stamped by rule 4: while `RiskConfig` carries no commission and no slippage, the
-summary says so on the page and the curve must not be read as a profit (C6 / §5 п.10).
+Каждый прогон помечается правилом 4. Пока в `RiskConfig` нет ни комиссии, ни слиппеджа, сводка
+пишет об этом прямо. Кривую капитала нельзя читать как прибыль (C6 / §5 п.10).
 
-The window is a cost, not a detail: the entry chain of Э4' walks every level of the window bar by
-bar, so its time used to grow roughly with the square of the window - measured on
-`./data/EURUSD_M15.csv` before Э9' that was 5 days 0.3 s, 1 month 6 s, 3 months 58 s, 1 year 16 min
-(`937.9 s`). The vectorised chain of Э9' (SPEC_SMC.md §7.13) answers the same rules far faster: the
-same year takes 1.2-1.9 s and the full four-year tape 9.7-17.3 s, so the shipped window and the
-optimization over it are affordable - what a study costs is measured by the first real run, and the
-fold grid is 15 folds of 60 days by default (SPEC_SMC.md §7.10 п.62). Start with a month or a
-quarter anyway - and with the costs of your profile, because rule 4 stamps a run without them.
+Окно — это цена, а не деталь. Цепочка входа Э4' обходит каждый уровень окна бар за баром, поэтому
+её время росло примерно как квадрат длины окна. Замеры на `./data/EURUSD_M15.csv` до Э9': 5 дней —
+0.3 с, 1 месяц — 6 с, 3 месяца — 58 с, 1 год — 16 минут (`937.9 с`). Векторная цепочка Э9'
+(SPEC_SMC.md §7.13) решает те же правила намного быстрее: тот же год — 1.2–1.9 с, вся
+четырёхлетняя лента — 9.7–17.3 с. Поэтому и рабочее окно, и оптимизация по нему стали по силам.
+Сколько стоит такое исследование, показал первый настоящий прогон. Сетка фолдов по умолчанию —
+15 фолдов по 60 дней (SPEC_SMC.md §7.10 п.62). Всё равно начинайте с месяца или квартала — и со
+своими издержками, потому что правило 4 помечает прогон без них.
 
-## Checks
+## Проверки
 
 ```bash
 ruff check .
 pytest
 ```
 
-Implemented so far: the data layer (`data_loader.py`: open_time convention, closed-bar
-HTF -> LTF stitching), the indicator layer (`indicators/structure.py` swings and BOS/CHoCH,
-`fvg.py`, `liquidity.py` sweeps, `impulse.py` displacement gate, `sessions.py` killzones,
-`bias.py` H1/H4/D1 bias, `levels.py` PDH/PDL, PWH/PWL, PMH/PML and the Asian/London/NY session
-ranges with their availability gates and fresh/broken lifecycle) and the strategy layer
-(`strategy/intents.py` - the M15 entry chain of SPEC_SMC.md §7.8 with `sweep -> CHoCH ->
-displacement -> FVG limit`, one intent per accepted bar (the most significant level of a bar wins)
-and a rejection ledger;
-`strategy/take_profit.py` - the nearest visible liquidity level with the RR fallback;
-`strategy/risk_gate.py` - the C7 margin check and the risk percentage of a batch of intents)
-and the backtester layer (`backtester/engine.py` - the event-driven engine of SPEC_SMC.md §7.9:
-one limit filled on the bar after its signal, the stop looked at before the target, the C6 price
-list charged as spread/swap plus the profile's commission and slippage, the C7 margin gate asked
-with the running equity, and a ledger row for every intent that did not become a trade;
-`backtester/metrics.py` - the metric table; `backtester/reports.py` - the text summary and the
-trade-log export) and the walk-forward layer (`backtester/walkforward.py` - the out-of-sample split
-of one tape (Э6'): `split_walkforward` cuts anchored expanding folds by default and rolling ones
-with `anchored=False`, as positional views of the caller's frame, so a fold never shares a bar with
-its own train window; `aggregate_fold_metrics` reports the mean *and* the population sigma of the
-six headline metrics, and `run_walkforward` joins the folds to the Э5' engine with fixed costs and
-no optimization - fitting the parameters is Э7') and the optimizer layer (`optimizer/` - the search
-of SPEC_SMC.md §7.11, Э7': `build_tape_marks` caches the HTF bias markup and the level book **once
-per run** for every trial of a study, `score_from_aggregates` ranks one parameter set by its
-out-of-sample folds - the leading metric of the walk-forward aggregate times the out-of-sample
-profit, divided by the drawdown, and - at the operator's `penalty_power` - throttled by how much of
-the in-sample profit survived; an out-of-sample window that made no money scores a flat zero, so a
-losing parameter set can never outrank a profitable one - `run_optimization` maximizes that score with
-a seeded TPE study over the ranges of `PARAM_RANGES` and re-evaluates the winner over every fold from
-scratch, while `cache_mismatches` refuses a configuration the cache was not built from; optuna is
-imported lazily by the study factory, so the layer - and its tests - run without it) and the console
-layer (`scripts/` - the Э8' runners: `smc-backtest` runs one fixed configuration over a window of
-`./data` and writes its report, `smc-optimize` runs the Э7' study over a walk-forward and then
-reports the winner; both are `./reports` writers with an argparse contract of their own, and neither
-defines a threshold or recomputes a metric - SPEC_SMC.md §7.12). Data files live in `./data/`,
-reports land in `./reports/`.
+## Запуск длительных прогонов
+
+Длительные процессы — оптимизацию, бэктест на полном периоде, прогоны на несколько часов —
+запускайте ТОЛЬКО под `nohup`. Тогда они переживут закрытие терминала и обрывы связи. Пример:
+
+```bash
+nohup env PYTHONPATH=src .venv/bin/python -m scripts.run_optimization \
+  --symbol EURUSD --start 2022-08-15 --end 2026-09-22 \
+  --n-trials 100 --jobs 2 --seed 42 --report-dir ./reports/full_run \
+  > /tmp/opt_run.log 2>&1 &
+```
+
+Мониторинг: `tail -f /tmp/opt_run.log` и `grep -c 'Trial.*finished' /tmp/opt_run.log`.
+Остановка: `kill <PID>`. PID печатается при запуске, а если потеряли — ищите через
+`ps aux | grep run_optimization`.
+
+Это правило обязательно для всех будущих прогонов.
+
+## Что уже сделано
+
+Реализованы такие слои.
+
+Данные — `data_loader.py`: конвенция open_time, сшивка старшего таймфрейма (HTF) и младшего
+(LTF) по закрытому бару.
+
+Индикаторы — `indicators/structure.py` (свинги и BOS/CHoCH), `fvg.py`, `liquidity.py` (sweep),
+`impulse.py` (гейт импульса), `sessions.py` (killzone — торговые окна сессий), `bias.py` (bias по
+H1/H4/D1), `levels.py` (PDH/PDL, PWH/PWL, PMH/PML и диапазоны азиатской, лондонской и
+нью-йоркской сессий с гейтами доступности и жизненным циклом fresh/broken).
+
+Стратегия — `strategy/intents.py`: цепочка входа M15 из SPEC_SMC.md §7.8, `sweep -> CHoCH ->
+displacement -> FVG limit`. Один интент на принятый бар (побеждает самый значимый уровень бара),
+плюс журнал отказов. `strategy/take_profit.py`: ближайший видимый уровень ликвидности с фолбэком
+по RR. `strategy/risk_gate.py`: проверка маржи по C7 и процент риска для набора интентов.
+
+Бэктестер — `backtester/engine.py`: событийный движок из SPEC_SMC.md §7.9. Лимит исполняется на
+баре после сигнала. Стоп читается раньше цели. Прайс-лист C6 списывается как спред и своп, плюс
+комиссия и слиппедж профиля. Маржинальный гейт C7 спрашивается по текущей equity. Для каждого
+интента, не ставшего сделкой, есть строка в журнале. `backtester/metrics.py`: таблица метрик.
+`backtester/reports.py`: текстовая сводка и экспорт журнала сделок.
+
+Walk-forward — `backtester/walkforward.py`: разбиение одной ленты на обучение и проверку (Э6').
+`split_walkforward` режет якорные расширяющиеся фолды по умолчанию и скользящие при
+`anchored=False`. Это позиционные срезы кадра заказчика, поэтому фолд никогда не делит бар со
+своим окном обучения. `aggregate_fold_metrics` отдаёт среднее и сигму по генеральной совокупности
+для шести главных метрик. `run_walkforward` соединяет фолды с движком Э5' при фиксированных
+издержках и без оптимизации (подбор параметров — это Э7').
+
+Оптимизатор — `optimizer/`: поиск из SPEC_SMC.md §7.11 (Э7'). `build_tape_marks` кэширует
+разметку bias старших таймфреймов и книгу уровней один раз на прогон для всех триалов
+исследования. `score_from_aggregates` ранжирует один набор параметров по фолдам проверки: ведущая
+метрика агрегата walk-forward умножается на профит проверки и делится на просадку, а при
+`penalty_power` заказчика ещё приглушается тем, сколько прибыли обучения дожило до проверки. Окно
+проверки, не заработавшее денег, получает ровно ноль, поэтому убыточный набор никогда не обгонит
+прибыльный. `run_optimization` максимизирует этот счёт на исследовании TPE с фиксированным seed по
+диапазонам `PARAM_RANGES` и заново переоценивает победителя по всем фолдам. `cache_mismatches`
+отказывает конфигурации, из которой кэш не строился. optuna импортируется лениво, фабрикой
+исследования, поэтому слой и его тесты работают и без неё.
+
+Консоль — `scripts/`: раннеры Э8'. `smc-backtest` прогоняет одну фиксированную конфигурацию по
+окну `./data` и пишет отчёт. `smc-optimize` прогоняет исследование Э7' по walk-forward и затем
+отчитывается о победителе. Оба пишут в `./reports`, у обоих свой контракт argparse. Ни один из них
+не задаёт порог и не пересчитывает метрику (SPEC_SMC.md §7.12).
+
+Данные лежат в `./data/`, отчёты — в `./reports/`.

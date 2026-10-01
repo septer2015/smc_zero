@@ -27,7 +27,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from smc_zero.config import DisplacementConfig, EntryConfig, RiskConfig, StrategyConfig, TPConfig
+from smc_zero.config import (
+    BrokerSpec,
+    DisplacementConfig,
+    EntryConfig,
+    RiskConfig,
+    StrategyConfig,
+    TPConfig,
+)
 from smc_zero.data_loader import IS_CLOSED_COLUMN, TIMESTAMP_COLUMN
 from smc_zero.indicators.bias import BIAS_DIR_COLUMN
 from smc_zero.indicators.levels import (
@@ -186,12 +193,14 @@ def _chain(
     """Run the chain on the scenario with ``pip_size`` pinned and the kwargs overridden.
 
     The FX pip is part of the C7 risk profile (§7.8 п.37), so it is pinned there - one copy of
-    the broker numbers, and a ``risk`` override of the caller keeps it.
+    the broker numbers (Э10': inside ``BrokerSpec``, never beside it), and a ``risk`` override of
+    the caller keeps it.
     """
     bars = _frame(rows) if frame is None else frame
     book = PDH_LEVEL if levels is None else levels
     markup = _bias(bars, bias_value) if bias_frame is None else bias_frame
-    risk = replace(cfg_kw.pop("risk", RiskConfig()), pip_size=PIP)
+    base_risk = cfg_kw.pop("risk", RiskConfig())
+    risk = replace(base_risk, broker=replace(base_risk.broker, pip_size=PIP))
     return build_intents(bars, markup, book, StrategyConfig(risk=risk, **cfg_kw))
 
 
@@ -455,7 +464,10 @@ _GATE_CASES: tuple[_GateCase, ...] = (
         PDH_LEVEL,
         _REVERSAL,
         -1,
-        {"risk": RiskConfig(spread=0.10)},
+        {"risk": RiskConfig(broker=replace(BrokerSpec(), spread_pip=10.0))},
+        # Э10': the Э5' ``spread=0.10`` price units *of the JPY pip* - 10 pips - stated in the
+        # profile's own unit.  The Э5' keyword converts by the *default* FX pip instead, a 100x
+        # wider spread that would hide the gate's own arithmetic behind the pin of :func:`_chain`.
         _ledger(
             ((26, 27, 28), REASON_CHOCH_NOT_FOUND),
             ((29, 30), REASON_FVG_NOT_READY),

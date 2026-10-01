@@ -22,6 +22,13 @@ What is compared, and how:
 * the worktree is removed after the run, and nothing of the old implementation is copied into
   the tree.
 
+The Э10' note on the recordings: ``RiskConfig`` is a slotted dataclass and no longer *has* the six
+Э5' cost fields of the pin (they moved into ``BrokerSpec``), so unpickling the pinned config would
+restore a profile whose values sit in the wrong fields.  Each recorder therefore writes
+``dataclasses.asdict`` of the pinned risk profile beside the arguments, and the replay rebuilds
+the config on the current classes through their deprecated keywords, which migrate those numbers by
+money - the pin itself stays what it is, a commit in history, and not a copy that would drift.
+
 The one place the two chains are *meant* to disagree is the same-bar rule Э9''.1 added to п.35:
 prod - and therefore the pinned head - placed every setup of a bar, while the new chain keeps the
 most significant level of it (:func:`smc_zero.strategy.intents._one_intent_per_bar`).  The record
@@ -47,13 +54,16 @@ import os
 import pickle
 import subprocess
 import sys
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from pandas.testing import assert_frame_equal
 
+from smc_zero.config import RiskConfig
 from smc_zero.indicators.levels import (
     ASIAN_HIGH,
     ASIAN_LOW,
@@ -89,19 +99,37 @@ REAL_WINDOW: tuple[str, str] = ("2022-08-15", "2022-11-15")
 RECORDER_PLUGIN = '''"""Plugin of the Э9' oracle: record every call of the pristine chain."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import pickle
 from pathlib import Path
 
 import smc_zero.strategy.intents as chain
 
+#: Where the config sits in the recorded call: ``build_intents(tape, bias, levels, config)``.
+CONFIG_ARGUMENT = 3
+
 _original = chain.build_intents
 _out = Path(os.environ["ORACLE_OUT"])
 _count = 0
 
 
+def _config(args, kwargs):
+    """Return the config of the call, however the caller passed it to the chain."""
+    if len(args) > CONFIG_ARGUMENT:
+        return args[CONFIG_ARGUMENT]
+    return kwargs["config"]
+
+
 def recording(*args, **kwargs):
-    """Record one call: the arguments, the accepted intents and the rejection ledger."""
+    """Record one call: the arguments, the risk profile as data and both faces of the verdict.
+
+    The profile is written with ``dataclasses.asdict`` and not as the object: a pickle of a slotted
+    dataclass carries the *values* of its slots, and Э10' moved the six Э5' cost fields of
+    ``RiskConfig`` into ``BrokerSpec``, so a pickle of the pinned class would have them land in the
+    wrong fields of the current one.  Data travels instead of the class, and the oracle rebuilds
+    the config through the current constructor's deprecated keywords.
+    """
     global _count
     out = _original(*args, **kwargs)
     _count += 1
@@ -110,6 +138,7 @@ def recording(*args, **kwargs):
             {
                 "args": args,
                 "kwargs": kwargs,
+                "risk": dataclasses.asdict(_config(args, kwargs).risk),
                 "intents": out.intents,
                 "rejections": out.rejections,
             },
@@ -127,6 +156,7 @@ chain.build_intents = recording
 REAL_SCRIPT = '''"""Record the pristine chain on the real window - run inside the Э9' worktree."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import pickle
 import sys
@@ -156,6 +186,7 @@ with Path(os.environ["ORACLE_OUT"], "real_window.pkl").open("wb") as handle:
         {
             "args": (tape, marks.bias_frame(), marks.levels, config),
             "kwargs": {},
+            "risk": dataclasses.asdict(config.risk),
             "intents": chain.intents,
             "rejections": chain.rejections,
         },
@@ -296,6 +327,43 @@ def _one_intent_per_bar(intents: tuple[Any, ...]) -> tuple[Any, ...]:
     return tuple(intent for index, intent in enumerate(intents) if index in keep)
 
 
+#: Where the config sits in a recorded call: ``build_intents(tape, bias, levels, config)``.  The two
+#: recorders state the position for themselves - they run as children, inside the Э9' worktree.
+CONFIG_ARGUMENT = 3
+
+
+def _rebuilt_call(case: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Return the recorded call with its config rebuilt on the current classes (Э10').
+
+    The pinned config cannot simply be unpickled: ``RiskConfig`` is a slotted dataclass, so a pickle
+    of it carries the *values* of its slots in declaration order, and Э10' moved the six Э5' cost
+    fields (commission, spread, slippage, pip_size, contract_size, leverage) out of it into
+    :class:`~smc_zero.config.BrokerSpec` - unpickled into the smaller current class those values
+    land in the wrong fields instead of raising.
+
+    The recorder therefore writes ``dataclasses.asdict`` of the pinned risk profile beside the
+    arguments, and the profile is rebuilt here through the current constructor, whose deprecated
+    keywords migrate those numbers *by money* (:func:`smc_zero.config._legacy_broker`) - the same
+    migration the pin's own call sites go through.  The gate stays what it is: an equivalence check
+    of the two *chains*, not a comparison of two cost profiles.
+
+    The migration warning is silenced on purpose - one per case would drown the gate - and the money
+    itself is what the comparison watches: a wrong spread, commission or pip moves the prices the
+    chain rounds with, so the frames would differ.
+    """
+    args = list(case["args"])
+    kwargs = dict(case["kwargs"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if len(args) > CONFIG_ARGUMENT:
+            args[CONFIG_ARGUMENT] = replace(
+                args[CONFIG_ARGUMENT], risk=RiskConfig(**case["risk"])
+            )
+        else:
+            kwargs["config"] = replace(kwargs["config"], risk=RiskConfig(**case["risk"]))
+    return tuple(args), kwargs
+
+
 def _replay(case: dict[str, Any]) -> None:
     """Run the current chain on the recorded arguments and compare both faces of the verdict.
 
@@ -305,7 +373,8 @@ def _replay(case: dict[str, Any]) -> None:
     normalised and nothing is allowed to be "close enough": this is the gate Э9' is accepted on
     (SPEC_SMC.md §7.13).
     """
-    out = build_intents(*case["args"], **case["kwargs"])
+    args, kwargs = _rebuilt_call(case)
+    out = build_intents(*args, **kwargs)
     expected = _one_intent_per_bar(case["intents"])
     assert_frame_equal(intents_frame(out.intents), intents_frame(expected))
     assert_frame_equal(out.rejections, case["rejections"])

@@ -77,6 +77,7 @@ def format_summary(result: BacktestResult, *, title: str | None = None) -> str:
     config = result.config
     instrument = result.instrument
     risk = config.risk
+    broker = risk.broker
     lines = [
         title
         or f"SMC backtest: {instrument.symbol} {config.timeframes.ltf} ({_span(result)})",
@@ -85,14 +86,14 @@ def format_summary(result: BacktestResult, *, title: str | None = None) -> str:
     for key, label, pattern in _SUMMARY_FIELDS:
         lines.append(f"  {label:<24} {pattern.format(result.metrics[key])}")
     lines.append(
-        f"  {'costs':<24} spread {instrument.spread_pip:.1f} pip, "
-        f"swap long {instrument.swap_long_pip:+.2f} / short {instrument.swap_short_pip:+.2f} "
-        f"pip per night, slippage {risk.slippage / instrument.pip_size:.1f} pip, "
-        f"commission {risk.commission:.2f}"
+        f"  {'costs':<24} spread {broker.spread_pip:.1f} pip, "
+        f"swap long {broker.swap_long_pip:+.2f} / short {broker.swap_short_pip:+.2f} "
+        f"pip per night, slippage {broker.slippage_pip:.2f} pip per market leg, "
+        f"commission {broker.commission_per_lot_usd:.2f} per lot"
     )
     lines.append(
-        f"  {'risk profile':<24} lot {risk.lot:g} on {instrument.contract_size:.0f} units, "
-        f"leverage {risk.leverage:g}, margin denominator {risk.deposit:.2f} (C7), "
+        f"  {'risk profile':<24} lot {risk.lot:g} on {broker.contract_size:.0f} units, "
+        f"leverage {broker.leverage:g}, margin denominator {risk.deposit:.2f} (C7), "
         f"warning above {risk.warning_risk_pct:.2f} %"
     )
     flagged = int(result.trades["risk_warning"].sum()) if not result.trades.empty else 0

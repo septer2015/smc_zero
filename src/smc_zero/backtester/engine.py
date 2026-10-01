@@ -31,12 +31,15 @@ alike, so no order is created and no level is hit while Alfa is shut.  The *leng
 two windows stay prod's raw-bar counts.  The day is the *MSK* day (the project clock of rule
 2b), which is also what ``days_held`` and the swap are counted in: one calendar, one reading.
 
-Money is the price list's (C6): the spread of the instrument is charged once per trade, its
-swap is signed and paid per night held (``days_held``), ``RiskConfig.commission`` is one fee
-per trade and ``RiskConfig.slippage`` worsens the *market* exits (a stop and an EOD close) -
-a limit fill keeps its limit price, so the entry is never slipped.  ``RiskConfig.spread``
-stays unused on purpose: C6 moves the spread into the instrument row, and charging both
-would double it (§7.9).  ``risk_pct`` is not recomputed here either: every intent is asked
+Money is the broker profile's (``cfg.risk.broker``, Э10'): the spread is charged once per round
+trip, the signed swap once per night held (``days_held``), the commission once per lot and
+round turn, and the slippage once per *market* leg - a stop and an EOD close are market orders
+and slip, while a limit entry and a limit target keep their price.  The four charges are added
+up in :func:`_costs_of` alone, so the ``profit`` column, the ``spread_cost`` / ``slippage_cost``
+/ ``swap_cost`` / ``commission`` columns and the balance of the engine can never drift apart.
+The price list handed to :func:`run_backtest` is checked against that profile before the run
+starts: two readings of the same account would make the report lie about the curve.
+``risk_pct`` is not recomputed here either: every intent is asked
 :func:`smc_zero.strategy.risk_gate.check_intent` with the equity of *its own* bar, so the
 margin gate and the reported percentage keep one implementation.
 
@@ -113,6 +116,7 @@ TRADE_COLUMNS: tuple[str, ...] = (
     "result",
     "profit",
     "spread_cost",
+    "slippage_cost",
     "swap_cost",
     "commission",
     "risk_pct",
@@ -233,45 +237,80 @@ def _exit_at(
     low: float,
     sl: float,
     tp: float,
-    slippage: float,
 ) -> tuple[int, float] | None:
     """Return ``(result, exit price)`` of the bar, or ``None`` when neither level is hit.
 
-    The stop is looked at first - prod's own order - so a bar whose range covers both levels
-    is booked as a stop, the conservative reading.  The stop is a market order once it is
-    touched, so its price is worsened by the profile's ``slippage``; the target keeps its
-    price, because a take profit is a resting limit like the entry.
+    The stop is looked at first - prod's own order - so a bar whose range covers both levels is
+    booked as a stop, the conservative reading.  Both prices are the levels themselves: a target
+    is a resting limit and a stop is the price the broker triggers at.  The slippage of a stop is
+    charged as money by :func:`_costs_of` and not baked into this price, so the log says both the
+    level that was hit and what the exit cost (Э10').
     """
     if side == "short":
         if high >= sl:
-            return SL_RESULT, sl + slippage
+            return SL_RESULT, sl
         if low <= tp:
             return TP_RESULT, tp
         return None
     if low <= sl:
-        return SL_RESULT, sl - slippage
+        return SL_RESULT, sl
     if high >= tp:
         return TP_RESULT, tp
     return None
 
 
-def _profit_of(intent: TradeIntent, exit_price: float, days_held: int, run: _Run) -> float:
-    """Return the money a closed trade moved: prod's ``compute_profit``, priced by C6.
+def _market_legs(result: int) -> int:
+    """Return the number of market legs of an exit: a target is a resting limit, a stop is not.
 
-    The sign follows the side, so the same three lines price a target, a stop and an EOD
-    close; the spread is paid once per round trip, the swap is signed (a negative leg credits
-    the account) and the commission of the profile is one fee per trade.  The engine's balance
-    and the ``profit`` column of the log go through here, so the two can never disagree.
+    A take profit sits in the book like the entry, so it is filled at its price and slipped
+    nothing; a stop loss and an EOD close are market orders and each slips one leg (Э10').
     """
-    instrument = run.instrument
+    return 0 if result == TP_RESULT else 1
+
+
+def _costs_of(
+    intent: TradeIntent,
+    result: int,
+    days_held: int,
+    run: _Run,
+) -> tuple[float, float, float, float]:
+    """Return the four charges of a closed trade in account currency, in log order.
+
+    They are (``spread_cost``, ``slippage_cost``, ``swap_cost``, ``commission``) of the broker
+    profile ``cfg.risk.broker`` (Э10'): the spread once per round trip, the slippage on the
+    market legs of the exit, the signed swap of the nights held (a negative leg credits the
+    account) and the commission once per lot and round turn.  This is the only place that adds
+    them up, so the columns of the log and the balance of the engine cannot drift apart.
+    """
+    broker = run.cfg.risk.broker
     lot = run.cfg.risk.lot
-    move = exit_price - intent.entry if intent.side == "long" else intent.entry - exit_price
     return (
-        instrument.money(move, lot)
-        - instrument.money(instrument.spread_abs, lot)
-        + instrument.money(instrument.swap_abs(intent.side, days_held), lot)
-        - run.cfg.risk.commission
+        broker.money(broker.spread_pip, lot),
+        broker.money(broker.slippage_pip * _market_legs(result), lot),
+        broker.swap_abs(intent.side, days_held, lot),
+        broker.commission(lot),
     )
+
+
+def _profit_of(
+    intent: TradeIntent,
+    result: int,
+    exit_price: float,
+    days_held: int,
+    run: _Run,
+) -> float:
+    """Return the money a closed trade moved: prod's ``compute_profit``, priced by the profile.
+
+    The sign of the move follows the side, so the same formula prices a target, a stop and an
+    EOD close; the four charges come from :func:`_costs_of` and are subtracted if they cost the
+    account and added if they do not (a negative swap earns).  The engine's balance and the
+    ``profit`` column of the log both go through here, so the two can never disagree.
+    """
+    broker = run.cfg.risk.broker
+    move = exit_price - intent.entry if intent.side == "long" else intent.entry - exit_price
+    money = broker.money(move / broker.pip_size, run.cfg.risk.lot)
+    spread_cost, slippage_cost, swap_cost, commission = _costs_of(intent, result, days_held, run)
+    return money - spread_cost - slippage_cost + swap_cost - commission
 
 
 def _trade_row(
@@ -284,18 +323,15 @@ def _trade_row(
 ) -> dict[str, object]:
     """Build one row of the trade log: the geometry, the exit and the money it moved.
 
-    The money is prod's ``compute_profit`` with the price list of C6 in place of its
-    constants: the signed move of the trade priced by the lot, less the spread once, plus the
-    signed swap of the nights held, less the profile's commission.  ``exit_price`` already
-    carries the slippage of a market exit, so one formula covers the target, the stop and an
-    EOD close (prod branched on the result to reconstruct what the exit prices already say).
+    The money is prod's ``compute_profit`` with the broker profile of Э10' in place of its
+    constants (see :func:`_costs_of`); ``exit_price`` is the level the trade left at, and the
+    slippage of a market exit is a charge of its own column rather than a worse price, so the
+    log says both what the broker hit and what the exit cost.
     """
     order = trade.order
     intent = order.intent
     instrument = run.instrument
-    lot = run.cfg.risk.lot
-    spread_cost = instrument.money(instrument.spread_abs, lot)
-    swap_cost = instrument.money(instrument.swap_abs(intent.side, days_held), lot)
+    spread_cost, slippage_cost, swap_cost, commission = _costs_of(intent, result, days_held, run)
     return {
         "signal_bar": intent.bar,
         "open_time": intent.open_time,
@@ -324,10 +360,11 @@ def _trade_row(
         "fvg_bar": intent.fvg_bar,
         "exit_price": exit_price,
         "result": result,
-        "profit": _profit_of(intent, exit_price, days_held, run),
+        "profit": _profit_of(intent, result, exit_price, days_held, run),
         "spread_cost": spread_cost,
+        "slippage_cost": slippage_cost,
         "swap_cost": swap_cost,
-        "commission": run.cfg.risk.commission,
+        "commission": commission,
         "risk_pct": order.risk_pct,
         "risk_warning": order.risk_warning,
     }
@@ -439,6 +476,43 @@ def _result_from(
     )
 
 
+#: The price-list numbers the run's row and its profile have to agree on: the ones that belong to
+#: the *symbol* (C6).  The account-level ones may differ on purpose - a run that experiments with
+#: its own commission or leverage is still charging one account.
+_SYMBOL_PRICE_FIELDS = (
+    "pip_size",
+    "contract_size",
+    "spread_pip",
+    "swap_long_pip",
+    "swap_short_pip",
+)
+
+
+def _check_profile(cfg: BacktestConfig, spec: InstrumentSpec) -> None:
+    """Refuse a run whose price-list row and broker profile disagree about the symbol (Э10').
+
+    The engine charges ``cfg.risk.broker`` and the row is what labels the run, so the two are one
+    account seen twice: a row whose symbol-level numbers differ from the profile describes a
+    *different* symbol, and the report of such a run would name one pair while charging the costs
+    of another.  Nothing is guessed here - the mismatch is an error, and the message says how to
+    fix it.  The account-level numbers (``leverage``, ``slippage_pip``,
+    ``commission_per_lot_usd``) are deliberately *not* compared: they belong to the account and a
+    run may want its own.
+    """
+    profile = cfg.risk.broker
+    differences = [
+        f"{name}: row {getattr(spec.broker, name):g} != profile {getattr(profile, name):g}"
+        for name in _SYMBOL_PRICE_FIELDS
+        if getattr(spec.broker, name) != getattr(profile, name)
+    ]
+    if differences:
+        raise ValueError(
+            f"the price list row of {spec.symbol} and the broker profile of the run disagree "
+            f"({'; '.join(differences)}): set RiskConfig(broker="
+            f"ALFAFOREX_SPECS['{spec.symbol}'].broker) or pass instrument=... (Э10')"
+        )
+
+
 def run_backtest(
     tape: pd.DataFrame,
     intents: pd.DataFrame | Iterable[TradeIntent],
@@ -450,9 +524,12 @@ def run_backtest(
     ``tape`` is the canonical loader frame (``timestamp`` = open stamp, OHLC, optional
     ``is_closed``) and ``intents`` the accepted setups of the strategy layer - a sequence of
     :class:`~smc_zero.strategy.base.TradeIntent` or an intents frame.  ``instrument`` is the
-    price list row the costs are charged from (C6; the EURUSD row of ``ALFAFOREX_SPECS`` by
-    default) and it is read *beside* ``cfg.risk``, which prices the order and the reported
-    ``risk_pct``.
+    price list row of the traded symbol (C6; the EURUSD row of ``ALFAFOREX_SPECS`` by default)
+    and it labels the run, while every cost is charged from the broker profile of the config
+    (``cfg.risk.broker``, Э10': the engine, the report and the optimizer then price one account).
+    The symbol-level numbers of the two have to agree - the run refuses a row whose spread,
+    swaps, pip or contract differ from the profile, because the report would otherwise name one
+    account and charge another (:func:`_check_profile`).
 
     The run is deterministic and look-ahead free: bar ``i`` is resolved with bar ``i`` and the
     state the earlier bars left behind, never with a stamp of a later bar.  Nothing is simulated
@@ -463,6 +540,7 @@ def run_backtest(
     """
     config = BacktestConfig() if cfg is None else cfg
     spec = DEFAULT_INSTRUMENT if instrument is None else instrument
+    _check_profile(config, spec)
     frame = _entry_tape(tape, config)
     grouped = _intents_by_bar(intents, frame)
     run = _Run(stamps=frame[TIMESTAMP_COLUMN], cfg=config, instrument=spec)
@@ -522,7 +600,6 @@ def run_backtest(
                         low[i],
                         intent.sl,
                         intent.tp,
-                        config.risk.slippage,
                     )
                     if tradable[i]
                     else None
@@ -533,7 +610,7 @@ def run_backtest(
                 result, exit_price = hit
                 held = _nights_between(days[trade.fill_bar], day)
                 trades.append(_trade_row(trade, i, result, exit_price, held, run))
-                balance += _profit_of(intent, exit_price, held, run)
+                balance += _profit_of(intent, result, exit_price, held, run)
                 if result == SL_RESULT:
                     # prod counted a stop at the *signal* bar; the event-driven engine counts it
                     # where it happens, which is what the day's cap has to read (see §7.9).
@@ -601,18 +678,15 @@ def run_backtest(
             placed_today[day] = placed_today.get(day, 0) + 1
 
         # 4. end of day: prod's ``force_close_eod`` branch, on the last bar of the MSK day (the
-        #    bar a date change follows).  It is a market exit, so it slips like a stop does, and
-        #    prod zeroes the swap of an EOD close: the position was never held overnight.
+        #    bar a date change follows).  It is a market exit, so it pays one leg of slippage in
+        #    :func:`_costs_of` and leaves at the close of the bar; prod zeroes the swap of an EOD
+        #    close too: the position was never held overnight.
         if open_trades and config.force_close_eod and day_ends[i]:
             for trade in open_trades:
                 intent = trade.order.intent
-                exit_price = (
-                    close[i] - config.risk.slippage
-                    if intent.side == "long"
-                    else close[i] + config.risk.slippage
-                )
+                exit_price = float(close[i])
                 trades.append(_trade_row(trade, i, EOD_RESULT, exit_price, 0, run))
-                balance += _profit_of(intent, exit_price, 0, run)
+                balance += _profit_of(intent, EOD_RESULT, exit_price, 0, run)
             open_trades = []
 
         curve[i] = balance

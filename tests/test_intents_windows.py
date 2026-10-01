@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from smc_zero.config import LiquidityConfig, RiskConfig, StrategyConfig
+from smc_zero.config import BrokerSpec, LiquidityConfig, RiskConfig, StrategyConfig
 from smc_zero.data_loader import IS_CLOSED_COLUMN, TIMESTAMP_COLUMN
 from smc_zero.indicators.bias import BIAS_DIR_COLUMN
 from smc_zero.indicators.levels import (
@@ -142,10 +142,13 @@ def _chain(
     levels: pd.DataFrame | None = None,
     **cfg_kw: object,
 ) -> EntryChain:
-    """Run the chain on one scenario with the JPY pip of this file pinned (the Э4' fixture rule)."""
+    """Run the chain on one scenario with the JPY pip of this file pinned (the Э4' fixture rule).
+
+    Э10': the pip is a field of ``BrokerSpec`` now, so it is pinned *inside* the profile.
+    """
     bars = _frame(rows)
     book = _book((PDH, LEVEL, True, None, None)) if levels is None else levels
-    risk = replace(RiskConfig(), pip_size=PIP)
+    risk = replace(RiskConfig(), broker=replace(BrokerSpec(), pip_size=PIP))
     return build_intents(bars, _bias(bars), book, StrategyConfig(risk=risk, **cfg_kw))
 
 

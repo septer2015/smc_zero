@@ -639,7 +639,9 @@ def build_intents(
     min_sl = config.min_sl_pip * pip
     min_sl_realistic = config.min_sl_realistic_pip * pip
     max_sl_realistic = config.max_sl_realistic_pip * pip
-    spread = config.risk.spread
+    # Gate (14) compares the spread of the profile with the stop in *price units*, which is what
+    # ``broker.spread_abs`` answers (Э10': the profile speaks pips, the levels speak prices).
+    spread = config.risk.broker.spread_abs
     max_spread_pct = config.max_spread_pct_of_sl
     lookback = config.liquidity.sweep_lookback
     cap = config.max_setups_per_level_per_day
@@ -796,7 +798,7 @@ def build_intents(
             refuse(rejected_all, REASON_SL_REJECTED_ALL)
             refuse(rejected_wide, REASON_SL_REJECTED_WIDE)
             refuse((sl_size <= 0) | (sl_size < min_sl), REASON_MIN_SL_SKIP)  # (13)
-            if max_spread_pct > 0:  # (14) inert while RiskConfig.spread is zero (Э3' default)
+            if max_spread_pct > 0:  # (14) the spread of the profile against the stop of the setup
                 refuse(spread > sl_size * max_spread_pct, REASON_SPREAD_PCT_SKIP)
         # (3) the cap of §7.8 п.38: the counter is per instance, so once the cap-th setup is taken
         # gate (3) answers before every later gate and a bar past that setup keeps that very reason.

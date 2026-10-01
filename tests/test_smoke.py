@@ -27,7 +27,11 @@ def test_backtest_config_defaults() -> None:
     config = smc_zero.BacktestConfig()
     assert config.initial_capital > 0
     assert config.drop_unclosed is True
-    assert config.risk.has_costs is False  # costs must be set explicitly
+    # The shipped profile is Alfa's (C6), so a run is charged its spread, its slippage and its
+    # commission unless the caller builds an uncosted broker profile on purpose (Э10').
+    assert config.risk.has_costs is True
+    assert config.risk.broker.spread_pip > 0
+    assert config.risk.broker.commission_per_lot_usd > 0
 
 
 def test_data_loader_is_importable() -> None:

@@ -1,9 +1,11 @@
 """Engine tests: one order life cycle per intent, C6 costs, the C7 gates (Э5').
 
 The tape is synthetic and small - M15 bars of a Tuesday from 08:00 UTC (11:00 MSK) - and the
-numbers are EURUSD at 0.1 lot: a pip is $1, the 1.4 pip spread of ``ALFAFOREX_SPECS`` costs
-exactly $1.40, a 30 pip stop is 3 % of the C7 deposit and 0.1 lot of a 100 000 contract needs
-$275 of margin at the price of the intents.  Every figure below can therefore be read by hand.
+numbers are EURUSD at 0.1 lot: a pip is $1, so the Alfa profile of ``BrokerSpec`` charges exactly
+$1.40 of spread and $1.40 of commission (7.0 per lot over the two turns) on every trade, $0.20 of
+slippage on each *market* leg and $0.70 of swap per long night; a 30 pip stop is 3 % of the C7
+deposit and 0.1 lot of a 100 000 contract needs $275 of margin at the price of the intents.  Every
+figure below can therefore be read by hand.
 
 The four mutations the module is one line away from, and the test each one must break:
 
@@ -33,7 +35,7 @@ from smc_zero.backtester.engine import (
     run_backtest,
 )
 from smc_zero.backtester.metrics import EOD_RESULT, SL_RESULT, TP_RESULT
-from smc_zero.config import BacktestConfig, RiskConfig
+from smc_zero.config import ALFAFOREX_SPECS, BacktestConfig, BrokerSpec, RiskConfig
 from smc_zero.indicators.levels import PDH
 from smc_zero.strategy.base import TradeIntent, intents_frame
 from smc_zero.strategy.risk_gate import REASON_NO_MARGIN, RISK_REJECTION_COLUMNS
@@ -107,7 +109,7 @@ def test_a_limit_fills_on_the_next_bar_never_on_its_own() -> None:
 
 
 def test_the_stop_wins_when_one_bar_touches_both_levels() -> None:
-    """The stop is looked at before the target, and an exit is only charged the spread (m2)."""
+    """The stop is looked at before the target, and the exit pays the market leg it is (m2)."""
     rows = [
         FLAT,
         FLAT,
@@ -122,26 +124,54 @@ def test_the_stop_wins_when_one_bar_touches_both_levels() -> None:
     trade = result.trades.iloc[0]
     assert trade["result"] == SL_RESULT
     assert trade["exit_bar"] == 4
-    assert trade["exit_price"] == pytest.approx(1.1030)
-    assert trade["profit"] == pytest.approx(-30.0 - 1.4)
+    assert trade["exit_price"] == pytest.approx(1.1030)  # the level the stop triggers at
+    assert trade["slippage_cost"] == pytest.approx(0.2)  # one market leg of the Alfa profile
+    # 30 pips of move, the spread of the round trip, the slippage of the exit and the commission.
+    assert trade["profit"] == pytest.approx(-30.0 - 1.4 - 0.2 - 1.4)
 
 
 def test_the_price_list_and_the_profile_are_charged_exactly() -> None:
-    """The spread is paid once per trade, the commission once, and no night was held (m3)."""
+    """The four charges of one trade, and the flat legacy commission migrated by money (m3)."""
     frame = _tape(_trade_rows())
-    config = BacktestConfig(risk=RiskConfig(commission=0.35))
+    config = BacktestConfig(risk=RiskConfig(commission=0.35))  # the Э5' keyword: per trade
     result = run_backtest(frame, [_intent(frame, 2)], config)
 
     trade = result.trades.iloc[0]
     assert trade["spread_cost"] == pytest.approx(1.4)  # 1.4 pip at $1 a pip
+    assert trade["slippage_cost"] == 0.0  # a target is a resting limit, not a market order
     assert trade["commission"] == pytest.approx(0.35)
     assert trade["swap_cost"] == 0.0
     assert trade["days_held"] == 0
-    # The target is 60 pips away, so the money is 60 - the spread - the commission.
+    # A flat 0.35 a trade is the same money as 1.75 per lot over two turns, so the migration of
+    # the old call site does not move a cent; the target is 60 pips away and the money is 60 -
+    # the spread - the commission.
+    assert result.config.risk.broker.commission_per_lot_usd == pytest.approx(1.75)
     assert trade["profit"] == pytest.approx(60.0 - 1.4 - 0.35)
     assert result.metrics["spread_cost"] == pytest.approx(1.4)
     assert result.metrics["profit"] == pytest.approx(58.25)
     assert result.metrics["final_balance"] == pytest.approx(10_058.25)
+
+
+def test_the_run_refuses_a_row_priced_like_another_symbol() -> None:
+    """The run charges one profile for one symbol, so the row and the profile have to agree (Э10')."""
+    frame = _tape(_trade_rows())
+    intent = _intent(frame, 2)
+
+    # The account-level numbers are the run's own: a commission the run wants is no mismatch.
+    own = BacktestConfig(risk=RiskConfig(broker=BrokerSpec(commission_per_lot_usd=3.5)))
+    assert len(run_backtest(frame, [intent], own).trades) == 1
+
+    # The symbol-level ones are not: the engine charges the profile of the run, so a GBPUSD row
+    # under the EURUSD profile would label a trade one way and price it another.
+    other = BacktestConfig(risk=RiskConfig(broker=ALFAFOREX_SPECS["GBPUSD"].broker))
+    with pytest.raises(ValueError, match="the price list row of EURUSD"):
+        run_backtest(frame, [intent], other)
+    with pytest.raises(ValueError, match="spread_pip: row 1.4 != profile 2.1"):
+        run_backtest(frame, [intent], other)
+
+    # Naming the row of the run explicitly is the other way out of the mismatch.
+    assert len(run_backtest(frame, [intent], other, ALFAFOREX_SPECS["GBPUSD"]).trades) == 1
+
 
 
 def test_the_margin_gate_measures_the_balance_of_the_intent_bar() -> None:
@@ -383,7 +413,9 @@ def test_the_swap_is_charged_per_msk_night_held() -> None:
 
     assert trade["days_held"] == 1
     assert trade["swap_cost"] == pytest.approx(-0.7)  # the long leg of the EURUSD price list
-    assert trade["profit"] == pytest.approx(50.0 - 1.4 - 0.7)
+    # 50 pips of move, the spread, the commission and one night of the long leg: the target is a
+    # resting limit and pays no slippage.
+    assert trade["profit"] == pytest.approx(50.0 - 1.4 - 0.7 - 1.4)
 
     # A night is an MSK date change, not a UTC one: a trade of one MSK day pays nothing, which
     # is where the engine deliberately leaves prod's UTC arithmetic (§7.9).
@@ -434,18 +466,23 @@ def test_the_equity_curve_is_flat_until_the_trade_closes() -> None:
     assert list(result.equity.index) == list(frame["timestamp"] + BAR)
     assert result.equity.iloc[0] == pytest.approx(10_000.0)
     assert result.equity.iloc[:4].nunique() == 1  # the trade is still open
-    assert result.equity.iloc[4] == pytest.approx(10_058.6)
+    assert result.equity.iloc[4] == pytest.approx(10_057.2)  # 60 pips - the spread - the commission
     assert result.equity.iloc[-1] == pytest.approx(result.metrics["final_balance"])
     assert result.config.initial_capital == 10_000.0
 
 
-def test_the_slippage_worsens_market_exits_only() -> None:
-    """A stop and an EOD close are market orders and pay the slippage; a target is a limit."""
-    config = BacktestConfig(risk=RiskConfig(slippage=0.0002))  # 2 pips
+def test_the_slippage_is_charged_on_the_market_legs_only() -> None:
+    """A target is a resting limit and pays no slippage; a stop and an EOD close pay one leg.
+
+    Э10' books the slippage as *money* of its own column instead of a worse price, so the log
+    keeps both the level the exit happened at and what that exit cost.
+    """
+    config = BacktestConfig(risk=RiskConfig(slippage=0.0002))  # the Э5' price unit: 2 pips
     frame = _tape(_trade_rows())
     winner = run_backtest(frame, [_intent(frame, 2)], config).trades.iloc[0]
     assert winner["result"] == TP_RESULT
     assert winner["exit_price"] == pytest.approx(1.0940)
+    assert winner["slippage_cost"] == 0.0
 
     stopped_frame = _tape(
         [
@@ -459,8 +496,9 @@ def test_the_slippage_worsens_market_exits_only() -> None:
     )
     stopped = run_backtest(stopped_frame, [_intent(stopped_frame, 2)], config).trades.iloc[0]
     assert stopped["result"] == SL_RESULT
-    assert stopped["exit_price"] == pytest.approx(1.1032)
-    assert stopped["profit"] == pytest.approx(-32.0 - 1.4)
+    assert stopped["exit_price"] == pytest.approx(1.1030)  # the trigger, not the fill
+    assert stopped["slippage_cost"] == pytest.approx(2.0)  # 2 pips on the one market leg
+    assert stopped["profit"] == pytest.approx(-30.0 - 1.4 - 2.0 - 1.4)
 
     start = pd.Timestamp(f"{DAY} 20:30", tz="UTC")
     eod_frame = _tape([FLAT, (1.0950, 1.1005, 1.0945, 1.0950)], start=start)
@@ -471,7 +509,8 @@ def test_the_slippage_worsens_market_exits_only() -> None:
         BacktestConfig(force_close_eod=True, risk=RiskConfig(slippage=0.0002)),
     ).trades.iloc[0]
     assert closed["result"] == EOD_RESULT
-    assert closed["exit_price"] == pytest.approx(eod_frame["close"].iloc[1] + 0.0002)
+    assert closed["exit_price"] == pytest.approx(eod_frame["close"].iloc[1])
+    assert closed["slippage_cost"] == pytest.approx(2.0)
 
 
 def test_an_empty_tape_or_an_empty_intent_list_is_a_flat_run() -> None:

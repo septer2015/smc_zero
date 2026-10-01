@@ -132,7 +132,7 @@ def test_the_report_holds_the_window_and_not_the_whole_file(
 def test_the_summary_of_a_run_lists_the_costs_it_was_charged(
     tmp_path: Path, stubbed_tape: None
 ) -> None:
-    """Rule 4 on the page: the cost assumptions are printed, an uncosted run is stamped."""
+    """Rule 4 on the page: the cost assumptions of the run are printed, and a costed run is clear."""
     report_dir = tmp_path / "reports"
 
     assert runner.main(_argv(report_dir)) == 0
@@ -141,11 +141,13 @@ def test_the_summary_of_a_run_lists_the_costs_it_was_charged(
         encoding="utf-8"
     )
     assert "costs" in text
+    # The runner trades the Alfa row and charges the shipped profile, so all three costs are on the
+    # page and rule 4 has nothing to stamp (Э10').  The uncosted run is the one that builds a zero
+    # profile on purpose, and that one is stamped (see tests/test_reports.py).
+    assert StrategyConfig().risk.has_costs is True
     assert "spread 1.4 pip" in text
-    if not StrategyConfig().risk.has_costs:
-        # The shipped profile carries no commission or slippage yet (C6 / §5 п.10), so the warning
-        # must be on the page while that is true - and may go once the costs arrive.
-        assert "RiskConfig.has_costs is False" in text
+    assert "slippage 0.20 pip per market leg, commission 7.00 per lot" in text
+    assert "RiskConfig.has_costs is False" not in text
 
 
 def test_a_missing_tape_is_refused_without_creating_a_report(tmp_path: Path) -> None:

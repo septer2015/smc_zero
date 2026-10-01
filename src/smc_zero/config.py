@@ -2,15 +2,18 @@
 
 Every threshold used by indicators, the strategy and the backtester lives in a
 dataclass here: strategy code must not contain magic numbers (constitution rule
-5).  Defaults are intentionally inert (zero tolerances, zero costs) wherever a
-value is project specific, so a concrete run has to set them explicitly - in
-particular :class:`RiskConfig` must carry non-zero costs before any result is
-called profitable (rule 4).
+5).  Strategy thresholds keep inert defaults (a concrete run sets them), while
+the money of a run has exactly one home: :class:`BrokerSpec`, the broker profile
+of the C6 price list and the C7 risk profile (Э10').  Its defaults are Alfa's, so
+a run is charged its spread, commission and slippage without being asked, and
+:attr:`RiskConfig.has_costs` reports that fact to the reporting layer (rule 4:
+without costs a positive curve must not be called a profit).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, replace
 from typing import Literal, TypeAlias
 
 # Timeframes supported by the pipeline: M15 entry, H1 structure, H4/D1 bias.
@@ -426,77 +429,300 @@ class LevelConfig:
             )
 
 
+#: The legs of one round turn: the entry is one, the exit it pays for the second.  The
+#: commission of a profile is charged over both (prod's convention), so both are named.
+TURNS_PER_TRADE = 2
+
+
 @dataclass(frozen=True, slots=True)
+class BrokerSpec:
+    """The broker profile of a run: the costs and the contract of one account (C6 + C7, Э10').
+
+    It is the *single* home of every money number of a backtest, so the engine, the report and
+    the optimizer can never price the same trade twice.  C6 read those numbers from a price
+    list and C7 kept its own copy (``RiskConfig.pip_size`` and the rest); Э10' merged both into
+    this profile, and the classes around it read it through properties instead of holding a
+    second copy.
+
+    The fields, all of them Alfa's and none of them invented (C6: the trading-terms page of the
+    knowledge base is empty, so the numbers are the ones of the contract and have to be
+    verified against it):
+
+    * ``spread_pip`` - the round-trip spread in *pips* (Alfa quotes EURUSD at 1.4);
+    * ``commission_per_lot_usd`` - the commission of one *round turn* per lot in account
+      currency (Alfa: 7.0, which is 1.40 on the 0.1 lot of C7);
+    * ``slippage_pip`` - the adverse slippage of one *market* leg in pips.  A limit fill and a
+      target hit keep their price; a stop, an EOD close and a market entry do not;
+    * ``swap_long_pip`` / ``swap_short_pip`` - the overnight rate in pips per night, signed so
+      that a negative number is charged to the account (Alfa: -0.70 / 0.00);
+    * ``contract_size`` - the units of one lot (100 000 for FX);
+    * ``pip_size`` - one pip in price units (0.0001 for FX);
+    * ``leverage`` - the margin ratio of the account (C7: 40).
+
+    A cost may be ``0`` and none of them may be negative: zero is how an *uncosted* run is written
+    down - one profile serves the priced run and the experiment that switches the fees off, so
+    there is no second config class to keep in step - while a negative fee would be money given to
+    the account, which no row of the price list does.  The shipped defaults are Alfa's, so
+    ``RiskConfig.has_costs`` is ``True`` for a bare config and the uncosted run is the one built
+    on purpose (the report stamps it, rule 4).
+
+    Two units live here on purpose, and every helper says which is which.  The unit of the
+    profile itself is the *pip*: :attr:`spread_abs` and :attr:`slippage_abs` convert a pip
+    value into price units (a level or a stop is compared in prices), :meth:`money` converts a
+    pip distance into account currency (a balance is money), while :meth:`commission` and
+    :meth:`swap_abs` are already money.
+
+    The formulas are the ones the engine charges, nothing here is a rounding of them:
+    ``spread_abs = spread_pip * pip_size``, ``slippage_abs = slippage_pip * pip_size``,
+    ``commission(lot) = commission_per_lot_usd * lot * turns``,
+    ``swap_abs(side, nights, lot) = money(swap_pip(side) * nights, lot)`` and
+    ``money(pips, lot) = pips * pip_size * contract_size * lot``.
+    """
+
+    spread_pip: float = 1.4
+    commission_per_lot_usd: float = 7.0
+    slippage_pip: float = 0.2
+    swap_long_pip: float = -0.70
+    swap_short_pip: float = 0.0
+    contract_size: float = 100_000.0
+    pip_size: float = 0.0001
+    leverage: float = 40.0
+
+    def __post_init__(self) -> None:
+        """Refuse numbers that cannot price an account; a zero cost is a choice, not a typo (Э10').
+
+        The three cost fields accept zero on purpose: ``BrokerSpec(spread_pip=0,
+        commission_per_lot_usd=0, slippage_pip=0)`` is the documented way to write down an
+        *uncosted* run, and :attr:`RiskConfig.has_costs` reports that choice to the reporting
+        layer, which then stamps the run (rule 4).  A negative cost would be money given to the
+        account and stays refused, as do a non-positive contract, pip and leverage.
+        """
+        if self.spread_pip < 0:
+            raise ValueError("spread_pip must be >= 0 (0 = no spread is charged)")
+        if self.commission_per_lot_usd < 0:
+            raise ValueError("commission_per_lot_usd must be >= 0 (0 = no commission is charged)")
+        if self.slippage_pip < 0:
+            raise ValueError("slippage_pip must be >= 0 (0 = no slippage is charged)")
+        if self.contract_size <= 0:
+            raise ValueError("contract_size must be > 0")
+        if self.pip_size <= 0:
+            raise ValueError("pip_size must be > 0")
+        if self.leverage < 1:
+            raise ValueError("leverage must be >= 1")
+
+    @property
+    def spread_abs(self) -> float:
+        """The round-trip spread in price units (prod: ``spread_pip * pip_size``)."""
+        return self.spread_pip * self.pip_size
+
+    @property
+    def slippage_abs(self) -> float:
+        """The slippage of one market leg in price units (``slippage_pip * pip_size``)."""
+        return self.slippage_pip * self.pip_size
+
+    def commission(self, lot: float, turns: int = TURNS_PER_TRADE) -> float:
+        """The commission of ``lot`` over ``turns`` legs, in account currency."""
+        return self.commission_per_lot_usd * lot * turns
+
+    def swap_pip(self, side: Side) -> float:
+        """The overnight rate of ``side`` in pips per night (one leg of the pair)."""
+        return self.swap_long_pip if side == "long" else self.swap_short_pip
+
+    def swap_abs(self, side: Side, days_held: int, lot: float) -> float:
+        """The overnight *money* of ``side`` for ``days_held`` nights, in account currency."""
+        return self.money(self.swap_pip(side) * days_held, lot)
+
+    def money(self, move_pips: float, lot: float) -> float:
+        """Convert a distance *in pips* into account currency.
+
+        ``money(pips, lot) = pips * pip_size * contract_size * lot``, so one pip on the 0.1 lot
+        of EURUSD is 0.1 * 100 000 * 0.0001 = 1.0 - C7's arithmetic ("$1 a pip at 0.1 lot").
+        """
+        return move_pips * self.pip_size * self.contract_size * lot
+
+
+def _legacy_broker(profile: BrokerSpec, lot: float, legacy: dict[str, float]) -> BrokerSpec:
+    """Fold the deprecated Э5' cost arguments of :class:`RiskConfig` into a broker profile.
+
+    Э5' introduced ``RiskConfig.commission`` / ``spread`` / ``slippage`` (one flat fee per trade
+    and two *price-unit* constants) and kept ``pip_size`` / ``contract_size`` / ``leverage`` in
+    the risk profile; Э10' moved all six into :class:`BrokerSpec`.  The names do not share their
+    units, so the migration keeps the *money* of the old call site and not its numbers:
+
+    * ``pip_size`` / ``contract_size`` / ``leverage`` - the value lands in the same-named field
+      of the profile (that trio was always the profile's own copy);
+    * ``spread`` / ``slippage`` - the old fields were price units and the new ones are pips, so
+      the value is divided by the pip the profile uses: ``spread_abs`` of the result is exactly
+      the price the old call site charged;
+    * ``commission`` - the old field was one flat fee per trade and the new one is a rate per lot
+      and round turn, so the value is divided by the lot and by the two legs: the money charged
+      on that lot is unchanged.
+
+    ``lot`` is validated by the caller: a non-positive one is refused by
+    :meth:`RiskConfig.__post_init__` before a division could matter.
+    """
+    moves: dict[str, float] = {}
+    pip = float(legacy.get("pip_size", profile.pip_size))
+    for name in ("pip_size", "contract_size", "leverage"):
+        if name in legacy:
+            moves[name] = float(legacy[name])
+    for name in ("spread", "slippage"):
+        if name in legacy:
+            moves[f"{name}_pip"] = float(legacy[name]) / pip
+    if "commission" in legacy and lot > 0:
+        moves["commission_per_lot_usd"] = float(legacy["commission"]) / (lot * TURNS_PER_TRADE)
+    return replace(profile, **moves)
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class RiskConfig:
-    """Position sizing, trading costs and the C7 risk profile.
+    """Position sizing, the C7 risk profile and - through the profile - the money of a run.
 
     ``risk_pct`` is the per-trade risk budget in percent of equity; ``rr`` keeps
     prod's ``params["rr"]`` (the 1.5 / 2.0 / 2.5 grid built from ``MIN_RR`` /
     ``MAX_RR`` / ``RR_STEP``), which v1 uses only as the TP fallback
     (``TPConfig.rr_fallback``) - the strict RR mode is deferred.
 
-    ``commission`` is charged per trade in account currency, ``spread`` and
-    ``slippage`` are expressed in price units.  :attr:`has_costs` is the guard
-    used by the reporting layer: without costs a positive equity curve must not
-    be presented as a profit.
+    ``lot`` and ``deposit`` are C7's fixed risk profile, and the lot is *given*, not derived
+    from ``risk_pct`` (``DEFAULT_LOT = 0.1`` with a 100 000 contract is $1/pip on EURUSD, so a
+    20-60 pip SL risks 2-6 % of the $1000 deposit - C7's own arithmetic), while every order has
+    to pass a margin check before it is placed.  ``deposit`` is the C7 answer of SPEC_SMC.md
+    §7.8 п.37 (ruling R2): the *denominator* of the reported ``risk_pct`` column, 1000 as the
+    owner ruled.  It is deliberately not ``BacktestConfig.initial_capital`` - that field is the
+    backtester's own capital (prod's 10000, SPEC_SMC.md §5 п.10) and the margin gate measures
+    against the *current* equity it is handed, so the two numbers answer two different questions
+    until §5 п.10 is answered.  ``warning_risk_pct`` is C7's reporting threshold: a single trade
+    above it is still allowed but flagged, and the backtester prints the median risk per trade.
 
-    ``lot``, ``leverage``, ``contract_size``, ``pip_size`` and ``deposit`` are C7's
-    fixed risk profile, and it is the *one* copy of every broker number: the risk
-    gate of :mod:`smc_zero.strategy.risk_gate` prices an order from this object
-    alone (``apply_risk_gate(intents, cfg, equity)``).  The lot is *given*, not
-    derived from ``risk_pct`` (``DEFAULT_LOT = 0.1`` with ``contract_size =
-    100 000`` is $1/pip on EURUSD, so a 20-60 pip SL risks 2-6 % of a $1000
-    deposit - C7's own arithmetic), and an order has to pass a margin check before
-    it is placed.  ``warning_risk_pct`` is C7's reporting threshold: a single trade
-    above it is still allowed but flagged, and the backtester must print the
-    median risk per trade.
+    Every broker number - the costs, the pip, the contract, the leverage - lives in
+    :attr:`broker` (Э10': one profile for the engine, the report and the optimizer), and the
+    properties below read it instead of keeping a second copy.  The three Э5' cost names stay,
+    and they answer in the units of the profile: ``spread`` and ``slippage`` are now *pips*
+    (they used to be price units - ``broker.spread_abs`` / ``broker.slippage_abs`` convert),
+    ``commission`` is the rate per lot of a round turn (it used to be one flat fee per trade -
+    ``broker.commission(lot)`` is the money charged).  All six Э5' cost keywords are still
+    accepted by the constructor and are migrated *by money* and not by name (see
+    :func:`_legacy_broker`), each of them with a :class:`DeprecationWarning`.
 
-    ``deposit`` is the C7 answer of SPEC_SMC.md §7.8 п.37 (ruling R2): the
-    *denominator* of the reported ``risk_pct`` column, 1000 as the owner ruled.
-    It is deliberately not ``BacktestConfig.initial_capital`` - that field is the
-    backtester's own capital (prod's 10000, SPEC_SMC.md §5 п.10) and the margin
-    gate measures against the *current* equity it is handed, so the two numbers
-    answer two different questions until §5 п.10 is answered.  ``pip_size`` and
-    ``contract_size`` are the FX pair of the price list (0.0001 pip, 100 000 a
-    lot); ``BrokerSpec`` (C6, Э5') has to *replace* this trio, not duplicate it.
+    :attr:`has_costs` is the guard used by the reporting layer: without costs a positive equity
+    curve must not be presented as a profit.  It is ``True`` only when the profile charges a
+    spread, a commission *and* a slippage - the Alfa defaults of :class:`BrokerSpec` do, so the
+    uncosted run is now the one built on purpose.
     """
 
     risk_pct: float = 1.0
     rr: float = 2.0
-    commission: float = 0.0
-    spread: float = 0.0
-    slippage: float = 0.0
     lot: float = 0.1
-    leverage: float = 40.0
-    contract_size: float = 100_000.0
-    pip_size: float = 0.0001
     deposit: float = 1000.0
     warning_risk_pct: float = 2.0
+    broker: BrokerSpec = field(default_factory=BrokerSpec)
+
+    def __init__(
+        self,
+        *,
+        risk_pct: float = 1.0,
+        rr: float = 2.0,
+        lot: float = 0.1,
+        deposit: float = 1000.0,
+        warning_risk_pct: float = 2.0,
+        broker: BrokerSpec | None = None,
+        commission: float | None = None,
+        spread: float | None = None,
+        slippage: float | None = None,
+        pip_size: float | None = None,
+        contract_size: float | None = None,
+        leverage: float | None = None,
+    ) -> None:
+        """Build the profile; the six cost keywords are the deprecated Э5' names (Э10').
+
+        The arguments are keyword-only on purpose: the Э5' order put ``commission`` third, so an
+        old positional call would silently bind its fee to the lot, and a silent change of money
+        is exactly what a migration must not do.  ``broker`` may be handed in whole - the Э10'
+        way - and the deprecated keywords are then folded *into* it by :func:`_legacy_broker`, so
+        ``RiskConfig(broker=..., pip_size=...)`` still means one profile and not two.
+        """
+        profile = BrokerSpec() if broker is None else broker
+        legacy = {
+            "commission": commission,
+            "spread": spread,
+            "slippage": slippage,
+            "pip_size": pip_size,
+            "contract_size": contract_size,
+            "leverage": leverage,
+        }
+        given = {name: value for name, value in legacy.items() if value is not None}
+        if given:
+            warnings.warn(
+                "RiskConfig cost arguments (commission, spread, slippage, pip_size, "
+                "contract_size, leverage) are deprecated: they moved into BrokerSpec, so pass "
+                "RiskConfig(broker=BrokerSpec(...)) instead (Э10')",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            profile = _legacy_broker(profile, lot, given)
+        object.__setattr__(self, "risk_pct", risk_pct)
+        object.__setattr__(self, "rr", rr)
+        object.__setattr__(self, "lot", lot)
+        object.__setattr__(self, "deposit", deposit)
+        object.__setattr__(self, "warning_risk_pct", warning_risk_pct)
+        object.__setattr__(self, "broker", profile)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.risk_pct <= 0:
             raise ValueError("risk_pct must be > 0")
         if self.rr <= 0:
             raise ValueError("rr must be > 0")
-        if min(self.commission, self.spread, self.slippage) < 0:
-            raise ValueError("commission, spread and slippage must be >= 0")
         if self.lot <= 0:
             raise ValueError("lot must be > 0")
-        if self.leverage < 1:
-            raise ValueError("leverage must be >= 1")
-        if self.contract_size <= 0:
-            raise ValueError("contract_size must be > 0")
-        if self.pip_size <= 0:
-            raise ValueError("pip_size must be > 0")
         if self.deposit <= 0:
             raise ValueError("deposit must be > 0")
         if not 0 < self.warning_risk_pct <= 100:
             raise ValueError("warning_risk_pct must satisfy 0 < warning_risk_pct <= 100")
 
     @property
+    def commission(self) -> float:
+        """The commission rate of the profile: account currency per lot of a round turn."""
+        return self.broker.commission_per_lot_usd
+
+    @property
+    def spread(self) -> float:
+        """The round-trip spread of the profile in *pips* (``broker.spread_abs``: price units)."""
+        return self.broker.spread_pip
+
+    @property
+    def slippage(self) -> float:
+        """The slippage of one market leg in *pips* (``broker.slippage_abs``: price units)."""
+        return self.broker.slippage_pip
+
+    @property
+    def pip_size(self) -> float:
+        """The pip of the traded pair in price units (one copy: the profile's)."""
+        return self.broker.pip_size
+
+    @property
+    def contract_size(self) -> float:
+        """The units of one lot (one copy: the profile's)."""
+        return self.broker.contract_size
+
+    @property
+    def leverage(self) -> float:
+        """The margin ratio of the account (C7: 40)."""
+        return self.broker.leverage
+
+    @property
     def has_costs(self) -> bool:
-        """``True`` when commission, spread and slippage are all set."""
-        return self.commission > 0 and self.spread > 0 and self.slippage > 0
+        """``True`` when the profile charges a spread, a commission *and* a slippage.
+
+        A zero in any of the three turns it off: :class:`BrokerSpec` accepts zeros, so a profile
+        can be built uncosted on purpose, and the report of a run priced by one is stamped
+        (rule 4) - an uncosted curve is not a profit.
+        """
+        return (
+            self.broker.spread_pip > 0
+            and self.broker.commission_per_lot_usd > 0
+            and self.broker.slippage_pip > 0
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,9 +758,9 @@ class StrategyConfig:
       ``MIN_SL_REALISTIC_PIP = 20`` / ``MAX_SL_REALISTIC_PIP = 60``: the realistic
       SL band C7's arithmetic is built on (20-60 pips = 2-6 % of $1000 at 0.1 lot).
 
-    ``pip_size`` and ``contract_size`` are *not* fields here: they are the C7
-    numbers of :class:`RiskConfig`, and this class reads them through the
-    read-only properties of the same name (one copy of every broker number, so
+    ``pip_size`` and ``contract_size`` are *not* fields here: they live in the
+    broker profile of :class:`RiskConfig` (Э10'), and this class reads them through
+    the read-only properties of the same name (one copy of every broker number, so
     that the risk gate can price an order from the risk profile alone).
     ``pip_size`` converts the pip-denominated prod parameters at the *strategy*
     boundary - indicators never see a pip - and ``contract_size`` feeds the
@@ -554,8 +780,9 @@ class StrategyConfig:
     of the M15 entry frame - prod had a single global structure parameter set, so
     the strategy does not keep a second copy of it.  ``max_spread_pct_of_sl`` is
     prod's ``DEFAULT_MAX_SPREAD_PCT_OF_SL``: the spread may not exceed this
-    fraction of the stop distance (it is inert while ``RiskConfig.spread`` is zero,
-    which is the Э3' default - costs arrive with Э5').
+    fraction of the stop distance, and the spread it reads is the profile's
+    ``spread_abs`` - with the Alfa profile of Э10' (1.4 pips) a stop below ~12 pips
+    is refused by that gate.
     """
 
     setup_type: SetupType = "fresh"
@@ -619,72 +846,126 @@ class StrategyConfig:
             )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class InstrumentSpec:
-    """The Alfa-Forex price list of one symbol (C6): the costs the engine charges.
+    """The Alfa-Forex price list row of one symbol: whose profile its trades are charged (C6).
 
-    A row of prod's ``ALFAFOREX_SPECS`` as a dataclass (Э5', SPEC_SMC.md §7.9).
-    ``spread_pip`` is the round-trip spread of the price list, ``limit_stop_level_pip``
-    the broker's minimum distance between the market and a pending order,
-    ``swap_long_pip`` / ``swap_short_pip`` the overnight rates in *pips per night*
-    (negative = charged to the trader) and ``contract_size`` the units of one lot;
-    ``pip_size`` is the pip of the symbol (prod's ``PIP_SIZE``: 0.0001 for FX).
+    ``symbol`` names the row, ``limit_stop_level_pip`` is the broker's minimum distance between
+    the market and a pending order (checked before an order is placed, C6) and :attr:`broker` is
+    the whole cost profile of the symbol - the row owns no cost number of its own any more:
+    Э10' made the engine charge ``cfg.risk.broker``, so this row says which profile belongs to
+    the symbol, and :func:`smc_zero.backtester.engine.run_backtest` refuses a run whose two
+    readings of the same account differ.
 
-    The helpers keep the FX arithmetic in one place: :attr:`spread_abs` and
-    :meth:`swap_abs` are price units (exactly what the engine multiplies by the lot with
-    :meth:`money`), and the lot itself comes from :class:`RiskConfig` - a price list does
-    not know the position size.  ``pip_size`` / ``contract_size`` are deliberately *also*
-    fields of that risk profile: C7 prices a stop in pips, C6 quotes a spread in pips, and
-    Э5' hands the instrument to the engine *beside* the risk profile instead of letting the
-    engine guess which copy it means (§7.9 keeps the duplication on the table until C6
-    replaces the C7 trio).
+    The Э5' cost fields (``pip_size``, ``contract_size``, ``spread_pip``, ``swap_long_pip``,
+    ``swap_short_pip``) stay readable as read-only properties of the profile, and the Э5'
+    constructor keywords are still accepted (they are migrated into the profile, with a
+    :class:`DeprecationWarning`).  The helpers keep their Э5' *units*: a price list answers in
+    price units (:attr:`spread_abs`, :meth:`swap_abs`, :meth:`money`), which is exactly what the
+    engine multiplies by the lot, while :class:`BrokerSpec` speaks pips and money.  The lot and
+    the capital come from :class:`RiskConfig` - a price list does not know the position size.
     """
 
     symbol: Symbol = "EURUSD"
-    pip_size: float = 0.0001
-    contract_size: float = 100_000.0
-    spread_pip: float = 1.4
     limit_stop_level_pip: float = 0.7
-    swap_long_pip: float = -0.70
-    swap_short_pip: float = 0.0
+    broker: BrokerSpec = field(default_factory=BrokerSpec)
+
+    def __init__(
+        self,
+        *,
+        symbol: Symbol = "EURUSD",
+        limit_stop_level_pip: float = 0.7,
+        broker: BrokerSpec | None = None,
+        pip_size: float | None = None,
+        contract_size: float | None = None,
+        spread_pip: float | None = None,
+        swap_long_pip: float | None = None,
+        swap_short_pip: float | None = None,
+    ) -> None:
+        """Build the row; the five cost keywords are the deprecated Э5' names (Э10').
+
+        Every one of them has the same name *and* the same unit inside :class:`BrokerSpec`, so a
+        deprecated keyword is a straight rename and the number keeps its meaning.
+        """
+        profile = BrokerSpec() if broker is None else broker
+        legacy = {
+            "pip_size": pip_size,
+            "contract_size": contract_size,
+            "spread_pip": spread_pip,
+            "swap_long_pip": swap_long_pip,
+            "swap_short_pip": swap_short_pip,
+        }
+        given = {name: value for name, value in legacy.items() if value is not None}
+        if given:
+            warnings.warn(
+                "InstrumentSpec cost arguments (pip_size, contract_size, spread_pip, "
+                "swap_long_pip, swap_short_pip) are deprecated: they moved into BrokerSpec, so "
+                "pass InstrumentSpec(broker=BrokerSpec(...)) instead (Э10')",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            profile = replace(profile, **given)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "limit_stop_level_pip", limit_stop_level_pip)
+        object.__setattr__(self, "broker", profile)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        if self.pip_size <= 0:
-            raise ValueError("pip_size must be > 0")
-        if self.contract_size <= 0:
-            raise ValueError("contract_size must be > 0")
-        if self.spread_pip < 0:
-            raise ValueError("spread_pip must be >= 0")
         if self.limit_stop_level_pip < 0:
             raise ValueError("limit_stop_level_pip must be >= 0")
 
     @property
+    def pip_size(self) -> float:
+        """The pip of the symbol in price units (prod's ``PIP_SIZE``: 0.0001 for FX)."""
+        return self.broker.pip_size
+
+    @property
+    def contract_size(self) -> float:
+        """The units of one lot (prod: 100 000 for FX)."""
+        return self.broker.contract_size
+
+    @property
+    def spread_pip(self) -> float:
+        """The round-trip spread of the row in pips."""
+        return self.broker.spread_pip
+
+    @property
+    def swap_long_pip(self) -> float:
+        """The overnight rate of a long position in pips per night (negative = charged)."""
+        return self.broker.swap_long_pip
+
+    @property
+    def swap_short_pip(self) -> float:
+        """The overnight rate of a short position in pips per night (negative = charged)."""
+        return self.broker.swap_short_pip
+
+    @property
     def spread_abs(self) -> float:
         """The round-trip spread in price units (prod: ``spread_pip * pip_size``)."""
-        return self.spread_pip * self.pip_size
+        return self.broker.spread_abs
 
     def swap_pip(self, side: Side) -> float:
         """The overnight rate of ``side`` in pips per night (one leg of the pair)."""
-        return self.swap_long_pip if side == "long" else self.swap_short_pip
+        return self.broker.swap_pip(side)
 
     def swap_abs(self, side: Side, days_held: int) -> float:
         """The overnight result of ``side`` in price units for ``days_held`` nights."""
-        return self.swap_pip(side) * days_held * self.pip_size
+        return self.broker.swap_pip(side) * days_held * self.broker.pip_size
 
     def money(self, move_abs: float, lot: float) -> float:
         """Convert a price distance into account currency: ``move * contract * lot``."""
-        return move_abs * self.contract_size * lot
+        return move_abs * self.broker.contract_size * lot
 
 
-#: The price-list rows v1 ships: the two FX pairs of prod's ``ALFAFOREX_SPECS``.
+#: The price-list rows v1 ships: the two FX pairs of prod's ``ALFAFOREX_SPECS``.  The EURUSD
+#: row carries the Alfa profile the project trades (C6 + C7); GBPUSD differs in the spread, the
+#: limit-stop distance and the two overnight legs, and keeps the account numbers of the rest.
 ALFAFOREX_SPECS: dict[str, InstrumentSpec] = {
     "EURUSD": InstrumentSpec(),
     "GBPUSD": InstrumentSpec(
         symbol="GBPUSD",
-        spread_pip=2.1,
         limit_stop_level_pip=1.1,
-        swap_long_pip=-0.55,
-        swap_short_pip=-0.25,
+        broker=BrokerSpec(spread_pip=2.1, swap_long_pip=-0.55, swap_short_pip=-0.25),
     ),
 }
 

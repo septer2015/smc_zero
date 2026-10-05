@@ -712,16 +712,18 @@ class RiskConfig:
 
     @property
     def has_costs(self) -> bool:
-        """``True`` when the profile charges a spread, a commission *and* a slippage.
+        """``True`` whenever the profile charges *any* of the three costs (Э11'.2).
 
-        A zero in any of the three turns it off: :class:`BrokerSpec` accepts zeros, so a profile
-        can be built uncosted on purpose, and the report of a run priced by one is stamped
-        (rule 4) - an uncosted curve is not a profit.
+        The flag is the *or* of the spread, the commission and the slippage, because a cost can
+        live in any one of them: the shipped Alfa account earns on the spread alone (its commission
+        is 0.00) and is priced all the same.  Only the profile whose three costs are all zero - the
+        documented way to write an *uncosted* run down - reports ``False``, and the report of a run
+        priced by one is stamped (rule 4): an uncosted curve is not a profit.
         """
         return (
             self.broker.spread_pip > 0
-            and self.broker.commission_per_lot_usd > 0
-            and self.broker.slippage_pip > 0
+            or self.broker.commission_per_lot_usd > 0
+            or self.broker.slippage_pip > 0
         )
 
 

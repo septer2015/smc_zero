@@ -1749,9 +1749,22 @@ commission(lot), swap_abs(side, days), spread_abs, slippage_abs.
    остались в SessionConfig и InstrumentSpec соответственно — это свойства
    инструмента/расписания, не брокера. BrokerSpec не дублирует их.
 
-has_costs = spread_pip > 0 and commission_per_lot_usd > 0 and slippage_pip >= 0.
-Нулевой профиль разрешён для юнит-тестов; штамп правила 4 печатается при
-has_costs=False.
+has_costs = spread_pip > 0 or commission_per_lot_usd > 0 or slippage_pip > 0.
+Флаг истинен, пока заряжен хотя бы один из трёх источников издержек, и ложен
+только когда все три равны нулю. Нулевой профиль разрешён для юнит-тестов;
+штамп правила 4 печатается при has_costs=False.
+
+Правка Э11'.2 (было/стало/почему).
+Было: has_costs = spread_pip > 0 and commission_per_lot_usd > 0 and
+slippage_pip >= 0 — конъюнкция, поэтому счёт с нулевой комиссией помечался
+предупреждением, хотя спред 1.4 пипс и слиппедж 0.2 пипс списывались
+(configs/live_eurusd_m15.yaml: commission_per_lot_usd = 0.0).
+Стало: дизъюнкция по трём полям. Почему: спред и слиппедж — такие же
+издержки, как комиссия, и модель «заработок на спреде» их и держит; ложный
+штамп обесценивает единственный сигнал правила 4.
+Подтверждение: прогон EURUSD M15 2022-08-29 … 2026-10-05 на счёте с нулевой
+комиссией дал profit +1528.91 и WARNING до правки; после правки profit тот же,
+штамп исчез.
 
 Миграция: RiskConfig и InstrumentSpec принимают deprecated-ключи через ручной
 __init__ с DeprecationWarning, переносят значения в BrokerSpec. Обратная

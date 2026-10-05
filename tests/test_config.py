@@ -12,8 +12,10 @@ What is pinned here:
 
 * the Alfa numbers of a bare profile and the four helpers that price a trade with them;
 * a *zero* profile: ``BrokerSpec`` accepts zeros, because that is how an uncosted run is written
-  down, and refuses a negative cost; ``RiskConfig.has_costs`` is ``True`` only while all *three* of
-  the charged costs are positive, which is the flag rule 4 stamps a report with;
+  down, and refuses a negative cost; ``RiskConfig.has_costs`` is ``True`` while *any* of the three
+  costs is charged and only the all-zero profile switches it off (Э11'.2: an account that earns on
+  the spread alone charges no commission and is still costed), which is the flag rule 4 stamps a
+  report with;
 * the money of an Э5' call site: the deprecated keywords and the deprecated properties answer the
   same amount as the profile they migrated into;
 * the risk profile the Э9' oracle records - the pinned ``RiskConfig`` of ``5a9e015`` written as a
@@ -25,7 +27,12 @@ The mutations this module is one line away from, and the test each one must brea
   :func:`test_a_zero_cost_is_a_choice_and_a_negative_one_is_refused`;
 * m2 "migrate the flat commission by name" - an Э5' call site starts charging 0.35 *per lot* instead
   of 0.35 *per trade*, which is five times the money; breaks
-  :func:`test_the_legacy_cost_keywords_keep_the_money`.
+  :func:`test_the_legacy_cost_keywords_keep_the_money`;
+* m3 "drop the slippage term" (``or self.broker.slippage_pip > 0``) - a profile charged by the spread
+  and the slippage alone is declared uncosted; breaks
+  :func:`test_has_costs_is_true_while_any_one_source_charges`;
+* m4 "put the ``and`` back" - the false stamp of Э11'.2 returns: an account with a zero commission is
+  reported as an uncosted run; breaks :func:`test_has_costs_is_true_while_any_one_source_charges`.
 """
 
 from __future__ import annotations
@@ -83,7 +90,7 @@ def test_a_bare_profile_charges_the_alfa_numbers() -> None:
 
 
 def test_a_zero_cost_is_a_choice_and_a_negative_one_is_refused() -> None:
-    """Zeros express the uncosted run of Э10'; each of the three switches ``has_costs`` off (m1)."""
+    """Zeros express the uncosted run of Э10'; only all three together switch ``has_costs`` off (m1)."""
     uncosted = RiskConfig(broker=UNCOSTED)
 
     assert uncosted.has_costs is False
@@ -92,15 +99,40 @@ def test_a_zero_cost_is_a_choice_and_a_negative_one_is_refused() -> None:
     assert uncosted.broker.commission(0.1) == 0.0
     assert uncosted.broker.swap_abs("long", 2, 0.1) == 0.0
 
-    # A report is unstamped only while all three are charged: zero in any one of them is enough.
+    # A run is stamped only while *nothing* is charged (Э11'.2): a single zero leaves the other two
+    # sources charging, so the profile is still costed and the report keeps its silence.
     for field in ("spread_pip", "commission_per_lot_usd", "slippage_pip"):
-        assert RiskConfig(broker=replace(BrokerSpec(), **{field: 0.0})).has_costs is False
+        assert RiskConfig(broker=replace(BrokerSpec(), **{field: 0.0})).has_costs is True
         with pytest.raises(ValueError, match="must be >= 0"):
             BrokerSpec(**{field: -1e-6})
 
     # The rest of the profile is still a real account: a zero cost is no licence for a zero pip.
     with pytest.raises(ValueError, match="pip_size"):
         replace(UNCOSTED, pip_size=0.0)
+
+
+def test_has_costs_is_true_while_any_one_source_charges() -> None:
+    """The account that earns on the spread alone is a costed run: a zero commission (m3, m4).
+
+    ``configs/live_eurusd_m15.yaml`` prices its trades with a spread of 1.4 pips and a slippage of
+    0.2 pips per market leg while its commission is 0.00 - the model of a broker that earns on the
+    spread.  Each of the three costs is enough on its own, and the stamp of rule 4 belongs to the
+    profile that charges nothing at all.
+    """
+    spread_and_slippage = RiskConfig(  # the shipped Alfa account: spread + slippage, no commission
+        broker=BrokerSpec(spread_pip=1.4, commission_per_lot_usd=0.0, slippage_pip=0.2)
+    )
+    commission_only = RiskConfig(
+        broker=BrokerSpec(spread_pip=0.0, commission_per_lot_usd=7.0, slippage_pip=0.0)
+    )
+    slippage_only = RiskConfig(
+        broker=BrokerSpec(spread_pip=0.0, commission_per_lot_usd=0.0, slippage_pip=0.2)
+    )
+
+    for profile in (spread_and_slippage, commission_only, slippage_only):
+        assert profile.has_costs is True
+
+    assert RiskConfig(broker=UNCOSTED).has_costs is False
 
 
 def test_the_legacy_cost_keywords_keep_the_money() -> None:

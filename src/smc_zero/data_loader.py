@@ -19,10 +19,22 @@ Findings that drive this module:
 * pandas 3 infers coarse resolutions from strings (``datetime64[us, UTC]``), so
   every ``timestamp``/``close_time`` leaving this module is explicitly forced to
   ``datetime64[ns, UTC]`` - one time dtype for the whole pipeline.
+
+The second supported on-disk layout is the raw MetaTrader 5 "Bars" export
+(Э11'.1)::
+
+    symbol,timeframe,time,open,high,low,close,tick_volume,spread,real_volume
+
+:func:`detect_format` tells the two apart by their columns, :func:`load_ohlcv`
+is the single entry point over both and :func:`merge_ohlcv` extends a tape with
+a second source.  The project layout keeps the older :func:`load_csv` contract
+untouched, MT5 stamps are read with an explicit format list because D1 is a bare
+date and intraday bars are full stamps.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +47,21 @@ TIMESTAMP_COLUMN = "timestamp"
 CLOSE_TIME_COLUMN = "close_time"
 IS_CLOSED_COLUMN = "is_closed"
 SOURCE_TIME_COLUMN = "datetime"
+
+#: The two on-disk layouts and the value that lets the columns decide (Э11'.1).
+PROJECT_FORMAT = "project"
+MT5_FORMAT = "mt5"
+AUTO_FORMAT = "auto"
+SUPPORTED_FORMATS: tuple[str, ...] = (AUTO_FORMAT, PROJECT_FORMAT, MT5_FORMAT)
+
+#: MetaTrader 5 "Bars" export: the columns that mark it and the raw OHLCV pair.
+MT5_TIME_COLUMN = "time"
+MT5_VOLUME_COLUMN = "tick_volume"
+MT5_REQUIRED_COLUMNS: frozenset[str] = frozenset(
+    {"symbol", "timeframe", MT5_TIME_COLUMN, MT5_VOLUME_COLUMN}
+)
+#: MT5 writes D1 as a bare date and every intraday bar as a full stamp.
+MT5_TIME_FORMATS: tuple[str, ...] = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
 
 # Bar length for every supported timeframe label.
 TIMEFRAME_PERIODS: dict[str, pd.Timedelta] = {
@@ -165,6 +192,108 @@ def validate_ohlcv(
     return frame
 
 
+def detect_format(columns: Iterable[str], *, source: str = "<frame>") -> str:
+    """Tell the on-disk layout of ``columns``: ``"mt5"`` or ``"project"``.
+
+    The MT5 marker wins when it is present, so a file carrying both the
+    ``symbol,timeframe,time,tick_volume`` block and a ``datetime`` column is read
+    as MT5.  A frame matching neither layout is refused with the file name: a
+    guess here would silently mis-map prices onto the wrong column (rule 1).
+    """
+    names = {str(column) for column in columns}
+    if MT5_REQUIRED_COLUMNS <= names:
+        return MT5_FORMAT
+    if {SOURCE_TIME_COLUMN, *OHLCV_COLUMNS} <= names:
+        return PROJECT_FORMAT
+    mt5 = ", ".join(sorted(MT5_REQUIRED_COLUMNS))
+    project = f"{SOURCE_TIME_COLUMN},{','.join(OHLCV_COLUMNS)}"
+    raise ValueError(
+        f"{source}: cannot tell the layout; expected MT5 ({mt5}) or project ({project})"
+    )
+
+
+def _parse_mt5_time(values: pd.Series, *, source: str) -> pd.Series:
+    """Read the MT5 ``time`` column; the two layouts MT5 writes are the contract.
+
+    M15/H1 carry a full ``YYYY-MM-DD HH:MM:SS`` stamp and D1 a bare date, so the
+    parse is an explicit list of patterns and not ``errors="coerce"``: a value
+    matching neither is an export this loader does not know and it is refused,
+    never turned into a silent ``NaT`` (rule 1).
+    """
+    for pattern in MT5_TIME_FORMATS:
+        try:
+            return pd.to_datetime(values, format=pattern)
+        except (TypeError, ValueError):
+            continue
+    formats = ", ".join(MT5_TIME_FORMATS)
+    raise ValueError(f"{source}: time column matches none of {formats}")
+
+
+def _normalise_mt5(frame: pd.DataFrame, *, source: str) -> pd.DataFrame:
+    """Shed an MT5 export down to the project's raw schema.
+
+    ``time`` becomes the source time column and ``tick_volume`` becomes
+    ``volume``; ``symbol``, ``timeframe``, ``spread`` and ``real_volume`` carry
+    nothing the pipeline reads and are dropped.  The result is the
+    ``datetime,open,high,low,close,volume`` shape :func:`_normalise` already
+    knows, so both layouts share one downstream path.
+    """
+    data = frame.copy()
+    data[SOURCE_TIME_COLUMN] = _parse_mt5_time(data[MT5_TIME_COLUMN], source=source)
+    data["volume"] = pd.to_numeric(data[MT5_VOLUME_COLUMN], errors="raise")
+    return data[[SOURCE_TIME_COLUMN, *OHLCV_COLUMNS]]
+
+
+def load_ohlcv(
+    path: str | Path,
+    *,
+    format: str = AUTO_FORMAT,
+    drop_unclosed: bool = True,
+    dedup: bool | None = None,
+) -> pd.DataFrame:
+    """Load a CSV of either supported layout into the canonical project schema.
+
+    ``format`` is ``"auto"`` (default), ``"project"`` or ``"mt5"``.  The explicit
+    value overrides the columns; ``"auto"`` reads them through
+    :func:`detect_format`.
+
+    The MT5 layout is normalised first (:func:`_normalise_mt5`) and its duplicate
+    timestamps are dropped by default - a repeated broker export often re-covers a
+    range it was asked for again.  The project layout keeps the older contract of
+    :func:`load_csv`, where a duplicate timestamp stays a ``ValueError``.  Pass
+    ``dedup`` explicitly to override either default.
+
+    Returns a DataFrame with UTC-aware ``timestamp``, ``open``/``high``/``low``/
+    ``close`` (float64), ``volume`` (int64) and ``is_closed`` (bool), sorted by
+    ``timestamp``.  A missing file is a :class:`FileNotFoundError` naming the file
+    and the folder it was looked for in.
+    """
+    file = Path(path)
+    if not file.is_file():
+        raise FileNotFoundError(f"no data file at {file}: expected {file.name} under {file.parent}")
+    if format not in SUPPORTED_FORMATS:
+        supported = ", ".join(SUPPORTED_FORMATS)
+        raise ValueError(f"unsupported format {format!r}; expected one of {supported}")
+
+    frame = pd.read_csv(file)
+    layout = detect_format(frame.columns, source=str(file)) if format == AUTO_FORMAT else format
+    if layout == MT5_FORMAT:
+        frame = _normalise_mt5(frame, source=str(file))
+        layout_dedup = True
+    else:
+        layout_dedup = False
+
+    frame = _normalise(frame, source=str(file))
+    frame = frame.sort_values(TIMESTAMP_COLUMN, kind="stable").reset_index(drop=True)
+    if layout_dedup if dedup is None else dedup:
+        frame = frame.drop_duplicates(subset=[TIMESTAMP_COLUMN], keep="last").reset_index(drop=True)
+    frame = validate_ohlcv(frame, source=str(file))
+    frame = mark_closed(frame)
+    if drop_unclosed:
+        frame = _drop_unclosed_bars(frame)
+    return frame
+
+
 def load_csv(path: str | Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
     """Load a single timeframe CSV into the canonical project schema.
 
@@ -180,15 +309,50 @@ def load_csv(path: str | Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
     DataFrame with UTC-aware ``timestamp``, ``open``/``high``/``low``/``close``
     (float64), ``volume`` (int64) and ``is_closed`` (bool), sorted by
     ``timestamp``.
+
+    This is a thin wrapper over :func:`load_ohlcv` with ``format="project"``: the
+    schema, the type coercion, the unclosed-tail rule and the duplicate-timestamp
+    ``ValueError`` are exactly the ones the loader has always had, so every
+    existing caller keeps its behaviour (Э11'.1).
     """
-    frame = pd.read_csv(path)
-    frame = _normalise(frame, source=str(path))
-    frame = frame.sort_values(TIMESTAMP_COLUMN, kind="stable").reset_index(drop=True)
-    frame = validate_ohlcv(frame, source=str(path))
-    frame = mark_closed(frame)
-    if drop_unclosed:
-        frame = _drop_unclosed_bars(frame)
-    return frame
+    return load_ohlcv(path, format=PROJECT_FORMAT, drop_unclosed=drop_unclosed)
+
+
+def merge_ohlcv(tapes: Iterable[pd.DataFrame], *, source: str = "<merge>") -> pd.DataFrame:
+    """Concatenate canonical tapes into one, dropping duplicate timestamps.
+
+    Every frame has to be the output of :func:`load_ohlcv` (or :func:`load_csv`):
+    a UTC-aware ``timestamp`` plus the OHLCV columns.  The frames are joined in
+    the given order, sorted by ``timestamp`` and de-duplicated with
+    ``keep="last"`` - the later source wins a shared bar, so
+    ``merge_ohlcv([project, fresh])`` lets the fresh export overwrite the old
+    one.  The ``is_closed`` flag travels with its own row.
+
+    This is the extension path of Э11'.1: four years of project data plus a
+    longer MT5 export become one tape without a single manual conversion.
+    """
+    frames = list(tapes)
+    if not frames:
+        raise ValueError(f"{source}: nothing to merge")
+    wanted = [TIMESTAMP_COLUMN, *OHLCV_COLUMNS]
+    parts = []
+    for frame in frames:
+        missing = [column for column in wanted if column not in frame.columns]
+        if missing:
+            raise ValueError(f"{source}: a tape is missing {missing}")
+        part = frame[wanted].copy()
+        part[TIMESTAMP_COLUMN] = _to_utc(part[TIMESTAMP_COLUMN])
+        if IS_CLOSED_COLUMN in frame.columns:
+            part[IS_CLOSED_COLUMN] = frame[IS_CLOSED_COLUMN].astype(bool)
+        else:
+            part[IS_CLOSED_COLUMN] = True
+        parts.append(part)
+    merged = pd.concat(parts, ignore_index=True)
+    merged = merged.sort_values(TIMESTAMP_COLUMN, kind="stable")
+    merged = merged.drop_duplicates(subset=[TIMESTAMP_COLUMN], keep="last").reset_index(drop=True)
+    merged = validate_ohlcv(merged, source=source)
+    merged[TIMESTAMP_COLUMN] = merged[TIMESTAMP_COLUMN].astype("datetime64[ns, UTC]")
+    return merged
 
 
 def attach_close_time(df: pd.DataFrame, period: pd.Timedelta | str) -> pd.DataFrame:

@@ -28,6 +28,7 @@ neither of them names.
 from __future__ import annotations
 
 import argparse
+import os
 from collections.abc import Mapping
 from dataclasses import fields, replace
 from pathlib import Path
@@ -44,13 +45,21 @@ from smc_zero.config import (
     RiskConfig,
     StrategyConfig,
 )
-from smc_zero.data_loader import TIMESTAMP_COLUMN, load_csv
+from smc_zero.data_loader import AUTO_FORMAT, TIMESTAMP_COLUMN, load_csv, load_ohlcv
 from smc_zero.optimizer.ranges import ParamValue, apply_params
 
 #: Where the loader's CSVs live, relative to the working directory (rule 6: ``./`` paths).
 DATA_DIR = Path("./data")
 #: The default report root - the folder of the Э5' export, beside the data and never inside it.
 REPORTS_DIR = Path("./reports")
+#: The two bases a tape may live in (Э11'.1): the project's own ``./data`` and a raw MT5 export.
+PROJECT_SOURCE = "project"
+MT5_SOURCE = "mt5"
+DATA_SOURCES: tuple[str, ...] = (PROJECT_SOURCE, MT5_SOURCE)
+#: Environment variable that overrides the MT5 export folder.
+SMC_DATA_DIR_ENV = "SMC_DATA_DIR"
+#: Default base of a MetaTrader 5 "Bars" export (D1 is a bare date, intraday bars full stamps).
+DEFAULT_MT5_DATA_DIR = Path.home() / "_data" / "mt5"
 #: The window of the shipped four-year tape (SPEC_SMC.md §7.10 п.62).
 DEFAULT_START = "2022-08-15"
 DEFAULT_END = "2026-09-22"
@@ -67,9 +76,30 @@ CONFIG_KEYS: tuple[str, ...] = ("symbol", "strategy", "broker", "backtest")
 RUN_KEYS: tuple[str, ...] = ("initial_capital", "lot")
 
 
-def tape_path(symbol: str, timeframe: str) -> Path:
-    """Return the tape of one symbol: ``./data/<SYMBOL>_<TIMEFRAME>.csv``."""
-    return DATA_DIR / f"{symbol.upper()}_{timeframe.upper()}.csv"
+def mt5_data_dir() -> Path:
+    """Return the MT5 base folder: ``SMC_DATA_DIR`` when set, else ``~/_data/mt5``.
+
+    Read on every call and never cached, so a test or a script can retarget the source through
+    ``os.environ`` without a re-import (Э11'.1).
+    """
+    override = os.environ.get(SMC_DATA_DIR_ENV)
+    return Path(override) if override else DEFAULT_MT5_DATA_DIR
+
+
+def data_base(source: str) -> Path:
+    """Return the base folder of ``source``: ``./data`` or the MT5 export folder."""
+    if source == PROJECT_SOURCE:
+        return DATA_DIR
+    if source == MT5_SOURCE:
+        return mt5_data_dir()
+    supported = ", ".join(DATA_SOURCES)
+    raise ValueError(f"unknown data source {source!r}; expected one of {supported}")
+
+
+def tape_path(symbol: str, timeframe: str, *, source: str = PROJECT_SOURCE) -> Path:
+    """Return the tape of one symbol: ``<base>/<SYMBOL>_<TIMEFRAME>.csv`` (Э11'.1)."""
+    base = data_base(source)
+    return base / f"{symbol.upper()}_{timeframe.upper()}.csv"
 
 
 def read_day(value: str) -> pd.Timestamp:
@@ -93,21 +123,32 @@ def slice_window(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd
 
 
 def load_windowed_tape(
-    symbol: str, timeframe: str, start: pd.Timestamp, end: pd.Timestamp
+    symbol: str,
+    timeframe: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    source: str = PROJECT_SOURCE,
 ) -> pd.DataFrame:
-    """Load ``./data/<SYMBOL>_<TF>.csv`` and cut the requested window out of it.
+    """Load ``<base>/<SYMBOL>_<TF>.csv`` and cut the requested window out of it.
 
-    Raising is the contract: :class:`FileNotFoundError` when the tape is absent and
-    :class:`ValueError` when no bar of it lies in the window, so a runner reports one line on
-    stderr and returns a code instead of simulating an empty tape (which would report a flat curve
-    as if it were a result).
+    ``source`` picks the base of the tape (Э11'.1): ``"project"`` reads ``./data`` through
+    :func:`~smc_zero.data_loader.load_csv`, ``"mt5"`` reads a raw MetaTrader 5 export through
+    :func:`~smc_zero.data_loader.load_ohlcv` (the layout is detected from the columns).  Raising is
+    the contract: :class:`FileNotFoundError` when the tape is absent and :class:`ValueError` when no
+    bar of it lies in the window, so a runner reports one line on stderr and returns a code instead
+    of simulating an empty tape (which would report a flat curve as if it were a result).
     """
-    path = tape_path(symbol, timeframe)
+    path = tape_path(symbol, timeframe, source=source)
     if not path.is_file():
-        raise FileNotFoundError(
-            f"no tape at {path}: run from the repository root, or fetch the CSV into ./data"
+        hint = (
+            f"run from the repository root, or fetch the CSV into {path.parent}"
+            if source == PROJECT_SOURCE
+            else f"point {SMC_DATA_DIR_ENV} at the export folder (now {path.parent})"
         )
-    window = slice_window(load_csv(path), start, end)
+        raise FileNotFoundError(f"no tape at {path}: {hint}")
+    tape = load_csv(path) if source == PROJECT_SOURCE else load_ohlcv(path, format=AUTO_FORMAT)
+    window = slice_window(tape, start, end)
     if window.empty:
         raise ValueError(f"no bar of {path} is opened in {start:%Y-%m-%d} .. {end:%Y-%m-%d}")
     return window
@@ -320,3 +361,18 @@ def add_window_arguments(parser: argparse.ArgumentParser) -> None:
         help="last day of the window, YYYY-MM-DD (included)",
     )
     parser.add_argument("--report-dir", default=str(REPORTS_DIR), help="report root, ./reports")
+
+
+def add_data_source_argument(parser: argparse.ArgumentParser) -> None:
+    """Add ``--data-source``: the base a run reads its tape from (Э11'.1).
+
+    ``project`` is the ``./data`` folder the layer shipped with; ``mt5`` is a raw MetaTrader 5
+    export under ``SMC_DATA_DIR`` (``~/_data/mt5`` by default).  The default keeps every existing
+    command line working unchanged.
+    """
+    parser.add_argument(
+        "--data-source",
+        choices=DATA_SOURCES,
+        default=PROJECT_SOURCE,
+        help="tape base: 'project' = ./data (default), 'mt5' = the export under SMC_DATA_DIR",
+    )

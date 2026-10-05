@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _common.add_window_arguments(parser)
     _common.add_config_argument(parser)
+    _common.add_data_source_argument(parser)
     parser.add_argument("--n-trials", type=int, default=100, help="parameter sets to evaluate")
     parser.add_argument("--jobs", type=int, default=1, help="parallel trials of the study")
     parser.add_argument("--seed", type=int, default=42, help="seed of the TPE sampler")
@@ -235,7 +236,9 @@ def run(args: argparse.Namespace) -> int:
     """Search the parameters of ``args``, run the winner over the window and write its report."""
     try:
         symbol, timeframe, strategy, backtest = _common.live_inputs(args)
-        tape = _common.load_windowed_tape(symbol, timeframe, args.start, args.end)
+        tape = _common.load_windowed_tape(
+            symbol, timeframe, args.start, args.end, source=args.data_source
+        )
         instrument = _common.instrument_for(symbol)
         walk_config = _walk_forward_config(args)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)

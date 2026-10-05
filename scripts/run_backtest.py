@@ -45,6 +45,10 @@ The four blocks of that file (``symbol`` / ``strategy`` / ``broker`` / ``backtes
 :func:`scripts._common.live_inputs`, and an argument typed on the command line still wins over the
 file.  The bias frame is asked for the agreement mode of the run and not for the default one:
 the config may have moved that knob.
+
+``--data-source`` picks the base of the tape (Э11'.1): ``project`` reads ``./data`` as before, while
+``mt5`` reads a raw MetaTrader 5 export under ``SMC_DATA_DIR`` (``~/_data/mt5`` by default), so a
+fresh broker export feeds the same chain without a manual conversion.
 """
 
 from __future__ import annotations
@@ -69,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _common.add_window_arguments(parser)
     _common.add_config_argument(parser)
+    _common.add_data_source_argument(parser)
     parser.add_argument(
         "--n-trials",
         type=int,
@@ -88,7 +93,9 @@ def run(args: argparse.Namespace) -> int:
     """Simulate the window of ``args`` with its config and write the report of the run."""
     try:
         symbol, timeframe, strategy, backtest = _common.live_inputs(args)
-        tape = _common.load_windowed_tape(symbol, timeframe, args.start, args.end)
+        tape = _common.load_windowed_tape(
+            symbol, timeframe, args.start, args.end, source=args.data_source
+        )
         instrument = _common.instrument_for(symbol)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

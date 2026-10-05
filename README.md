@@ -171,3 +171,29 @@ Walk-forward — `backtester/walkforward.py`: разбиение одной ле
 не задаёт порог и не пересчитывает метрику (SPEC_SMC.md §7.12).
 
 Данные лежат в `./data/`, отчёты — в `./reports/`.
+
+## Источники данных
+
+Лента приходит из двух баз, их выбирает флаг `--data-source`:
+
+- `project` (по умолчанию) — папка `./data` с раскладкой `datetime,open,high,low,close,volume`;
+- `mt5` — сырой экспорт MetaTrader 5 «Bars»
+  (`symbol,timeframe,time,open,high,low,close,tick_volume,spread,real_volume`).
+
+Имя файла одно в обеих базах: `<SYMBOL>_<TIMEFRAME>.csv`, например `EURUSD_M15.csv`. Базу MT5
+задаёт переменная `SMC_DATA_DIR`, без неё берётся `~/_data/mt5`. Раскладку `load_ohlcv` определяет
+по именам колонок, поэтому переводить выгрузку руками не нужно. D1 в экспорте MT5 — голая дата,
+M15/H1 — полный штамп времени.
+
+Прогон прямо на свежем экспорте брокера:
+
+```bash
+SMC_DATA_DIR=~/_data/mt5 smc-backtest --symbol EURUSD --timeframe M15 \
+  --start 2022-08-15 --end 2026-09-22 --data-source mt5
+```
+
+Повторный штамп времени в свежем экспорте не роняет прогон: побеждает поздняя строка
+(`merge_ohlcv` в `smc_zero.data_loader`). Так четыре года проектной ленты и длинный экспорт
+брокера становятся одной лентой без ручной конвертации.
+
+Подробности — SPEC_SMC.md §7.20.

@@ -65,13 +65,14 @@ smc-backtest --config-path configs/live_eurusd_m15.yaml
 
 ## Ежедневный контроль
 
-Сигналы дня готовит скрипт `scripts/daily_signal_check.sh`. Он запускает бэктест за последние
-4 года до текущей даты (через `nohup`), кладёт отчёт в `./reports/daily_<ГГГГММДД>` и печатает
-сделки, открытые с 22:00 MSK вчерашнего дня:
+Сигналы дня готовит скрипт `scripts/daily_signal_check.sh`. Он читает ленту из выгрузки
+MetaTrader 5 (флаг `--data-source mt5`, база `SMC_DATA_DIR`, по умолчанию `$HOME/_data/mt5`),
+запускает бэктест за последние 4 года до текущей даты (через `nohup`), кладёт отчёт в
+`./reports/daily_<ГГГГММДД>` и печатает сделки, открытые с 22:00 MSK вчерашнего дня:
 
 ```bash
 cd /home/com/work2/python/cfd/project/smc_zero
-./scripts/daily_signal_check.sh
+SMC_DATA_DIR=/home/com/_data/mt5 ./scripts/daily_signal_check.sh
 ```
 
 Повторно напечатать сигналы готового отчёта (без нового бэктеста) можно так:
@@ -81,11 +82,16 @@ SMC_REPORT_FOLDER=./reports/daily_20261002/backtest_EURUSD_M15_2022-10-02_2026-1
   ./scripts/daily_signal_check.sh
 ```
 
-Запуск по расписанию (будни, 22:00 MSK):
+Запуск по расписанию (будни, 22:00 MSK). База экспорта указана в самой строке cron, лог
+складывается в `/tmp/cron_smc.log`:
 
 ```
-0 22 * * 1-5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh
+0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /tmp/cron_smc.log 2>&1
 ```
+
+Перед запуском проверьте, что в папке экспорта лежат свежие `EURUSD_M15.csv` (и `EURUSD_H1.csv`,
+`EURUSD_D1.csv`, если они нужны стратегии). Обновление выгрузки описано в разделе
+«Установка и проверка данных».
 
 Каждое исполнение сигнала записывается в журнал `docs/TRADING_JOURNAL.md`:
 

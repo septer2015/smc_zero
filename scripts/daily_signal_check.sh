@@ -15,14 +15,22 @@
 # The demo face is manual on purpose: the script never talks to a broker and never sends an order.
 # What it prints is executed by hand and written into ``docs/TRADING_JOURNAL.md``.
 #
-# Cron (the executable bit is part of the repository, ``core.fileMode=true``):
+# The tape of the run is the raw MetaTrader 5 export, never the ``./data`` folder of the repository
+# (Э11'.2): the backtest is called with ``--data-source mt5`` and the export base ``SMC_DATA_DIR``,
+# whose default is ``$HOME/_data/mt5`` (``/home/com/_data/mt5`` here - the folder the Python layer
+# falls back to on its own, SPEC_SMC.md §7.20 п.104).  A fresh "Bars" download therefore feeds the
+# check with no conversion in between.
 #
-#   0 22 * * 1-5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh
+# Cron (the executable bit is part of the repository, ``core.fileMode=true``).  The base is written
+# out here as well, so the line keeps its meaning if that default ever moves:
+#
+#   0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /tmp/cron_smc.log 2>&1
 #
 # Overrides - all optional, for a dry run or a test; the defaults are the live ones:
 #
 #   SMC_REPO           repository root (default: the parent folder of this script)
-#   SMC_WORKDIR        folder whose ``./data`` holds the tape (default: ``SMC_REPO``)
+#   SMC_DATA_DIR       base of the MT5 export a run reads (default: ``$HOME/_data/mt5``)
+#   SMC_WORKDIR        folder the backtest is started from (default: ``SMC_REPO``)
 #   SMC_CONFIG         live YAML of the run (default: ``SMC_REPO/configs/live_eurusd_m15.yaml``)
 #   SMC_REPORT_ROOT    report root; the dated folder is made inside it (default: ``SMC_REPO/reports``)
 #   SMC_START/SMC_END  window days, YYYY-MM-DD (default: four years ago .. today, UTC)
@@ -55,6 +63,14 @@ SMC_REPO=${SMC_REPO:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}
 SMC_WORKDIR=$(to_abs "${SMC_WORKDIR:-${SMC_REPO}}")
 SMC_CONFIG=$(to_abs "${SMC_CONFIG:-${SMC_REPO}/configs/live_eurusd_m15.yaml}")
 SMC_REPORT_ROOT=$(to_abs "${SMC_REPORT_ROOT:-${SMC_REPO}/reports}")
+# The tape base of the check (Э11'.2): the MT5 export, never ``./data`` - a fresh "Bars" download
+# feeds the run as it is.  The value of the caller wins (the cron line sets one); the default is
+# ``$HOME/_data/mt5``, the same folder the Python layer falls back to.  It is exported, because the
+# runner is a child process and reads the base from its environment.
+SMC_DATA_DIR=${SMC_DATA_DIR:-${HOME:-/home/com}/_data/mt5}
+export SMC_DATA_DIR
+# The base a run reads: ``mt5`` is the export above - the flag of Э11'.1 (SPEC_SMC.md §7.20 п.104).
+DATA_SOURCE=mt5
 
 TODAY=$(date -u '+%Y%m%d')
 DAY_LABEL=$(date -u '+%Y-%m-%d')
@@ -88,6 +104,7 @@ echo "  workdir  ${SMC_WORKDIR}"
 echo "  config   ${SMC_CONFIG}"
 echo "  window   ${START} .. ${END}"
 echo "  reports  ${SMC_REPORT_ROOT}"
+echo "  source   ${DATA_SOURCE} under ${SMC_DATA_DIR}"
 echo "  since    ${SINCE} UTC (yesterday 22:00 MSK)"
 echo "  journal  docs/TRADING_JOURNAL.md"
 
@@ -105,6 +122,7 @@ else
   # nohup plus a redirect, so the run survives this script and its terminal (rule of long tasks).
   nohup env PYTHONPATH="${SMC_REPO}/src:${SMC_REPO}" "${PY}" -m scripts.run_backtest \
     --config-path "${SMC_CONFIG}" \
+    --data-source "${DATA_SOURCE}" \
     --start "${START}" \
     --end "${END}" \
     --report-dir "${DATED}" \

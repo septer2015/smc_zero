@@ -8,15 +8,19 @@ hand and out of the file it checks (``_hand_built_strategy`` and its two neighbo
 read its expected numbers from the same YAML would only prove that the YAML parses.
 
 The two windows of the end-to-end tests are the shipped ``./data/EURUSD_M15.csv``, because a live
-config is a statement about the real tape.  Measured on 2026-10-01:
+config is a statement about the real tape.  Measured on 2026-10-05 on the shipped account - the
+Alfa-Forex spread account of Э11'.2: 1.4 pips of round-trip spread, 0.2 pips of slippage per market
+leg and no commission:
 
 * five days (``2022-08-15 .. 2022-08-20``, 444 bars) carry **no setup at all** - neither under the
   defaults nor under the winner's numbers - so that window pins the command line (flag accepted,
   exit code 0, both report files written) and the equivalence of the config with the hand-built
   numbers is measured on the longer window below;
 * two weeks (``2022-08-15 .. 2022-08-29``, 996 bars) carry a setup under the winner's numbers only:
-  the defaults finish at ``0 trades / +0.00`` and the winner at ``1 trade / -26.65``, so the two
-  runs are distinguishable and the comparison is not vacuous.
+  the defaults finish at ``0 trades / +0.00`` and the winner at ``1 trade / -25.25``, so the two
+  runs are distinguishable and the comparison is not vacuous.  The single trade pays 1.40 less than
+  it did while the row carried the 7.00 of Э10', and that is the whole of the difference: 0.1 lot
+  over two market legs at 7.00 per lot is 1.40.
 
 The mutations this file is one line away from, and the test each one must break (all four measured
 on 2026-10-01, each red on the test named here and only there):
@@ -103,10 +107,16 @@ def _hand_built_strategy() -> StrategyConfig:
 
 
 def _hand_built_broker() -> BrokerSpec:
-    """Return the account of the winner typed by hand (C6: the numbers of the shipped row)."""
+    """Return the account of the winner typed by hand: the numbers of the shipped row (C6).
+
+    The row of ``configs/live_eurusd_m15.yaml`` is the Alfa-Forex *spread* account of Э11'.2: 1.4
+    pips of round-trip spread, 0.2 pips of slippage per market leg and **no commission** - the model
+    of a broker that earns on the spread and not on the fee.  The trade of the two-week window pays
+    1.40 less than it did while the row carried the 7.00 of Э10'.
+    """
     return BrokerSpec(
         spread_pip=1.4,
-        commission_per_lot_usd=7.0,
+        commission_per_lot_usd=0.0,
         slippage_pip=0.2,
         swap_long_pip=-0.70,
         swap_short_pip=0.0,

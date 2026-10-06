@@ -49,6 +49,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -287,7 +288,10 @@ def test_an_argument_wins_over_the_config() -> None:
     symbol, timeframe, strategy, _ = common.live_inputs(args)
 
     assert (symbol, timeframe) == ("GBPUSD", "M5")
-    assert strategy == _hand_built_strategy(), "the file still fills the numbers it is asked for"
+    # the hierarchy owns the bias frames (§7.20), so the hand-built strategy carries the M5 set
+    hand = _hand_built_strategy()
+    expected = replace(hand, bias=replace(hand.bias, timeframes=("H4", "D1")))
+    assert strategy == expected, "the file still fills the numbers it is asked for"
     assert common.resolve_selector(None, {"symbol": "gbpusd"}, "symbol", "EURUSD") == "GBPUSD"
     assert common.resolve_selector(None, None, "symbol", "EURUSD") == "EURUSD"
     assert common.resolve_selector("eurusd", None, "symbol", "GBPUSD") == "EURUSD"
@@ -308,6 +312,27 @@ def test_the_hierarchy_preset_sets_all_three_timeframes() -> None:
     assert common.HIERARCHY_PRESETS["D1_H1_M15"].structure is None
     assert common.resolve_hierarchy(None, None) == common.DEFAULT_HIERARCHY
     assert common.resolve_hierarchy("h4_m15_m5", None) == "H4_M15_M5"
+
+
+def test_the_hierarchy_preset_sets_the_bias_timeframes() -> None:
+    """Р1 of §7.20: the M5 hierarchy asks H4 + D1 for a direction; the v1 set stays the default."""
+    parser = backtest_face.build_parser()
+
+    _, _, strategy, _ = common.live_inputs(parser.parse_args(["--hierarchy", "H4_M15_M5"]))
+
+    assert strategy.bias.timeframes == ("H4", "D1")
+    # the v1 run keeps exactly the configuration it had
+    assert common.live_inputs(parser.parse_args([]))[2] == StrategyConfig()
+
+
+def test_the_file_keeps_the_bias_knobs_it_may_set() -> None:
+    """The preset owns the set of frames; ``agreement`` and the swing settings stay the file's."""
+    args = backtest_face.build_parser().parse_args(["--config-path", str(LIVE_CONFIG)])
+
+    _, _, strategy, _ = common.live_inputs(args)
+
+    assert strategy.bias.agreement == _hand_built_strategy().bias.agreement
+    assert strategy.bias.timeframes == common.HIERARCHY_PRESETS["D1_H1_M15"].bias
 
 
 def test_a_mismatch_between_timeframe_and_hierarchy_is_refused(tmp_path: Path) -> None:

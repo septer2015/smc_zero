@@ -44,6 +44,7 @@ import pytest
 from smc_zero.config import (
     DEFAULT_HIERARCHY,
     HIERARCHY_PRESETS,
+    BiasConfig,
     BrokerSpec,
     InstrumentSpec,
     RiskConfig,
@@ -234,4 +235,12 @@ def test_the_m5_preset_names_m15_as_structure() -> None:
     assert preset_of(preset.timeframes) is preset
     with pytest.raises(ValueError, match="no hierarchy preset"):
         preset_of(TimeframeConfig(ltf="M5", mtf="H1", htf="D1"))
+
+
+def test_the_m5_preset_names_the_h4_d1_bias() -> None:
+    """Р1 of §7.20: the second hierarchy asks H4 and keeps D1 as the global context."""
+    assert HIERARCHY_PRESETS["H4_M15_M5"].bias == ("H4", "D1")
+    # the v1 hierarchy keeps the C5 set of the project
+    assert HIERARCHY_PRESETS[DEFAULT_HIERARCHY].bias == ("H1", "H4", "D1")
+    assert HIERARCHY_PRESETS[DEFAULT_HIERARCHY].bias == BiasConfig().timeframes
 

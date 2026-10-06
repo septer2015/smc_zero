@@ -110,16 +110,22 @@ class TimeframeConfig:
 #: The frame the structure is read on when the entry frame does not own it.
 @dataclass(frozen=True, slots=True)
 class HierarchyPreset:
-    """One entry hierarchy: its three working timeframes and the frame the structure is read on.
+    """One entry hierarchy: its working timeframes, the structure frame and its bias frames.
 
     ``structure`` is ``None`` while the entry frame owns the structure - the v1 reading, bit for
     bit - and names the working frame (here ``"M15"`` for the M5 entry) when the two are separate:
     :func:`smc_zero.indicators.structure.structure_layer` then joins that frame onto the entry bars
     by ``close_time``.
+
+    ``bias`` is the set of timeframes the direction is asked of
+    (:attr:`smc_zero.config.BiasConfig.timeframes`).  The v1 hierarchy is the C5 set
+    (H1 + H4 + D1); the second one drops H1 and keeps H4 as the working senior frame beside the
+    global D1 - the ruling Р1 of §7.20.
     """
 
     timeframes: TimeframeConfig
     structure: Timeframe | None = None
+    bias: tuple[Timeframe, ...] = ("H1", "H4", "D1")
 
 
 #: The entry hierarchies of the project, keyed by the name a live config names (§7.20): every
@@ -132,7 +138,9 @@ class HierarchyPreset:
 HIERARCHY_PRESETS: dict[str, HierarchyPreset] = {
     "D1_H1_M15": HierarchyPreset(timeframes=TimeframeConfig(ltf="M15", mtf="H1", htf="D1")),
     "H4_M15_M5": HierarchyPreset(
-        timeframes=TimeframeConfig(ltf="M5", mtf="M15", htf="H4"), structure="M15"
+        timeframes=TimeframeConfig(ltf="M5", mtf="M15", htf="H4"),
+        structure="M15",
+        bias=("H4", "D1"),
     ),
 }
 #: The preset a run without a ``hierarchy`` key keeps - the D1 -> H1 -> M15 of Э8'.

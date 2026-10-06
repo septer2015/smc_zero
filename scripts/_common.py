@@ -379,6 +379,12 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
     with the preset's ``ltf`` is refused instead of being run: an M5 tape under the M15 preset, or
     an M15 file under the M5 one, is a config error and not a silent reinterpretation.
 
+    The preset also owns the *bias* frames (R1 of §7.20): the v1 set is H1 + H4 + D1 and the second
+    hierarchy asks H4 + D1.  ``BiasConfig.timeframes`` of the returned strategy is therefore the
+    preset's set - the other bias knobs (``agreement``, the swing settings) still come from the
+    file, and a file cannot name a different set, because a YAML list is not a threshold
+    (:func:`flatten_block`) and the hierarchy, not the file, decides what a direction is asked of.
+
     The effective entry timeframe also scales the run: ``sharpe_bars_per_day`` is set from
     :func:`~smc_zero.data_loader.bars_per_day`, so an M5 run of the second hierarchy reads its 288
     bars a day instead of the 96 of M15.  For the default M15 hierarchy the values are the
@@ -405,17 +411,19 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
             f"'{HIERARCHY_KEY}: H4_M15_M5' (or pass --hierarchy) for an M5 run"
         )
     scale = bars_per_day(timeframe)
+    strategy = StrategyConfig() if cfg is None else strategy_from_config(cfg)
+    strategy = replace(strategy, bias=replace(strategy.bias, timeframes=preset.bias))
     if cfg is None:
         return (
             symbol,
             timeframe,
-            StrategyConfig(),
+            strategy,
             BacktestConfig(timeframes=timeframes, sharpe_bars_per_day=scale),
         )
     backtest = replace(
         backtest_from_config(cfg), timeframes=timeframes, sharpe_bars_per_day=scale
     )
-    return symbol, timeframe, strategy_from_config(cfg), backtest
+    return symbol, timeframe, strategy, backtest
 
 
 def add_config_argument(parser: argparse.ArgumentParser) -> None:

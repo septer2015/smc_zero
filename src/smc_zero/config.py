@@ -90,13 +90,34 @@ class TimeframeConfig:
 
     ``ltf`` is the entry timeframe and defaults to ``"M15"``; the optional
     H4 -> M15 -> M5 hierarchy sets it to ``"M5"`` through the ``hierarchy`` preset of a
-    config (SPEC_SMC.md §7.20).  ``htf`` stays ``"D1"`` for the global bias context; the
-    full bias hierarchy is ``BiasConfig.timeframes`` (H1 + H4 + D1, SPEC_SMC.md C5).
+    config (SPEC_SMC.md §7.20, :data:`HIERARCHY_PRESETS`).  ``htf`` stays ``"D1"`` for the
+    global bias context of a preset; the full bias hierarchy is ``BiasConfig.timeframes``
+    (H1 + H4 + D1, SPEC_SMC.md C5).  The three frames must differ: a hierarchy that names one
+    frame twice is refused instead of silently reading one leg as both.
     """
 
     ltf: Timeframe = "M15"
     mtf: Timeframe = "H1"
     htf: Timeframe = "D1"
+
+    def __post_init__(self) -> None:
+        if len({self.ltf, self.mtf, self.htf}) != 3:
+            raise ValueError(
+                f"the working timeframes must be distinct, got {(self.ltf, self.mtf, self.htf)}"
+            )
+
+
+#: The entry hierarchies of the project, keyed by the name a live config names (§7.20): every
+#: preset carries the three working timeframes of a run - the entry frame, the frame the working
+#: structure is read on and the frame of the global context.  ``D1_H1_M15`` is the v1 hierarchy of
+#: C5; ``H4_M15_M5`` is the second one, whose H4 leg is the working senior frame while D1 stays
+#: the global bias (the ruling Р1 of §7.20).
+HIERARCHY_PRESETS: dict[str, TimeframeConfig] = {
+    "D1_H1_M15": TimeframeConfig(ltf="M15", mtf="H1", htf="D1"),
+    "H4_M15_M5": TimeframeConfig(ltf="M5", mtf="M15", htf="H4"),
+}
+#: The preset a run without a ``hierarchy`` key keeps - the D1 -> H1 -> M15 of Э8'.
+DEFAULT_HIERARCHY = "D1_H1_M15"
 
 
 @dataclass(frozen=True, slots=True)

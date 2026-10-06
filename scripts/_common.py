@@ -39,6 +39,8 @@ import yaml
 
 from smc_zero.config import (
     ALFAFOREX_SPECS,
+    DEFAULT_HIERARCHY,
+    HIERARCHY_PRESETS,
     BacktestConfig,
     BrokerSpec,
     InstrumentSpec,
@@ -81,6 +83,9 @@ CONFIG_KEYS: tuple[str, ...] = ("symbol", "strategy", "broker", "backtest")
 #: The two knobs the ``backtest`` block of a live config may set: the capital of the run and the
 #: lot it trades.  Every other number of a run stays a project default (§7.19).
 RUN_KEYS: tuple[str, ...] = ("initial_capital", "lot")
+#: The optional key of a live config that names the entry hierarchy (SPEC_SMC.md §7.20).  It is not
+#: in :data:`CONFIG_KEYS`: a file without it keeps the D1 -> H1 -> M15 preset of Э8'.
+HIERARCHY_KEY = "hierarchy"
 
 
 def mt5_data_dir() -> Path:
@@ -313,26 +318,73 @@ def resolve_selector(
     return fallback
 
 
+def resolve_hierarchy(argument: str | None, cfg: Mapping[str, Any] | None) -> str:
+    """Return the effective hierarchy preset name: the argument, the config's, else the default.
+
+    The same order as :func:`resolve_selector`: what the caller typed wins over the file, and a run
+    that names neither keeps :data:`~smc_zero.config.DEFAULT_HIERARCHY` (D1 -> H1 -> M15).  A name
+    outside :data:`~smc_zero.config.HIERARCHY_PRESETS` is refused with the list of the known ones,
+    because a typo would otherwise silently select the default preset.
+    """
+    named = argument or (None if cfg is None else cfg.get(HIERARCHY_KEY)) or DEFAULT_HIERARCHY
+    name = str(named).upper()
+    if name not in HIERARCHY_PRESETS:
+        known = ", ".join(sorted(HIERARCHY_PRESETS))
+        raise ValueError(f"hierarchy: no such preset {name!r}: expected one of {known}")
+    return name
+
+
 def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, BacktestConfig]:
     """Return the symbol, the timeframe and the two configs of a run: the file first, the arguments.
 
-    ``args`` carries ``--config-path`` (optional), ``--symbol`` and ``--timeframe`` (``None`` when
-    the caller typed none of them).  Without a config the result is the project defaults of Э8';
-    with one, the three blocks of §7.19 fill the two dataclasses and a typed argument still wins.
-    Both faces call this one function, so a rule about the file cannot hold in one of them only.
+    ``args`` carries ``--config-path`` (optional), ``--symbol``, ``--timeframe`` and
+    ``--hierarchy`` (``None`` when the caller typed none of them).  Without a config the result is
+    the project defaults of Э8'; with one, the three blocks of §7.19 fill the two dataclasses and a
+    typed argument still wins.  Both faces call this one function, so a rule about the file cannot
+    hold in one of them only.
+
+    The hierarchy and the entry timeframe are one decision, not two (§7.20).  The preset is
+    resolved first (:func:`resolve_hierarchy`) and ``timeframes`` of the returned
+    :class:`~smc_zero.config.BacktestConfig` is exactly it - the engine dates the tape with
+    ``timeframes.ltf``, so a mismatch would silently re-price every bar.  The entry timeframe is
+    then taken from the caller, the file's key or the preset itself, and a value that disagrees
+    with the preset's ``ltf`` is refused instead of being run: an M5 tape under the M15 preset, or
+    an M15 file under the M5 one, is a config error and not a silent reinterpretation.
 
     The effective entry timeframe also scales the run: ``sharpe_bars_per_day`` is set from
     :func:`~smc_zero.data_loader.bars_per_day`, so an M5 run of the second hierarchy reads its 288
-    bars a day instead of the 96 of M15.  For the default M15 hierarchy the value is the dataclass
-    default and the returned config is unchanged.
+    bars a day instead of the 96 of M15.  For the default M15 hierarchy the values are the
+    dataclass defaults and the returned config is unchanged.
     """
     cfg = load_config(args.config_path) if args.config_path else None
+    preset_name = resolve_hierarchy(getattr(args, "hierarchy", None), cfg)
+    preset = HIERARCHY_PRESETS[preset_name]
     symbol = resolve_selector(args.symbol, cfg, "symbol", DEFAULT_SYMBOL)
-    timeframe = resolve_selector(args.timeframe, cfg, "timeframe", DEFAULT_TIMEFRAME)
+    timeframe = resolve_selector(args.timeframe, cfg, "timeframe", preset.ltf)
+    if timeframe != preset.ltf:
+        named = getattr(args, "hierarchy", None) or (
+            None if cfg is None else cfg.get(HIERARCHY_KEY)
+        )
+        if named:
+            raise ValueError(
+                f"hierarchy {preset_name!r} requires timeframe {preset.ltf!r}, got {timeframe!r}"
+            )
+        raise ValueError(
+            f"timeframe {timeframe!r} needs an explicit hierarchy: the default is "
+            f"{DEFAULT_HIERARCHY!r} ({preset.ltf} entries), so name e.g. "
+            f"'{HIERARCHY_KEY}: H4_M15_M5' (or pass --hierarchy) for an M5 run"
+        )
     scale = bars_per_day(timeframe)
     if cfg is None:
-        return symbol, timeframe, StrategyConfig(), BacktestConfig(sharpe_bars_per_day=scale)
-    backtest = replace(backtest_from_config(cfg), sharpe_bars_per_day=scale)
+        return (
+            symbol,
+            timeframe,
+            StrategyConfig(),
+            BacktestConfig(timeframes=preset, sharpe_bars_per_day=scale),
+        )
+    backtest = replace(
+        backtest_from_config(cfg), timeframes=preset, sharpe_bars_per_day=scale
+    )
     return symbol, timeframe, strategy_from_config(cfg), backtest
 
 
@@ -361,6 +413,14 @@ def add_window_arguments(parser: argparse.ArgumentParser) -> None:
         "--timeframe",
         default=None,
         help="entry timeframe of the tape, M15 for v1 (default: the config's, else M15)",
+    )
+    parser.add_argument(
+        "--hierarchy",
+        default=None,
+        help=(
+            "entry hierarchy preset, e.g. H4_M15_M5 (default: the config's, else D1_H1_M15); "
+            "it fixes the entry timeframe, so a --timeframe that disagrees is refused"
+        ),
     )
     parser.add_argument(
         "--start",

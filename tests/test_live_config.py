@@ -67,6 +67,7 @@ from smc_zero.config import (
     DisplacementConfig,
     RiskConfig,
     StrategyConfig,
+    TimeframeConfig,
     TPConfig,
 )
 from smc_zero.optimizer import build_tape_marks
@@ -257,7 +258,7 @@ def test_the_entry_timeframe_scales_the_sharpe_of_the_run() -> None:
     """
     parser = backtest_face.build_parser()
 
-    _, timeframe, _, backtest = common.live_inputs(parser.parse_args(["--timeframe", "M5"]))
+    _, timeframe, _, backtest = common.live_inputs(parser.parse_args(["--hierarchy", "H4_M15_M5"]))
 
     assert timeframe == "M5"
     assert backtest.sharpe_bars_per_day == 288
@@ -265,18 +266,74 @@ def test_the_entry_timeframe_scales_the_sharpe_of_the_run() -> None:
 
 
 def test_an_argument_wins_over_the_config() -> None:
-    """The order of §7.19: what the caller typed, then the file, then the default of Э8'."""
+    """The order of §7.19: what the caller typed, then the file, then the default of Э8'.
+
+    The entry timeframe is not free any more: it belongs to the hierarchy (§7.20), so the argument
+    that wins here is the pair of them - a typed ``--hierarchy`` with the ``--timeframe`` it names.
+    """
     args = backtest_face.build_parser().parse_args(
-        ["--config-path", str(LIVE_CONFIG), "--symbol", "GBPUSD", "--timeframe", "H1"]
+        [
+            "--config-path",
+            str(LIVE_CONFIG),
+            "--symbol",
+            "GBPUSD",
+            "--hierarchy",
+            "H4_M15_M5",
+            "--timeframe",
+            "M5",
+        ]
     )
 
     symbol, timeframe, strategy, _ = common.live_inputs(args)
 
-    assert (symbol, timeframe) == ("GBPUSD", "H1")
+    assert (symbol, timeframe) == ("GBPUSD", "M5")
     assert strategy == _hand_built_strategy(), "the file still fills the numbers it is asked for"
     assert common.resolve_selector(None, {"symbol": "gbpusd"}, "symbol", "EURUSD") == "GBPUSD"
     assert common.resolve_selector(None, None, "symbol", "EURUSD") == "EURUSD"
     assert common.resolve_selector("eurusd", None, "symbol", "GBPUSD") == "EURUSD"
+
+
+def test_the_hierarchy_preset_sets_all_three_timeframes() -> None:
+    """The M5 preset of §7.20 is one decision: entry M5, working structure M15, context H4."""
+    args = backtest_face.build_parser().parse_args(["--hierarchy", "H4_M15_M5"])
+
+    _, timeframe, _, backtest = common.live_inputs(args)
+
+    # the preset names the entry frame itself - no ``--timeframe`` was typed or needed
+    assert timeframe == "M5"
+    assert backtest.timeframes == TimeframeConfig(ltf="M5", mtf="M15", htf="H4")
+    assert backtest.sharpe_bars_per_day == 288
+    # the v1 preset is the default and stays untouched bit for bit
+    assert common.HIERARCHY_PRESETS["D1_H1_M15"] == TimeframeConfig()
+    assert common.resolve_hierarchy(None, None) == common.DEFAULT_HIERARCHY
+    assert common.resolve_hierarchy("h4_m15_m5", None) == "H4_M15_M5"
+
+
+def test_a_mismatch_between_timeframe_and_hierarchy_is_refused(tmp_path: Path) -> None:
+    """A file that names the M5 hierarchy and an M15 entry is a config error, not a silent run."""
+    cfg = common.load_config(LIVE_CONFIG)
+    cfg[common.HIERARCHY_KEY] = "H4_M15_M5"
+    path = tmp_path / "m5_hierarchy_m15_entry.yaml"
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires timeframe 'M5'"):
+        common.live_inputs(backtest_face.build_parser().parse_args(["--config-path", str(path)]))
+
+
+def test_m5_without_a_hierarchy_is_refused() -> None:
+    """An M5 tape under the default M15 preset would re-price every bar: it is refused."""
+    args = backtest_face.build_parser().parse_args(["--timeframe", "M5"])
+
+    with pytest.raises(ValueError, match="needs an explicit hierarchy"):
+        common.live_inputs(args)
+
+
+def test_a_hierarchy_preset_that_does_not_exist_is_refused() -> None:
+    """A typo in the preset name may not fall back to the default hierarchy (rule 5)."""
+    args = backtest_face.build_parser().parse_args(["--hierarchy", "M1_M5_M15"])
+
+    with pytest.raises(ValueError, match="no such preset"):
+        common.live_inputs(args)
 
 
 def test_the_pair_of_the_config_is_used_when_the_caller_types_none(tmp_path: Path) -> None:
@@ -285,19 +342,21 @@ def test_the_pair_of_the_config_is_used_when_the_caller_types_none(tmp_path: Pat
     The check is written on a config of *another* pair on purpose.  A default of Э8' left in the
     parser would be indistinguishable from a typed argument whenever the file happens to name the
     same pair - which is exactly the case the shipped config is in, so this test names another one
-    and the mutation "default the symbol again" has to go red here.
+    and the mutation "default the symbol again" has to go red here.  The pair has to be a whole
+    hierarchy as well (§7.20), hence the preset key beside the two values it stands for.
     """
     cfg = common.load_config(LIVE_CONFIG)
     cfg["symbol"] = "GBPUSD"
-    cfg["timeframe"] = "H1"
-    path = tmp_path / "gbpusd_h1.yaml"
+    cfg["timeframe"] = "M5"
+    cfg[common.HIERARCHY_KEY] = "H4_M15_M5"
+    path = tmp_path / "gbpusd_m5.yaml"
     path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
     args = backtest_face.build_parser().parse_args(["--config-path", str(path)])
     symbol, timeframe, _, _ = common.live_inputs(args)
 
     assert args.symbol is None and args.timeframe is None
-    assert (symbol, timeframe) == ("GBPUSD", "H1")
+    assert (symbol, timeframe) == ("GBPUSD", "M5")
 
 
 def test_a_missing_file_is_refused_as_the_missing_file_it_is() -> None:

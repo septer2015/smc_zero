@@ -41,7 +41,14 @@ from dataclasses import replace
 
 import pytest
 
-from smc_zero.config import BrokerSpec, InstrumentSpec, RiskConfig
+from smc_zero.config import (
+    DEFAULT_HIERARCHY,
+    HIERARCHY_PRESETS,
+    BrokerSpec,
+    InstrumentSpec,
+    RiskConfig,
+    TimeframeConfig,
+)
 
 #: ``dataclasses.asdict`` of the pinned ``RiskConfig`` of ``5a9e015``: the profile the recorder of the
 #: Э9' oracle writes beside the arguments, with the six cost fields the pin kept in the risk profile.
@@ -200,3 +207,13 @@ def test_the_risk_profile_of_the_pinned_oracle_still_builds() -> None:
     assert pinned.broker.spread_abs == 0.0
     assert pinned.broker.slippage_abs == 0.0
     assert pinned.broker.commission(0.1) == 0.0
+
+
+def test_a_hierarchy_preset_names_three_distinct_timeframes() -> None:
+    """§7.20: the two presets are the two entry hierarchies, and one frame named twice is refused."""
+    assert HIERARCHY_PRESETS["D1_H1_M15"] == TimeframeConfig()
+    assert DEFAULT_HIERARCHY == "D1_H1_M15"
+    assert HIERARCHY_PRESETS["H4_M15_M5"] == TimeframeConfig(ltf="M5", mtf="M15", htf="H4")
+    with pytest.raises(ValueError, match="distinct"):
+        TimeframeConfig(ltf="M5", mtf="M5", htf="H4")
+

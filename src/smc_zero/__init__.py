@@ -16,6 +16,7 @@ from smc_zero.config import (
     RiskConfig,
     SessionConfig,
     StructureConfig,
+    StructureLayerConfig,
     TimeframeConfig,
     WalkForwardConfig,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "RiskConfig",
     "SessionConfig",
     "StructureConfig",
+    "StructureLayerConfig",
     "TimeframeConfig",
     "WalkForwardConfig",
     "__version__",

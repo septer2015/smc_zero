@@ -31,8 +31,22 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from smc_zero.config import BreakEvent, StructureConfig
+from smc_zero.config import (
+    BreakEvent,
+    StructureConfig,
+    StructureLayerConfig,
+    Timeframe,
+)
+from smc_zero.data_loader import (
+    CLOSE_TIME_COLUMN,
+    TIMESTAMP_COLUMN,
+    align_htf_to_ltf,
+    attach_close_time,
+    drop_unclosed,
+    period_for,
+)
 from smc_zero.indicators._markup import known_at
+from smc_zero.indicators.impulse import displacement_gate
 
 
 def _fractal_mask(values: np.ndarray, lookback: int, *, higher: bool) -> np.ndarray:
@@ -177,4 +191,165 @@ def structure_breaks(df: pd.DataFrame, cfg: StructureConfig | None = None) -> pd
         },
         index=df.index,
     )
+
+
+#: The columns the structure layer carries from a working frame onto the entry frame (§7.20).
+STRUCTURE_LAYER_COLUMNS: tuple[str, ...] = ("break_dir", "disp_ok", "disp_known_at")
+#: The suffix those columns wear while the two grids are joined by :func:`align_htf_to_ltf`.
+STRUCTURE_SUFFIX = "_struct"
+
+
+def _stamp_ns(values: pd.Series) -> np.ndarray:
+    """Return a stamp column as UTC-naive ``datetime64[ns]`` - the comparison scale of the join."""
+    stamps = (
+        values.dt.tz_convert("UTC").dt.tz_localize(None)
+        if isinstance(values.dtype, pd.DatetimeTZDtype)
+        else values
+    )
+    return stamps.to_numpy(dtype="datetime64[ns]")
+
+
+def _empty_structure_layer() -> pd.DataFrame:
+    """Return an empty layer frame carrying the three columns and their documented dtypes."""
+    return pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: pd.Series(dtype="datetime64[ns, UTC]"),
+            "break_dir": pd.Series(dtype="int8"),
+            "disp_ok": pd.Series(dtype=bool),
+            "disp_known_at": pd.Series(dtype="Int64"),
+        }
+    )
+
+
+def _entry_frame(ltf: pd.DataFrame, timeframe: Timeframe | None) -> pd.DataFrame:
+    """Return the closed entry bars as a positional frame, checking the named grid when given.
+
+    Rule 2b: the presumed still-forming tail bar is dropped, exactly as the entry chain does.  A
+    ``timeframe`` names the grid the frame has to sit on - a working frame joined onto a foreign
+    grid would mis-date every ``disp_known_at`` - and ``None`` leaves that check to the caller.
+    """
+    if TIMESTAMP_COLUMN not in ltf.columns:
+        raise ValueError("structure_layer expects a 'timestamp' column (loader schema)")
+    missing = [column for column in ("high", "low", "close") if column not in ltf.columns]
+    if missing:
+        raise ValueError(f"structure_layer needs the {missing} column(s) (loader schema)")
+    bars = drop_unclosed(ltf).reset_index(drop=True)
+    if timeframe is None or len(bars) < 2:
+        return bars
+    expected = period_for(timeframe)
+    stamps = bars[TIMESTAMP_COLUMN]
+    if isinstance(stamps.dtype, pd.DatetimeTZDtype):
+        stamps = stamps.dt.tz_convert("UTC")
+    step = stamps.diff().dropna().min()
+    if step != expected:
+        raise ValueError(
+            f"structure_layer expects the {timeframe} entry frame ({expected} bars), "
+            f"got a {step} grid"
+        )
+    return bars
+
+
+def _layer_of_one_frame(frame: pd.DataFrame, cfg: StructureLayerConfig) -> pd.DataFrame:
+    """Return the three layer columns of one frame: the break, the impulse and its known bar.
+
+    The columns are the positional reading of :func:`structure_breaks` and
+    :func:`~smc_zero.indicators.impulse.displacement_gate` - exactly what
+    :func:`smc_zero.strategy.intents.build_intents` computes for itself when it owns the frame.
+    """
+    missing = [column for column in ("high", "low", "close") if column not in frame.columns]
+    if missing:
+        raise ValueError(f"structure_layer needs the {missing} column(s) (loader schema)")
+    breaks = structure_breaks(frame, cfg.structure)
+    impulse = displacement_gate(frame, breaks, cfg.displacement)
+    return pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: frame[TIMESTAMP_COLUMN],
+            "break_dir": breaks["break_dir"].to_numpy(dtype="int8"),
+            "disp_ok": impulse["disp_ok"].to_numpy(dtype=bool),
+            "disp_known_at": impulse["disp_known_at"],
+        },
+        index=frame.index,
+    )
+
+
+def _tidy_layer(joined: pd.DataFrame) -> pd.DataFrame:
+    """Return the joined frame as the layer itself: three columns, documented dtypes, no index."""
+    columns = {f"{column}{STRUCTURE_SUFFIX}": column for column in STRUCTURE_LAYER_COLUMNS}
+    out = joined[[TIMESTAMP_COLUMN, *columns]].rename(columns=columns).copy()
+    # an entry bar preceding the first close of the working frame has no break and no impulse yet
+    out["break_dir"] = out["break_dir"].fillna(0).astype("int8")
+    out["disp_ok"] = out["disp_ok"].fillna(False).astype(bool)
+    out["disp_known_at"] = out["disp_known_at"].astype("Int64")
+    return out.reset_index(drop=True)
+
+
+def structure_layer(
+    ltf: pd.DataFrame,
+    structure: pd.DataFrame | None = None,
+    *,
+    ltf_timeframe: Timeframe | None = None,
+    structure_timeframe: Timeframe | None = None,
+    cfg: StructureLayerConfig | None = None,
+) -> pd.DataFrame:
+    """Stitch the working structure onto the entry bars, visible only once its bar has closed.
+
+    ``ltf`` is the entry frame and ``structure`` the working frame whose swing / BOS / CHoCH markup
+    is read (the M5 tape and the M15 tape of the H4 -> M15 -> M5 hierarchy of §7.20).  The result has
+    the rows of the entry frame and three columns:
+
+    * ``break_dir`` - the sign of the break as it is visible at that entry bar (``0`` before any
+      working bar has closed);
+    * ``disp_ok`` - the impulse verdict of the confirming working bar;
+    * ``disp_known_at`` - the *entry* bar at which that impulse becomes knowable, i.e. the first
+      entry bar opening at or after the close of the bar ``disp_known_at`` of the working frame.
+      ``NA`` when that instant lies beyond the frame, so the gate reads "never visible" instead of a
+      number it could compare - which is what makes a working bar visible only from the entry bar
+      after its close (rule 2).
+
+    ``structure=None`` keeps the v1 reading: the structure is measured on the entry frame itself and
+    the positions of ``disp_known_at`` are its own, bit for bit.  ``structure_timeframe`` is
+    mandatory as soon as a working frame is given - its bar period is what dates the join - and
+    ``ltf_timeframe``, when passed, is checked against the grid of the entry frame.
+    """
+    config = StructureLayerConfig() if cfg is None else cfg
+    bars = _entry_frame(ltf, ltf_timeframe)
+    if structure is None:
+        return _layer_of_one_frame(bars, config)
+    if structure_timeframe is None:
+        raise ValueError(
+            "structure_layer needs structure_timeframe when a working frame is given: "
+            "the bar period of that frame is what dates the visibility of the join"
+        )
+    period = period_for(structure_timeframe)
+    working = drop_unclosed(structure).reset_index(drop=True)
+    if bars.empty or working.empty:
+        return _empty_structure_layer()
+
+    layer = _layer_of_one_frame(working, config)
+    known = layer["disp_known_at"].to_numpy(dtype="float64", na_value=np.nan)
+    visible = np.full(known.shape, np.nan, dtype="float64")
+    finite = np.isfinite(known)
+    if finite.any():
+        closes = attach_close_time(working, period)[CLOSE_TIME_COLUMN]
+        entry_ns = _stamp_ns(bars[TIMESTAMP_COLUMN])
+        found = np.searchsorted(entry_ns, _stamp_ns(closes)[finite], side="left")
+        # an impulse knowable only after the last entry bar of the frame is never visible in it
+        visible[finite] = np.where(found >= entry_ns.size, np.nan, found)
+
+    source = pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: working[TIMESTAMP_COLUMN],
+            "break_dir": layer["break_dir"].to_numpy(dtype="int8"),
+            "disp_ok": layer["disp_ok"].to_numpy(dtype=bool),
+            "disp_known_at": visible,
+        }
+    )
+    joined = align_htf_to_ltf(
+        bars,
+        source,
+        htf_period=period,
+        extra_columns=STRUCTURE_LAYER_COLUMNS,
+        suffixes=("", STRUCTURE_SUFFIX),
+    )
+    return _tidy_layer(joined)
 

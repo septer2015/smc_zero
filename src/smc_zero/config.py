@@ -285,6 +285,26 @@ class DisplacementConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StructureLayerConfig:
+    """The structure layer of a working timeframe (SPEC_SMC.md §7.20).
+
+    The default hierarchy works on one frame: the working structure and the entry share the M15
+    tape, so the chain reads the swing settings from ``BiasConfig.structure`` and the impulse gate
+    from ``StrategyConfig.displacement``.  The second hierarchy separates them - the structure is
+    read on the *working* frame (M15) and has to reach the *entry* frame (M5) only once its bar has
+    closed - and this class is where that frame's two parameter sets live, so a run cannot
+    accidentally measure the structure with the entry frame's settings.
+
+    ``structure`` is the swing / BOS / CHoCH configuration of the working frame and
+    ``displacement`` the impulse gate applied to its breaks - the same pair the v1 hierarchy passes
+    through the strategy, and the defaults are the same inert ones.
+    """
+
+    structure: StructureConfig = field(default_factory=StructureConfig)
+    displacement: DisplacementConfig = field(default_factory=DisplacementConfig)
+
+
+@dataclass(frozen=True, slots=True)
 class FVGConfig:
     """Three-candle fair value gap detection parameters (SPEC_SMC.md, п.8).
 

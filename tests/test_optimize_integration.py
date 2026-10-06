@@ -45,6 +45,7 @@ from smc_zero.config import (
     OptunaConfig,
     StrategyConfig,
     StructureLayerConfig,
+    TradeTargetScore,
     WalkForwardConfig,
 )
 from smc_zero.data_loader import TIMESTAMP_COLUMN, drop_unclosed
@@ -56,6 +57,8 @@ from smc_zero.optimizer import (
     evaluate_params,
     run_optimization,
     score_from_aggregates,
+    trades_pool_scorer,
+    trades_scaled_score,
 )
 from smc_zero.strategy.intents import build_intents
 
@@ -390,6 +393,31 @@ def test_evaluate_params_reads_the_cached_layer_of_each_fold() -> None:
 
     assert len(evaluation.fold_metrics_test) == 2
     assert len(evaluation.fold_metrics_train) == 2
+
+
+def test_the_pooled_score_runs_on_the_real_fold_tables_of_the_engine() -> None:
+    """The Э13.1 score reads the engine's own tables: it carries the sums and obeys its gates.
+
+    The unit tests of ``tests/test_optimize.py`` pin the arithmetic of the pool on hand-written
+    tables; this one pins the *contract* between the Э5' metric and the score: a fold table of the
+    real engine carries the uncapped ``gross_win`` / ``gross_loss`` pair, the shipped gates refuse
+    a two-fold pool outright, and the ``Scorer``-shaped adapter scores exactly the out-of-sample
+    tables - not the fit ones - under a budget that accepts them.
+    """
+    df = _tape()
+    marks = build_tape_marks(df, BASE)
+    evaluation = evaluate_params(df, marks, BASE, SHORT, BACKTEST)
+    folds = evaluation.fold_metrics_test
+
+    assert len(folds) == 2
+    assert all({"gross_win", "gross_loss"} <= set(table) for table in folds)
+    # Two folds are below the shipped minimum of five: the pool is refused outright.
+    assert trades_pool_scorer(evaluation, TradeTargetScore()) == 0.0
+    # A budget that accepts those two folds scores their pool - the out-of-sample tables, nothing else.
+    relaxed = TradeTargetScore(min_valid_folds=2, min_fold_trades=1, min_trades=1)
+    assert trades_pool_scorer(evaluation, relaxed) == pytest.approx(
+        trades_scaled_score(folds, relaxed)
+    )
 
 
 def test_every_fold_is_simulated_on_its_own_test_window() -> None:

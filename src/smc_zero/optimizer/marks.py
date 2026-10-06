@@ -33,7 +33,7 @@ from typing import Any
 
 import pandas as pd
 
-from smc_zero.config import Agreement, StrategyConfig
+from smc_zero.config import Agreement, StrategyConfig, Timeframe
 from smc_zero.data_loader import TIMESTAMP_COLUMN, drop_unclosed, resample_to_timeframe
 from smc_zero.indicators.bias import (
     BIAS_DIR_COLUMN,
@@ -83,7 +83,12 @@ class TapeMarks:
         return markup
 
 
-def build_tape_marks(df: pd.DataFrame, cfg: StrategyConfig | None = None) -> TapeMarks:
+def build_tape_marks(
+    df: pd.DataFrame,
+    cfg: StrategyConfig | None = None,
+    *,
+    ltf: Timeframe | None = None,
+) -> TapeMarks:
     """Build the markup cache of one tape: six heavy calls, once, for the whole study.
 
     The six are the three :func:`~smc_zero.data_loader.resample_to_timeframe` calls (one
@@ -93,12 +98,15 @@ def build_tape_marks(df: pd.DataFrame, cfg: StrategyConfig | None = None) -> Tap
     so that a refactor cannot quietly move them back into the per-trial path (100 trials
     would be 600 calls).
 
-    ``df`` is the whole M15 tape; its presumed still-forming tail bar is dropped here
-    (rule 2b), and the HTF frames are resampled from the *closed* tape, so the live edge
-    never enters the cache.  ``cfg`` supplies the inputs - the bias timeframes and swing
-    settings, the killzone table of the level windows and the level map - and defaults to
-    a plain :class:`~smc_zero.config.StrategyConfig`; the trials of a study must leave
-    exactly those parts alone (:func:`cache_mismatches` enforces it).
+    ``df`` is the whole tape of the run (the M15 tape of the default hierarchy); its
+    presumed still-forming tail bar is dropped here (rule 2b), and the HTF frames are
+    resampled from the *closed* tape, so the live edge never enters the cache.  ``cfg``
+    supplies the inputs - the bias timeframes and swing settings, the killzone table of the
+    level windows and the level map - and defaults to a plain
+    :class:`~smc_zero.config.StrategyConfig`; the trials of a study must leave exactly those
+    parts alone (:func:`cache_mismatches` enforces it).  ``ltf`` names the entry timeframe
+    of ``df`` and only reaches the ``broken_at`` grid of the level book; the H4 -> M15 -> M5
+    hierarchy passes ``"M5"`` here, and ``None`` keeps the M15 default.
     """
     config = StrategyConfig() if cfg is None else cfg
     closed = drop_unclosed(df)
@@ -111,6 +119,7 @@ def build_tape_marks(df: pd.DataFrame, cfg: StrategyConfig | None = None) -> Tap
         static_levels(closed, config.levels, session_cfg=config.session),
         closed,
         config.levels,
+        timeframe=ltf,
     )
     return TapeMarks(trends=trends, levels=levels, config=config)
 

@@ -16,8 +16,9 @@ import warnings
 from dataclasses import dataclass, field, replace
 from typing import Literal, TypeAlias
 
-# Timeframes supported by the pipeline: M15 entry, H1 structure, H4/D1 bias.
-Timeframe: TypeAlias = Literal["M15", "H1", "H4", "D1"]
+# Timeframes supported by the pipeline: the M15 entry of the default hierarchy (H1 structure,
+# H4/D1 bias) and the M5 entry of the optional H4 -> M15 -> M5 hierarchy (SPEC_SMC.md §7.20).
+Timeframe: TypeAlias = Literal["M5", "M15", "H1", "H4", "D1"]
 Confirmation: TypeAlias = Literal["close", "wick"]
 SweepMode: TypeAlias = Literal["wick_close_inside", "wick_only"]
 Season: TypeAlias = Literal["summer", "winter"]
@@ -85,10 +86,12 @@ Symbol: TypeAlias = Literal["EURUSD", "GBPUSD"]
 
 @dataclass(frozen=True, slots=True)
 class TimeframeConfig:
-    """Working timeframe hierarchy (M5 is deliberately absent).
+    """Working timeframe hierarchy of the default D1 -> H1 -> M15 run.
 
-    ``htf`` stays ``"D1"`` for the global bias context; the full bias hierarchy is
-    ``BiasConfig.timeframes`` (H1 + H4 + D1, SPEC_SMC.md C5).
+    ``ltf`` is the entry timeframe and defaults to ``"M15"``; the optional
+    H4 -> M15 -> M5 hierarchy sets it to ``"M5"`` through the ``hierarchy`` preset of a
+    config (SPEC_SMC.md §7.20).  ``htf`` stays ``"D1"`` for the global bias context; the
+    full bias hierarchy is ``BiasConfig.timeframes`` (H1 + H4 + D1, SPEC_SMC.md C5).
     """
 
     ltf: Timeframe = "M15"

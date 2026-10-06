@@ -602,6 +602,27 @@ def test_lifecycle_refuses_a_frame_that_is_not_the_entry_timeframe() -> None:
         level_lifecycle(_single_level("PDH", 100.0, True, "2026-01-05 00:00"), hourly)
 
 
+def test_the_lifecycle_of_an_m5_tape_dates_the_break_in_m5_bars() -> None:
+    """ОМ-2: the period of ``broken_at`` follows the named entry timeframe, not a hard-coded M15.
+
+    The same twelve five minute bars answer two different questions: named ``"M5"`` they date the
+    break on their own grid, and left unnamed they are refused, because the default M15 grid would
+    put the break 10 minutes late.  A silent fallback here would mis-date every lifecycle date of
+    the H4 -> M15 -> M5 hierarchy.
+    """
+    stamps = pd.date_range("2026-01-05 00:00", periods=12, freq="5min", tz="UTC")
+    close = np.array([99.0, 99.5, 99.9, 103.0, 100.0, 100.0] + [100.0] * 6)
+    frame = _bars(stamps, high=np.maximum(close, 100.0), low=np.minimum(close, 97.0), close=close)
+    level = _single_level("PDH", 100.0, True, "2026-01-05 00:05")
+
+    on_grid = level_lifecycle(level, frame, timeframe="M5")
+
+    # the bar opening at 00:15 is the first close beyond 102.0, so the break is known at 00:20
+    assert on_grid[BROKEN_AT_COLUMN].iloc[0] == _stamp("2026-01-05 00:20")
+    with pytest.raises(ValueError, match="entry frame"):
+        level_lifecycle(level, frame)
+
+
 def test_empty_frames_yield_empty_results() -> None:
     empty = pd.DataFrame(
         {

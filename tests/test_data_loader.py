@@ -24,6 +24,7 @@ from smc_zero.data_loader import (
     drop_unclosed,
     load_csv,
     mark_closed,
+    period_for,
     resample_to_timeframe,
 )
 
@@ -368,3 +369,16 @@ def test_resample_skips_unclosed_source_bars() -> None:
     ]
     closed = marked.loc[marked[IS_CLOSED_COLUMN]]
     assert int(hourly["volume"].sum()) == int(closed["volume"].sum())
+
+
+def test_the_m5_entry_timeframe_carries_its_bar_length() -> None:
+    """``"M5"`` is a supported label, so the second hierarchy can name its entry bar.
+
+    The bar length drives three things at once: ``close_time = timestamp + period`` of a
+    loaded file, the visibility of a stitched structure bar and the lifecycle dates of a
+    level.  A label the table does not hold must keep raising, never fall back silently.
+    """
+    assert period_for("M5") == pd.Timedelta(minutes=5)
+    assert period_for("m5") == pd.Timedelta(minutes=5)
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        period_for("M1")

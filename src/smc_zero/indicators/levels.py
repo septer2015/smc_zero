@@ -36,7 +36,14 @@ from collections.abc import Mapping
 import numpy as np
 import pandas as pd
 
-from smc_zero.config import HourWindow, Killzone, LevelConfig, SessionConfig, TimeframeConfig
+from smc_zero.config import (
+    HourWindow,
+    Killzone,
+    LevelConfig,
+    SessionConfig,
+    Timeframe,
+    TimeframeConfig,
+)
 from smc_zero.data_loader import TIMESTAMP_COLUMN, drop_unclosed, period_for
 from smc_zero.indicators.sessions import (
     LONDON,
@@ -378,28 +385,34 @@ def dynamic_idl_idh(df: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _ltf_period(stamps: pd.Series) -> pd.Timedelta:
+def _ltf_period(stamps: pd.Series, timeframe: Timeframe | None = None) -> pd.Timedelta:
     """Return the entry timeframe's bar period after checking the frame's own grid.
 
     ``close_time`` of a breaking bar is ``timestamp + period``, and that period is the pipeline's
-    entry timeframe (:attr:`smc_zero.config.TimeframeConfig.ltf`, C5).  A frame that is *not* on
-    that grid would silently mis-date every ``broken_at``, so a mismatch is an error instead of a
-    silently inferred period.
+    entry timeframe (:attr:`smc_zero.config.TimeframeConfig.ltf`, C5).  The caller may name it
+    explicitly - the H4 -> M15 -> M5 hierarchy trades five minute bars - and leaving it ``None``
+    keeps the M15 default of the C5 hierarchy.  A frame that is *not* on the named grid would
+    silently mis-date every ``broken_at``, so a mismatch is an error instead of a silently
+    inferred period.
     """
-    timeframe = TimeframeConfig().ltf
-    period = period_for(timeframe)
+    label = TimeframeConfig().ltf if timeframe is None else timeframe
+    period = period_for(label)
     if len(stamps) > 1:
         step = stamps.diff().dropna().min()
         if step != period:
             raise ValueError(
-                f"level_lifecycle expects the {timeframe} entry frame ({period} bars), "
+                f"level_lifecycle expects the {label} entry frame ({period} bars), "
                 f"got a {step} grid"
             )
     return period
 
 
 def level_lifecycle(
-    levels: pd.DataFrame, df: pd.DataFrame, cfg: LevelConfig | None = None
+    levels: pd.DataFrame,
+    df: pd.DataFrame,
+    cfg: LevelConfig | None = None,
+    *,
+    timeframe: Timeframe | None = None,
 ) -> pd.DataFrame:
     """Return ``levels`` with a ``broken_at`` column attached to every instance.
 
@@ -413,6 +426,10 @@ def level_lifecycle(
 
     Combine the result with :func:`fresh_at` to ask what a strategy asks: is this level still
     tradable at bar ``i``?
+
+    ``timeframe`` names the entry timeframe of ``df`` and defaults to the M15 of the C5
+    hierarchy; the H4 -> M15 -> M5 hierarchy passes ``"M5"`` so that ``broken_at`` is dated on
+    the five minute grid of the tape the chain actually trades.
     """
     config = LevelConfig() if cfg is None else cfg
     missing = [column for column in LEVEL_COLUMNS if column not in levels.columns]
@@ -426,7 +443,7 @@ def level_lifecycle(
         )
         return lifecycle
     stamps = closed[TIMESTAMP_COLUMN]
-    period = _ltf_period(stamps)
+    period = _ltf_period(stamps, timeframe)
     stamps_np = stamps.dt.tz_localize(None).to_numpy(dtype="datetime64[ns]")
     close = closed["close"].to_numpy(dtype="float64")
     buffer = config.break_buffer_pip

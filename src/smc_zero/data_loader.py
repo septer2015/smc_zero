@@ -1,7 +1,7 @@
 """CSV loading, bar closing and multi-timeframe stitching.
 
 Reconnaissance of ``./data`` fixed the on-disk schema for every timeframe
-(M15 / H1 / D1)::
+(M5 / M15 / H1 / H4 / D1)::
 
     datetime,open,high,low,close,volume
 
@@ -65,6 +65,7 @@ MT5_TIME_FORMATS: tuple[str, ...] = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
 
 # Bar length for every supported timeframe label.
 TIMEFRAME_PERIODS: dict[str, pd.Timedelta] = {
+    "M5": pd.Timedelta(minutes=5),
     "M15": pd.Timedelta(minutes=15),
     "H1": pd.Timedelta(hours=1),
     "H4": pd.Timedelta(hours=4),

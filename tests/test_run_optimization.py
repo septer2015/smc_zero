@@ -279,11 +279,13 @@ def test_the_winner_is_reported_from_a_backtest_of_the_window(
         bias: pd.DataFrame,
         levels: pd.DataFrame,
         cfg: StrategyConfig | None = None,
+        *,
+        structure: pd.DataFrame | None = None,
     ) -> Any:
         """Record the configuration the report is armed with, then build it."""
         assert cfg is not None
         used.append(cfg)
-        return real(ltf, bias, levels, cfg)
+        return real(ltf, bias, levels, cfg, structure=structure)
 
     monkeypatch.setattr(runner, "build_intents", spy)
 

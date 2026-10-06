@@ -46,6 +46,8 @@ from smc_zero.config import (
     InstrumentSpec,
     RiskConfig,
     StrategyConfig,
+    TimeframeConfig,
+    preset_of,
 )
 from smc_zero.data_loader import (
     AUTO_FORMAT,
@@ -164,6 +166,32 @@ def load_windowed_tape(
     if window.empty:
         raise ValueError(f"no bar of {path} is opened in {start:%Y-%m-%d} .. {end:%Y-%m-%d}")
     return window
+
+
+def working_frame(
+    symbol: str,
+    timeframes: TimeframeConfig,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    source: str = PROJECT_SOURCE,
+) -> tuple[str | None, pd.DataFrame | None]:
+    """Return the working timeframe of a run and its tape, or ``(None, None)``.
+
+    The second hierarchy separates the frame the structure is *read on* from the frame that is
+    traded (SPEC_SMC.md §7.20): its preset names that frame (``H4_M15_M5`` reads the structure on
+    M15), the tape is loaded over the same window, and the cache joins the two grids so the entry
+    chain reads a working bar only after it closed.  The v1 hierarchy has ``structure=None`` - the
+    entry frame owns the structure - and this answers ``(None, None)``, which keeps every existing
+    command line bit for bit.
+
+    Raises like :func:`load_windowed_tape`: a working tape that is absent or holds no bar of the
+    window stops the runner instead of running the entry alone under a structure that is not there.
+    """
+    preset = preset_of(timeframes)
+    if preset.structure is None:
+        return None, None
+    return preset.structure, load_windowed_tape(symbol, preset.structure, start, end, source=source)
 
 
 def instrument_for(symbol: str) -> InstrumentSpec:
@@ -359,19 +387,21 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
     cfg = load_config(args.config_path) if args.config_path else None
     preset_name = resolve_hierarchy(getattr(args, "hierarchy", None), cfg)
     preset = HIERARCHY_PRESETS[preset_name]
+    timeframes = preset.timeframes
     symbol = resolve_selector(args.symbol, cfg, "symbol", DEFAULT_SYMBOL)
-    timeframe = resolve_selector(args.timeframe, cfg, "timeframe", preset.ltf)
-    if timeframe != preset.ltf:
+    timeframe = resolve_selector(args.timeframe, cfg, "timeframe", timeframes.ltf)
+    if timeframe != timeframes.ltf:
         named = getattr(args, "hierarchy", None) or (
             None if cfg is None else cfg.get(HIERARCHY_KEY)
         )
         if named:
             raise ValueError(
-                f"hierarchy {preset_name!r} requires timeframe {preset.ltf!r}, got {timeframe!r}"
+                f"hierarchy {preset_name!r} requires timeframe {timeframes.ltf!r}, "
+                f"got {timeframe!r}"
             )
         raise ValueError(
             f"timeframe {timeframe!r} needs an explicit hierarchy: the default is "
-            f"{DEFAULT_HIERARCHY!r} ({preset.ltf} entries), so name e.g. "
+            f"{DEFAULT_HIERARCHY!r} ({timeframes.ltf} entries), so name e.g. "
             f"'{HIERARCHY_KEY}: H4_M15_M5' (or pass --hierarchy) for an M5 run"
         )
     scale = bars_per_day(timeframe)
@@ -380,10 +410,10 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
             symbol,
             timeframe,
             StrategyConfig(),
-            BacktestConfig(timeframes=preset, sharpe_bars_per_day=scale),
+            BacktestConfig(timeframes=timeframes, sharpe_bars_per_day=scale),
         )
     backtest = replace(
-        backtest_from_config(cfg), timeframes=preset, sharpe_bars_per_day=scale
+        backtest_from_config(cfg), timeframes=timeframes, sharpe_bars_per_day=scale
     )
     return symbol, timeframe, strategy_from_config(cfg), backtest
 

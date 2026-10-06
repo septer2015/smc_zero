@@ -107,17 +107,49 @@ class TimeframeConfig:
             )
 
 
+#: The frame the structure is read on when the entry frame does not own it.
+@dataclass(frozen=True, slots=True)
+class HierarchyPreset:
+    """One entry hierarchy: its three working timeframes and the frame the structure is read on.
+
+    ``structure`` is ``None`` while the entry frame owns the structure - the v1 reading, bit for
+    bit - and names the working frame (here ``"M15"`` for the M5 entry) when the two are separate:
+    :func:`smc_zero.indicators.structure.structure_layer` then joins that frame onto the entry bars
+    by ``close_time``.
+    """
+
+    timeframes: TimeframeConfig
+    structure: Timeframe | None = None
+
+
 #: The entry hierarchies of the project, keyed by the name a live config names (§7.20): every
-#: preset carries the three working timeframes of a run - the entry frame, the frame the working
-#: structure is read on and the frame of the global context.  ``D1_H1_M15`` is the v1 hierarchy of
-#: C5; ``H4_M15_M5`` is the second one, whose H4 leg is the working senior frame while D1 stays
-#: the global bias (the ruling Р1 of §7.20).
-HIERARCHY_PRESETS: dict[str, TimeframeConfig] = {
-    "D1_H1_M15": TimeframeConfig(ltf="M15", mtf="H1", htf="D1"),
-    "H4_M15_M5": TimeframeConfig(ltf="M5", mtf="M15", htf="H4"),
+#: preset carries the three working timeframes of a run - the entry frame, the frame of the working
+#: context and the frame of the global context - and the frame the structure is read on.
+#: ``D1_H1_M15`` is the v1 hierarchy of C5, where the entry frame owns the structure
+#: (``structure=None``, the reading the chain has always used); ``H4_M15_M5`` is the second one,
+#: whose structure is read on the working M15 frame and reaches the M5 entry only once that bar has
+#: closed, while D1 stays the global bias (the ruling Р1 of §7.20).
+HIERARCHY_PRESETS: dict[str, HierarchyPreset] = {
+    "D1_H1_M15": HierarchyPreset(timeframes=TimeframeConfig(ltf="M15", mtf="H1", htf="D1")),
+    "H4_M15_M5": HierarchyPreset(
+        timeframes=TimeframeConfig(ltf="M5", mtf="M15", htf="H4"), structure="M15"
+    ),
 }
 #: The preset a run without a ``hierarchy`` key keeps - the D1 -> H1 -> M15 of Э8'.
 DEFAULT_HIERARCHY = "D1_H1_M15"
+
+
+def preset_of(timeframes: TimeframeConfig) -> HierarchyPreset:
+    """Return the hierarchy preset those working timeframes belong to, or raise.
+
+    The two presets name different sets, so the lookup is unambiguous; a :class:`TimeframeConfig`
+    no preset holds is a wiring error and not a default.
+    """
+    for preset in HIERARCHY_PRESETS.values():
+        if preset.timeframes == timeframes:
+            return preset
+    known = ", ".join(sorted(HIERARCHY_PRESETS))
+    raise ValueError(f"no hierarchy preset names {timeframes!r}: expected one of {known}")
 
 
 @dataclass(frozen=True, slots=True)

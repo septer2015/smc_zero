@@ -48,6 +48,7 @@ from smc_zero.config import (
     InstrumentSpec,
     RiskConfig,
     TimeframeConfig,
+    preset_of,
 )
 
 #: ``dataclasses.asdict`` of the pinned ``RiskConfig`` of ``5a9e015``: the profile the recorder of the
@@ -211,9 +212,26 @@ def test_the_risk_profile_of_the_pinned_oracle_still_builds() -> None:
 
 def test_a_hierarchy_preset_names_three_distinct_timeframes() -> None:
     """§7.20: the two presets are the two entry hierarchies, and one frame named twice is refused."""
-    assert HIERARCHY_PRESETS["D1_H1_M15"] == TimeframeConfig()
+    assert HIERARCHY_PRESETS["D1_H1_M15"].timeframes == TimeframeConfig()
     assert DEFAULT_HIERARCHY == "D1_H1_M15"
-    assert HIERARCHY_PRESETS["H4_M15_M5"] == TimeframeConfig(ltf="M5", mtf="M15", htf="H4")
+    assert HIERARCHY_PRESETS["H4_M15_M5"].timeframes == TimeframeConfig(ltf="M5", mtf="M15", htf="H4")
     with pytest.raises(ValueError, match="distinct"):
         TimeframeConfig(ltf="M5", mtf="M5", htf="H4")
+
+
+def test_the_default_preset_has_no_structure_layer() -> None:
+    """The v1 hierarchy reads the structure on its own entry frame: no separate working frame."""
+    assert HIERARCHY_PRESETS[DEFAULT_HIERARCHY].structure is None
+    assert preset_of(TimeframeConfig()) is HIERARCHY_PRESETS[DEFAULT_HIERARCHY]
+
+
+def test_the_m5_preset_names_m15_as_structure() -> None:
+    """The second hierarchy reads its structure on the working M15 frame, not on the M5 entry."""
+    preset = HIERARCHY_PRESETS["H4_M15_M5"]
+
+    assert preset.structure == "M15"
+    assert preset.structure != preset.timeframes.ltf
+    assert preset_of(preset.timeframes) is preset
+    with pytest.raises(ValueError, match="no hierarchy preset"):
+        preset_of(TimeframeConfig(ltf="M5", mtf="H1", htf="D1"))
 

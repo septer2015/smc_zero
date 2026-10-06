@@ -244,6 +244,9 @@ def run(args: argparse.Namespace) -> int:
             symbol, timeframe, args.start, args.end, source=args.data_source
         )
         instrument = _common.instrument_for(symbol)
+        structure_timeframe, structure_frame = _common.working_frame(
+            symbol, backtest.timeframes, args.start, args.end, source=args.data_source
+        )
         walk_config = _walk_forward_config(args, timeframe)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)
     except (OSError, ValueError) as error:
@@ -260,9 +263,16 @@ def run(args: argparse.Namespace) -> int:
         return 2
 
     # The config of the run is the base of the study: a trial moves the knobs of ``PARAM_RANGES``
-    # on top of it, and every fold is charged the account of the same config (Э10'.2).
+    # on top of it, and every fold is charged the account of the same config (Э10'.2).  A separate
+    # working frame (§7.20) is marked up once into the cache, beside the trends and the level book.
     base = strategy
-    marks = build_tape_marks(tape, base)
+    marks = build_tape_marks(
+        tape,
+        base,
+        ltf=backtest.timeframes.ltf,
+        structure_frame=structure_frame,
+        structure_timeframe=structure_timeframe,
+    )
     try:
         outcome = run_optimization(
             tape, study_config, walk_config, backtest, instrument, base=base, marks=marks
@@ -290,6 +300,7 @@ def run(args: argparse.Namespace) -> int:
         marks.bias_frame(outcome.strategy.bias.agreement),
         marks.levels,
         outcome.strategy,
+        structure=marks.structure,
     )
     result = run_backtest(tape, chain.intents, backtest, instrument)
 

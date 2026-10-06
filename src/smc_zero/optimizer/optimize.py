@@ -47,6 +47,7 @@ from smc_zero.config import (
     StrategyConfig,
     WalkForwardConfig,
 )
+from smc_zero.data_loader import drop_unclosed
 from smc_zero.optimizer.marks import TapeMarks, build_tape_marks, cache_mismatches
 from smc_zero.optimizer.ranges import ParamValue, TrialLike, apply_params, suggest_params
 from smc_zero.optimizer.score import score_from_aggregates
@@ -84,7 +85,12 @@ Evaluator: TypeAlias = Callable[
 StudyFactory: TypeAlias = Callable[[OptunaConfig], Any]
 
 
-def _intents_fn(bias: pd.DataFrame, levels: pd.DataFrame, cfg: StrategyConfig) -> IntentBuilder:
+def _intents_fn(
+    bias: pd.DataFrame,
+    levels: pd.DataFrame,
+    cfg: StrategyConfig,
+    structure: pd.DataFrame | None = None,
+) -> IntentBuilder:
     """Return the Э6' builder of one parameter set.
 
     The contract of :func:`run_walkforward` (§7.10 п.65) is that the *second* argument is
@@ -94,11 +100,17 @@ def _intents_fn(bias: pd.DataFrame, levels: pd.DataFrame, cfg: StrategyConfig) -
     the fit window is used on the other side of the fold: to score the trial in sample.
     Returning only the chain's ``intents`` drops its ledger of rejected attempts, which the
     engine replaces with the accounting it needs.
+
+    ``structure`` is the cached layer of a separate working frame (§7.20).  It covers the whole
+    tape while a fold is a window of it, so the layer is cut to the very bars the chain will read
+    (``drop_unclosed(test)`` - the same rows :func:`build_intents` keeps) before it is handed over;
+    the cache stays one frame per study instead of one per fold.
     """
 
     def build(train: pd.DataFrame, test: pd.DataFrame) -> tuple[TradeIntent, ...]:
         """Arm the entry chain on the test window and return its accepted intents."""
-        return build_intents(test, bias, levels, cfg).intents
+        window = None if structure is None else structure.loc[drop_unclosed(test).index]
+        return build_intents(test, bias, levels, cfg, structure=window).intents
 
     return build
 
@@ -127,7 +139,12 @@ def evaluate_params(
     config = WalkForwardConfig() if cfg_wf is None else cfg_wf
     backtest_cfg = BacktestConfig() if backtest is None else backtest
     spec = DEFAULT_INSTRUMENT if instrument is None else instrument
-    build = _intents_fn(marks.bias_frame(cfg_strategy.bias.agreement), marks.levels, cfg_strategy)
+    build = _intents_fn(
+        marks.bias_frame(cfg_strategy.bias.agreement),
+        marks.levels,
+        cfg_strategy,
+        marks.structure,
+    )
     walk = run_walkforward(df, build, config, backtest_cfg, spec)
     train_metrics = [
         run_backtest(train, build(train, train), backtest_cfg, spec).metrics

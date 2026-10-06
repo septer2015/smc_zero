@@ -44,8 +44,11 @@ from smc_zero.config import (
     InstrumentSpec,
     OptunaConfig,
     StrategyConfig,
+    StructureLayerConfig,
     WalkForwardConfig,
 )
+from smc_zero.data_loader import TIMESTAMP_COLUMN, drop_unclosed
+from smc_zero.indicators.structure import STRUCTURE_LAYER_COLUMNS, structure_layer
 from smc_zero.optimizer import (
     FoldEvaluation,
     TapeMarks,
@@ -91,6 +94,47 @@ def _tape() -> pd.DataFrame:
     )
     frame["volume"] = 1
     frame["is_closed"] = True
+    return frame
+
+
+def _tape5() -> pd.DataFrame:
+    """The entry tape of the second hierarchy: its own walk on a five minute grid (its own seed).
+
+    The seed is deliberately not the M15 one: a working frame that carries the *same* sequence as
+    the entry tape would make the ``m4`` mutation (measuring the structure on the entry tape) look
+    identical to the correct run, and the test would lose its teeth.
+    """
+    rng = np.random.default_rng(11)
+    close = 1.1000 + np.cumsum(rng.normal(0.0, 0.0005, BARS))
+    open_ = np.concatenate(([1.1000], close[:-1]))
+    frame = pd.DataFrame(
+        {
+            "open": open_,
+            "high": np.maximum(open_, close) + 0.0003,
+            "low": np.minimum(open_, close) - 0.0003,
+            "close": close,
+        }
+    )
+    frame.insert(
+        0, "timestamp", pd.date_range("2026-06-08 00:00", periods=BARS, freq="5min", tz="UTC")
+    )
+    frame["volume"] = 1
+    frame["is_closed"] = True
+    return frame
+
+
+def _working_tape() -> pd.DataFrame:
+    """The M15 working tape of the fixture: the module tape shifted up from its bar 10.
+
+    The random walk alone carries no swing break at all, and a structure layer of empty breaks
+    would make the ``m4`` mutation (measuring the structure on the entry tape) invisible: the test
+    would compare two frames of zeros.  One deterministic step gives the working frame a break the
+    entry tape does not have.
+    """
+    frame = _tape()
+    shift = np.where(np.arange(BARS) >= 10, 0.02, 0.0)
+    for column in ("open", "high", "low", "close"):
+        frame[column] = frame[column] + shift
     return frame
 
 
@@ -205,7 +249,13 @@ class _StubEvaluator:
 def _count_heavy_calls(monkeypatch: pytest.MonkeyPatch) -> Counter[str]:
     """Count the heavy calls of the markup on :mod:`smc_zero.optimizer.marks` as they happen."""
     counts: Counter[str] = Counter()
-    for name in ("resample_to_timeframe", "bias_frames", "static_levels", "level_lifecycle"):
+    for name in (
+        "resample_to_timeframe",
+        "bias_frames",
+        "static_levels",
+        "level_lifecycle",
+        "structure_layer",
+    ):
         real = getattr(marks_module, name)
 
         def wrapper(*args: Any, _real: Any = real, _name: str = name, **kwargs: Any) -> Any:
@@ -260,6 +310,86 @@ def test_the_markup_of_a_run_is_built_once_for_every_trial(monkeypatch: pytest.M
     # The last evaluation is the winner's, recomputed from scratch rather than read back.
     assert seen[-1] == result.strategy
     assert all(table["trades"] >= 0 for table in result.best_evaluation.fold_metrics_test)
+
+
+def test_m15_mode_does_not_compute_structure() -> None:
+    """The v1 hierarchy reads the structure of the entry tape: no separate frame, no layer."""
+    marks = build_tape_marks(_tape(), BASE)
+
+    assert marks.structure is None
+
+
+def test_the_structure_layer_is_cached_in_tape_marks() -> None:
+    """A separate working frame is marked up once into the cache, in the scale of the entry bars."""
+    entry = _tape5()
+
+    marks = build_tape_marks(
+        entry, BASE, ltf="M5", structure_frame=_working_tape(), structure_timeframe="M15"
+    )
+
+    assert marks.structure is not None
+    assert len(marks.structure) == len(drop_unclosed(entry))
+    assert list(marks.structure.columns) == [TIMESTAMP_COLUMN, *STRUCTURE_LAYER_COLUMNS]
+    # the working frame carries a break and the entry tape (its own walk) does not
+    assert int((marks.structure["break_dir"] != 0).sum()) > 0
+    # the layer is the *working* frame's reading of the entry bars, not the entry tape's own (m4)
+    expected = structure_layer(
+        drop_unclosed(entry),
+        _working_tape(),
+        ltf_timeframe="M5",
+        structure_timeframe="M15",
+        cfg=StructureLayerConfig(structure=BASE.bias.structure, displacement=BASE.displacement),
+    )
+    pd.testing.assert_frame_equal(
+        marks.structure.drop(columns=[TIMESTAMP_COLUMN]).reset_index(drop=True),
+        expected.drop(columns=[TIMESTAMP_COLUMN]).reset_index(drop=True),
+    )
+    # the cached layer addresses the entry tape itself, which is what the chain requires of it
+    chain = build_intents(
+        entry,
+        marks.bias_frame(BASE.bias.agreement),
+        marks.levels,
+        BASE,
+        structure=marks.structure,
+    )
+    assert len(chain.rejections) >= 0
+
+
+def test_the_markup_count_includes_the_structure_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The layer is one more heavy call: once per run in the M5 mode, absent in the v1 mode (m4)."""
+    counts = _count_heavy_calls(monkeypatch)
+
+    build_tape_marks(_tape(), BASE)
+    assert counts["structure_layer"] == 0
+    assert counts == Counter(
+        {"resample_to_timeframe": 1, "bias_frames": 1, "static_levels": 1, "level_lifecycle": 1}
+    )
+
+    counts.clear()
+    build_tape_marks(_tape5(), BASE, ltf="M5", structure_frame=_working_tape(), structure_timeframe="M15")
+
+    assert counts == Counter(
+        {
+            "resample_to_timeframe": 1,
+            "bias_frames": 1,
+            "static_levels": 1,
+            "level_lifecycle": 1,
+            "structure_layer": 1,
+        }
+    )
+
+
+def test_evaluate_params_reads_the_cached_layer_of_each_fold() -> None:
+    """A fold gets the rows of the cached layer that belong to its own window, not the whole tape."""
+    entry = _tape5()
+    marks = build_tape_marks(
+        entry, BASE, ltf="M5", structure_frame=_working_tape(), structure_timeframe="M15"
+    )
+
+    evaluation = evaluate_params(entry, marks, BASE, SHORT, BACKTEST)
+
+    assert len(evaluation.fold_metrics_test) == 2
+    assert len(evaluation.fold_metrics_train) == 2
 
 
 def test_every_fold_is_simulated_on_its_own_test_window() -> None:

@@ -28,12 +28,13 @@ level map - is refused instead of being served a stale markup.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any
 
 import pandas as pd
 
-from smc_zero.config import Agreement, StrategyConfig, Timeframe
+from smc_zero.config import Agreement, StrategyConfig, StructureLayerConfig, Timeframe
 from smc_zero.data_loader import TIMESTAMP_COLUMN, drop_unclosed, resample_to_timeframe
 from smc_zero.indicators.bias import (
     BIAS_DIR_COLUMN,
@@ -43,6 +44,7 @@ from smc_zero.indicators.bias import (
     trend_column,
 )
 from smc_zero.indicators.levels import level_lifecycle, static_levels
+from smc_zero.indicators.structure import structure_layer
 from smc_zero.optimizer.ranges import PARAM_RANGES
 
 
@@ -55,11 +57,17 @@ class TapeMarks:
     the book of :func:`level_lifecycle` (one row per level instance, ``broken_at``
     included), and ``config`` the :class:`~smc_zero.config.StrategyConfig` they were built
     from - the record :func:`cache_mismatches` compares a trial's configuration against.
+
+    ``structure`` is the structure layer of the entry frame when the run has a *separate*
+    working timeframe (the H4 -> M15 -> M5 hierarchy of §7.20): the frame
+    :func:`~smc_zero.indicators.structure.structure_layer` returns, cached here for the whole
+    study, and ``None`` while the entry frame owns the structure itself (the v1 hierarchy).
     """
 
     trends: pd.DataFrame
     levels: pd.DataFrame
     config: StrategyConfig
+    structure: pd.DataFrame | None = None
 
     def bias_frame(self, agreement: Agreement | None = None) -> pd.DataFrame:
         """Return the bias markup for one agreement mode, off the cached trends.
@@ -88,40 +96,70 @@ def build_tape_marks(
     cfg: StrategyConfig | None = None,
     *,
     ltf: Timeframe | None = None,
+    htf_frames: Mapping[str, pd.DataFrame] | None = None,
+    structure_frame: pd.DataFrame | None = None,
+    structure_timeframe: Timeframe | None = None,
 ) -> TapeMarks:
-    """Build the markup cache of one tape: six heavy calls, once, for the whole study.
+    """Build the markup cache of one tape: the heavy calls, once, for the whole study.
 
-    The six are the three :func:`~smc_zero.data_loader.resample_to_timeframe` calls (one
-    per bias timeframe), :func:`~smc_zero.indicators.bias.bias_frames`,
-    :func:`~smc_zero.indicators.levels.static_levels` and
-    :func:`~smc_zero.indicators.levels.level_lifecycle`; the guard test of Э7' counts them
-    so that a refactor cannot quietly move them back into the per-trial path (100 trials
-    would be 600 calls).
+    The calls are the :func:`~smc_zero.data_loader.resample_to_timeframe` calls (one per bias
+    timeframe), :func:`~smc_zero.indicators.bias.bias_frames`,
+    :func:`~smc_zero.indicators.levels.static_levels`,
+    :func:`~smc_zero.indicators.levels.level_lifecycle` and - when the run has a separate working
+    frame - :func:`~smc_zero.indicators.structure.structure_layer`; the guard test of Э7' counts
+    them so that a refactor cannot quietly move them back into the per-trial path (100 trials
+    would be hundreds of calls).
 
-    ``df`` is the whole tape of the run (the M15 tape of the default hierarchy); its
-    presumed still-forming tail bar is dropped here (rule 2b), and the HTF frames are
-    resampled from the *closed* tape, so the live edge never enters the cache.  ``cfg``
-    supplies the inputs - the bias timeframes and swing settings, the killzone table of the
-    level windows and the level map - and defaults to a plain
-    :class:`~smc_zero.config.StrategyConfig`; the trials of a study must leave exactly those
-    parts alone (:func:`cache_mismatches` enforces it).  ``ltf`` names the entry timeframe
-    of ``df`` and only reaches the ``broken_at`` grid of the level book; the H4 -> M15 -> M5
-    hierarchy passes ``"M5"`` here, and ``None`` keeps the M15 default.
+    ``df`` is the whole tape of the run (the M15 tape of the default hierarchy); its presumed
+    still-forming tail bar is dropped here (rule 2b), and the HTF frames are resampled from the
+    *closed* tape, so the live edge never enters the cache.  ``cfg`` supplies the inputs - the bias
+    timeframes and swing settings, the killzone table of the level windows and the level map - and
+    defaults to a plain :class:`~smc_zero.config.StrategyConfig`; the trials of a study must leave
+    exactly those parts alone (:func:`cache_mismatches` enforces it).
+
+    ``ltf`` names the entry timeframe of ``df`` and reaches the ``broken_at`` grid of the level
+    book (:func:`~smc_zero.indicators.levels.level_lifecycle`); ``None`` keeps the M15 default.
+
+    ``htf_frames`` optionally hands in the already built HTF frames of the bias timeframes instead
+    of resampling them here; a frame the bias asks for and the mapping does not hold is a
+    ``ValueError``.  ``structure_frame`` is the tape of the *working* timeframe (the M15 tape of the
+    H4 -> M15 -> M5 hierarchy, §7.20): when it is given, the structure layer of the entry frame is
+    computed and cached beside the trends, the working frame's parameters are the strategy's own
+    (``bias.structure`` and ``displacement`` - one copy of every structure number), and
+    ``structure_timeframe`` has to name that frame.  Without it the entry frame owns the structure
+    (the v1 hierarchy) and ``TapeMarks.structure`` stays ``None``.
     """
     config = StrategyConfig() if cfg is None else cfg
     closed = drop_unclosed(df)
-    htf_frames = {
-        timeframe: resample_to_timeframe(closed, timeframe)
-        for timeframe in config.bias.timeframes
-    }
-    trends = bias_frames(closed, htf_frames, config.bias)
+    if htf_frames is None:
+        frames = {
+            timeframe: resample_to_timeframe(closed, timeframe)
+            for timeframe in config.bias.timeframes
+        }
+    else:
+        missing = [timeframe for timeframe in config.bias.timeframes if timeframe not in htf_frames]
+        if missing:
+            raise ValueError(f"htf_frames is missing the {missing} frame(s) of the bias")
+        frames = {timeframe: htf_frames[timeframe] for timeframe in config.bias.timeframes}
+    trends = bias_frames(closed, frames, config.bias)
     levels = level_lifecycle(
         static_levels(closed, config.levels, session_cfg=config.session),
         closed,
         config.levels,
         timeframe=ltf,
     )
-    return TapeMarks(trends=trends, levels=levels, config=config)
+    structure = None
+    if structure_frame is not None:
+        structure = structure_layer(
+            closed,
+            structure_frame,
+            ltf_timeframe=ltf,
+            structure_timeframe=structure_timeframe,
+            cfg=StructureLayerConfig(
+                structure=config.bias.structure, displacement=config.displacement
+            ),
+        )
+    return TapeMarks(trends=trends, levels=levels, config=config, structure=structure)
 
 
 def _leaf_paths(value: Any, prefix: str = "") -> dict[str, Any]:

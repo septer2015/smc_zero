@@ -31,6 +31,8 @@ import scripts._common as common
 import scripts.run_backtest as runner
 from smc_zero.backtester.engine import TRADE_COLUMNS
 from smc_zero.config import StrategyConfig
+from smc_zero.data_loader import TIMESTAMP_COLUMN
+from smc_zero.indicators.structure import STRUCTURE_LAYER_COLUMNS
 
 BARS = 100
 #: The tape starts at a Monday 00:00 UTC, so its 100 bars reach into the next calendar day.
@@ -38,10 +40,11 @@ START = "2026-06-08"
 NEXT_DAY = "2026-06-09"
 
 
-def _tape(bars: int = BARS) -> pd.DataFrame:
-    """Return the fixture tape: a 15 pip random walk of closed M15 bars, all flags set."""
+def _tape(bars: int = BARS, freq: str = "15min") -> pd.DataFrame:
+    """Return the fixture tape: a random walk of closed bars on the grid of ``freq``."""
     rng = np.random.default_rng(7)
-    close = 1.1000 + np.cumsum(rng.normal(0.0, 0.0015, bars))
+    step = 0.0015 if freq == "15min" else 0.0005
+    close = 1.1000 + np.cumsum(rng.normal(0.0, step, bars))
     open_ = np.concatenate(([1.1000], close[:-1]))
     frame = pd.DataFrame(
         {
@@ -52,20 +55,20 @@ def _tape(bars: int = BARS) -> pd.DataFrame:
         }
     )
     frame.insert(
-        0, "timestamp", pd.date_range("2026-06-08 00:00", periods=bars, freq="15min", tz="UTC")
+        0, "timestamp", pd.date_range("2026-06-08 00:00", periods=bars, freq=freq, tz="UTC")
     )
     frame["volume"] = 1
     frame["is_closed"] = True
     return frame
 
 
-def _argv(report_dir: Path, **overrides: str) -> list[str]:
+def _argv(report_dir: Path, timeframe: str = "M15", **overrides: str) -> list[str]:
     """Return a command line of the fixture, with the two window days of the tape."""
     argv = [
         "--symbol",
         "EURUSD",
         "--timeframe",
-        "M15",
+        timeframe,
         "--start",
         START,
         "--end",
@@ -80,12 +83,17 @@ def _argv(report_dir: Path, **overrides: str) -> list[str]:
 
 @pytest.fixture
 def stubbed_tape(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Serve the fixture tape to the runner instead of reading ``./data``."""
+    """Serve the fixture tape to the runner instead of reading ``./data``.
+
+    The five minute tape of the second hierarchy is served as well, so a run of the M5 mode reads
+    both its entry frame and its working frame from the fixture and never from the repository.
+    """
 
     def load_csv(path: Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
-        """Return the fixture tape whatever path was asked for."""
-        assert path.name == "EURUSD_M15.csv"
-        return _tape()
+        """Return the fixture tape of the timeframe the path names."""
+        grid = {"EURUSD_M5.csv": "5min", "EURUSD_M15.csv": "15min"}.get(path.name)
+        assert grid is not None, f"the fixture serves M5 and M15, not {path.name}"
+        return _tape(freq=grid)
 
     monkeypatch.setattr(common, "load_csv", load_csv)
 
@@ -110,6 +118,40 @@ def test_the_backtest_runner_returns_zero_and_writes_its_report(
     printed = capsys.readouterr().out
     assert printed.splitlines()[0].startswith("SMC backtest: EURUSD M15")
     assert str(folder) in printed
+
+
+def test_scripts_pass_structure_to_build_intents(
+    tmp_path: Path, stubbed_tape: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An M5 run reads the M15 structure: the cached layer reaches the chain instead of nothing.
+
+    The fixture tape carries no setup, so this pins the *wiring* and not a verdict: what matters is
+    that ``--hierarchy H4_M15_M5`` makes the runner load the working tape over the same window and
+    hand its layer to :func:`build_intents`, in the scale of the entry bars.
+    """
+    seen: list[object] = []
+    real = runner.build_intents
+
+    def spy(
+        ltf: pd.DataFrame,
+        bias: pd.DataFrame,
+        levels: pd.DataFrame,
+        cfg: StrategyConfig | None = None,
+        *,
+        structure: pd.DataFrame | None = None,
+    ) -> object:
+        """Record the layer the runner hands over, then build the chain as usual."""
+        seen.append(structure)
+        return real(ltf, bias, levels, cfg, structure=structure)
+
+    monkeypatch.setattr(runner, "build_intents", spy)
+
+    code = runner.main(_argv(tmp_path / "reports", timeframe="M5", hierarchy="H4_M15_M5"))
+
+    assert code == 0
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert list(seen[0].columns) == [TIMESTAMP_COLUMN, *STRUCTURE_LAYER_COLUMNS]
 
 
 def test_the_report_holds_the_window_and_not_the_whole_file(

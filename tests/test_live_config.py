@@ -304,7 +304,8 @@ def test_the_hierarchy_preset_sets_all_three_timeframes() -> None:
     assert backtest.timeframes == TimeframeConfig(ltf="M5", mtf="M15", htf="H4")
     assert backtest.sharpe_bars_per_day == 288
     # the v1 preset is the default and stays untouched bit for bit
-    assert common.HIERARCHY_PRESETS["D1_H1_M15"] == TimeframeConfig()
+    assert common.HIERARCHY_PRESETS["D1_H1_M15"].timeframes == TimeframeConfig()
+    assert common.HIERARCHY_PRESETS["D1_H1_M15"].structure is None
     assert common.resolve_hierarchy(None, None) == common.DEFAULT_HIERARCHY
     assert common.resolve_hierarchy("h4_m15_m5", None) == "H4_M15_M5"
 

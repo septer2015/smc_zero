@@ -97,6 +97,9 @@ def run(args: argparse.Namespace) -> int:
             symbol, timeframe, args.start, args.end, source=args.data_source
         )
         instrument = _common.instrument_for(symbol)
+        structure_timeframe, structure_frame = _common.working_frame(
+            symbol, backtest.timeframes, args.start, args.end, source=args.data_source
+        )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -104,8 +107,22 @@ def run(args: argparse.Namespace) -> int:
     # The markup is built on the window and reused by everything below: the bias frame the chain
     # asks for a direction and the level book it tries to sweep.  The agreement mode is the one the
     # config of the run names, not the cache default: ``bias_frame`` is asked for it explicitly.
-    marks = build_tape_marks(tape, strategy)
-    chain = build_intents(tape, marks.bias_frame(strategy.bias.agreement), marks.levels, strategy)
+    # A separate working frame (§7.20) is marked up into ``marks.structure``, so the chain reads
+    # the structure of that frame instead of measuring the entry tape itself.
+    marks = build_tape_marks(
+        tape,
+        strategy,
+        ltf=backtest.timeframes.ltf,
+        structure_frame=structure_frame,
+        structure_timeframe=structure_timeframe,
+    )
+    chain = build_intents(
+        tape,
+        marks.bias_frame(strategy.bias.agreement),
+        marks.levels,
+        strategy,
+        structure=marks.structure,
+    )
     result = run_backtest(tape, chain.intents, backtest, instrument)
 
     summary = format_summary(result)

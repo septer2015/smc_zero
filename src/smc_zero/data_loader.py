@@ -109,6 +109,18 @@ def _coerce_period(period: pd.Timedelta | str) -> pd.Timedelta:
     return delta
 
 
+def bars_per_day(timeframe: str) -> int:
+    """Return how many bars of ``timeframe`` fit into one day, e.g. 96 for M15 and 288 for M5.
+
+    Two runs of one day read different scales: the Sharpe ratio of a run is computed per bar and
+    scaled by :attr:`smc_zero.config.BacktestConfig.sharpe_bars_per_day`, and the walk-forward
+    windows of :func:`smc_zero.backtester.walkforward.default_walk_forward` are counted in bars as
+    well.  Both ask this function, so the H4 -> M15 -> M5 hierarchy gets the 288 of its five minute
+    tape instead of silently reusing the 96 of the M15 run it replaced.
+    """
+    return int(pd.Timedelta(days=1) / period_for(timeframe))
+
+
 def _to_utc(values: pd.Series) -> pd.Series:
     """Return ``values`` as a UTC-aware ``datetime64[ns, UTC]`` series.
 

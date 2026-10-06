@@ -58,6 +58,7 @@ import pandas as pd
 from scripts import _common
 from smc_zero.backtester import (
     FOLD_METRIC_FIELDS,
+    default_walk_forward,
     export_trades,
     format_summary,
     run_backtest,
@@ -109,24 +110,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _walk_forward_config(args: argparse.Namespace) -> WalkForwardConfig:
-    """Return the fold configuration of the run: the shipped defaults, two bar counts overridable.
+def _walk_forward_config(args: argparse.Namespace, timeframe: str) -> WalkForwardConfig:
+    """Return the fold scheme of the run: the windows of its entry timeframe, counts overridable.
 
+    The base is :func:`~smc_zero.backtester.walkforward.default_walk_forward` of the *effective*
+    entry timeframe: an M15 tape keeps the 120 / 60 day windows of §7.10 п.62, the M5 tape of the
+    second hierarchy reads the 60 / 30 days ruled in §7.20 (17 280 / 8 640 bars, nine folds).
     ``--min-train-bars`` and ``--test-period-bars`` are what makes a short window hold a fold at
     all (§7.10 п.61), which is what a smoke run or a test needs; leaving both alone keeps the
-    defaults of :class:`~smc_zero.config.WalkForwardConfig` (11 520 / 5 760 bars - a 120 day
-    warm-up and the 60 day out-of-sample window of the study).  The config
-    validates the pair itself, so ``--min-train-bars 0`` is a ``ValueError`` and not a silent
-    default.
+    windows of the timeframe.  The config validates the pair itself, so ``--min-train-bars 0`` is
+    a ``ValueError`` and not a silent default.
     """
-    defaults = WalkForwardConfig()
+    defaults = default_walk_forward(timeframe)
     return WalkForwardConfig(
+        anchored=defaults.anchored,
         min_train_bars=(
             defaults.min_train_bars if args.min_train_bars is None else args.min_train_bars
         ),
         test_period_bars=(
             defaults.test_period_bars if args.test_period_bars is None else args.test_period_bars
         ),
+        train_period_bars=defaults.train_period_bars,
     )
 
 
@@ -240,7 +244,7 @@ def run(args: argparse.Namespace) -> int:
             symbol, timeframe, args.start, args.end, source=args.data_source
         )
         instrument = _common.instrument_for(symbol)
-        walk_config = _walk_forward_config(args)
+        walk_config = _walk_forward_config(args, timeframe)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

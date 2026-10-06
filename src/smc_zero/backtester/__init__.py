@@ -38,6 +38,7 @@ from smc_zero.backtester.walkforward import (
     IntentBuilder,
     WalkForwardResult,
     aggregate_fold_metrics,
+    default_walk_forward,
     run_walkforward,
     split_walkforward,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "WalkForwardResult",
     "aggregate_fold_metrics",
     "calc_metrics",
+    "default_walk_forward",
     "export_trades",
     "format_summary",
     "run_backtest",

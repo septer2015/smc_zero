@@ -26,6 +26,7 @@ import pytest
 from smc_zero.backtester.walkforward import (
     FOLD_METRIC_FIELDS,
     aggregate_fold_metrics,
+    default_walk_forward,
     split_walkforward,
 )
 from smc_zero.config import WalkForwardConfig
@@ -62,6 +63,26 @@ def test_the_folds_of_a_short_tape_start_at_the_warm_up_the_config_asks_for() ->
         (800, 0, 800, 899),
         (900, 0, 900, 999),
     ]
+
+def test_the_fold_windows_of_an_entry_timeframe_are_written_in_its_own_bars() -> None:
+    """A 60 / 30 day M5 window is 17 280 / 8 640 bars; the M15 pair stays the dataclass default.
+
+    The windows are lengths *in bars of the entry tape*, so the second hierarchy cannot reuse the
+    M15 numbers: its tape carries four times as many bars a day.
+    """
+    daily = default_walk_forward("M15")
+    assert (daily.min_train_bars, daily.test_period_bars) == (96 * 120, 96 * 60)
+    assert daily == WalkForwardConfig()
+
+    fast = default_walk_forward("M5")
+    assert (fast.min_train_bars, fast.test_period_bars) == (288 * 60, 288 * 30)
+    assert fast.train_period_bars == 288 * 60
+    # the shipped M5 tape (100 136 bars of 2025-05-06 .. 2026-09-22) holds nine folds under them
+    assert (100_136 - fast.min_train_bars) // fast.test_period_bars == 9
+
+    with pytest.raises(ValueError, match="no walk-forward windows"):
+        default_walk_forward("H1")
+
 
 def test_a_fold_never_shares_a_bar_with_its_train_window() -> None:
     """Train and test are adjacent windows of one tape: no shared bar and no gap (m1)."""

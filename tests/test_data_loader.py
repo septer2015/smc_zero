@@ -21,6 +21,7 @@ from smc_zero.data_loader import (
     TIMESTAMP_COLUMN,
     align_htf_to_ltf,
     attach_close_time,
+    bars_per_day,
     drop_unclosed,
     load_csv,
     mark_closed,
@@ -382,3 +383,14 @@ def test_the_m5_entry_timeframe_carries_its_bar_length() -> None:
     assert period_for("m5") == pd.Timedelta(minutes=5)
     with pytest.raises(ValueError, match="unsupported timeframe"):
         period_for("M1")
+
+
+def test_the_bar_scale_of_a_timeframe_counts_one_day() -> None:
+    """``bars_per_day`` is the scale of the run (Sharpe, fold windows): 96 on M15, 288 on M5."""
+    assert bars_per_day("M15") == 96
+    assert bars_per_day("M5") == 288
+    assert bars_per_day("H1") == 24
+    assert bars_per_day("H4") == 6
+    assert bars_per_day("D1") == 1
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        bars_per_day("M1")

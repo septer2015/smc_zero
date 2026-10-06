@@ -47,6 +47,7 @@ import pandas as pd
 
 from smc_zero.backtester.engine import DEFAULT_INSTRUMENT, run_backtest
 from smc_zero.config import BacktestConfig, InstrumentSpec, WalkForwardConfig
+from smc_zero.data_loader import bars_per_day
 from smc_zero.strategy.base import TradeIntent
 
 #: One fold of a walk-forward: the window that may be fitted and the window that is simulated.
@@ -60,6 +61,40 @@ IntentBuilder: TypeAlias = Callable[
 
 #: The fields :func:`aggregate_fold_metrics` reports, in the order of the metric table of Э5'.
 FOLD_METRIC_FIELDS: tuple[str, ...] = ("trades", "profit", "win_rate", "pf", "max_dd", "sharpe")
+
+#: The fold windows of an entry timeframe, as ``(warm-up days, out-of-sample days)``: the M15 tape
+#: of the default hierarchy keeps the 120 / 60 days of SPEC_SMC.md §7.10 п.62 (a 15 fold study on
+#: the four year tape), while the five minute tape of the H4 -> M15 -> M5 hierarchy uses 60 / 30
+#: days - the ruling of SPEC_SMC.md §7.20, which keeps nine folds on 1.4 years of M5 bars instead
+#: of the three a strict day-for-day scaling of the M15 windows would leave.
+FOLD_WINDOW_DAYS: dict[str, tuple[int, int]] = {
+    "M15": (120, 60),
+    "M5": (60, 30),
+}
+
+
+def default_walk_forward(timeframe: str) -> WalkForwardConfig:
+    """Return the fold scheme of an entry timeframe: its windows in days, written in its own bars.
+
+    ``timeframe`` is the entry timeframe of the tape the study reads, and an unknown label is
+    refused instead of being served the M15 windows: a study of a five minute tape measured with
+    M15-length windows would fold four times more bars than it holds.  ``anchored`` and the rolling
+    length keep the :class:`~smc_zero.config.WalkForwardConfig` defaults, and the caller may still
+    override any count on the command line.
+    """
+    try:
+        warm_up_days, test_days = FOLD_WINDOW_DAYS[timeframe.upper()]
+    except KeyError as exc:
+        supported = ", ".join(sorted(FOLD_WINDOW_DAYS))
+        raise ValueError(
+            f"no walk-forward windows for {timeframe!r}; expected one of {supported}"
+        ) from exc
+    per_day = bars_per_day(timeframe)
+    return WalkForwardConfig(
+        min_train_bars=per_day * warm_up_days,
+        test_period_bars=per_day * test_days,
+        train_period_bars=per_day * warm_up_days,
+    )
 
 
 def _fold_bounds(n_bars: int, cfg: WalkForwardConfig) -> list[tuple[int, int, int, int]]:

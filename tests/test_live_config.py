@@ -249,6 +249,21 @@ def test_a_run_without_a_config_keeps_the_project_defaults() -> None:
     assert backtest == BacktestConfig()
 
 
+def test_the_entry_timeframe_scales_the_sharpe_of_the_run() -> None:
+    """An M5 run reads 288 bars a day: the scale follows the entry tape, not the M15 default.
+
+    The Sharpe ratio of a run is per bar (:attr:`BacktestConfig.sharpe_bars_per_day`), so an M5
+    report scaled by 96 would understate every volatility it prints by ``sqrt(3)``.
+    """
+    parser = backtest_face.build_parser()
+
+    _, timeframe, _, backtest = common.live_inputs(parser.parse_args(["--timeframe", "M5"]))
+
+    assert timeframe == "M5"
+    assert backtest.sharpe_bars_per_day == 288
+    assert common.live_inputs(parser.parse_args(["--timeframe", "M15"]))[3] == BacktestConfig()
+
+
 def test_an_argument_wins_over_the_config() -> None:
     """The order of §7.19: what the caller typed, then the file, then the default of Э8'."""
     args = backtest_face.build_parser().parse_args(

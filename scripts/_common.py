@@ -45,7 +45,13 @@ from smc_zero.config import (
     RiskConfig,
     StrategyConfig,
 )
-from smc_zero.data_loader import AUTO_FORMAT, TIMESTAMP_COLUMN, load_csv, load_ohlcv
+from smc_zero.data_loader import (
+    AUTO_FORMAT,
+    TIMESTAMP_COLUMN,
+    bars_per_day,
+    load_csv,
+    load_ohlcv,
+)
 from smc_zero.optimizer.ranges import ParamValue, apply_params
 
 #: Where the loader's CSVs live, relative to the working directory (rule 6: ``./`` paths).
@@ -63,7 +69,8 @@ DEFAULT_MT5_DATA_DIR = Path.home() / "_data" / "mt5"
 #: The window of the shipped four-year tape (SPEC_SMC.md §7.10 п.62).
 DEFAULT_START = "2022-08-15"
 DEFAULT_END = "2026-09-22"
-#: The entry timeframe: the hierarchy trades M15 entries (D1 bias -> H1 structure -> M15 entry).
+#: The entry timeframe of the default hierarchy (D1 bias -> H1 structure -> M15 entry); the second
+#: hierarchy (H4 bias -> M15 structure -> M5 entry) names its own through a live config (§7.20).
 DEFAULT_TIMEFRAME = "M15"
 #: The symbol and the timeframe a run without arguments assumes.
 DEFAULT_SYMBOL = "EURUSD"
@@ -313,13 +320,20 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
     the caller typed none of them).  Without a config the result is the project defaults of Э8';
     with one, the three blocks of §7.19 fill the two dataclasses and a typed argument still wins.
     Both faces call this one function, so a rule about the file cannot hold in one of them only.
+
+    The effective entry timeframe also scales the run: ``sharpe_bars_per_day`` is set from
+    :func:`~smc_zero.data_loader.bars_per_day`, so an M5 run of the second hierarchy reads its 288
+    bars a day instead of the 96 of M15.  For the default M15 hierarchy the value is the dataclass
+    default and the returned config is unchanged.
     """
     cfg = load_config(args.config_path) if args.config_path else None
     symbol = resolve_selector(args.symbol, cfg, "symbol", DEFAULT_SYMBOL)
     timeframe = resolve_selector(args.timeframe, cfg, "timeframe", DEFAULT_TIMEFRAME)
+    scale = bars_per_day(timeframe)
     if cfg is None:
-        return symbol, timeframe, StrategyConfig(), BacktestConfig()
-    return symbol, timeframe, strategy_from_config(cfg), backtest_from_config(cfg)
+        return symbol, timeframe, StrategyConfig(), BacktestConfig(sharpe_bars_per_day=scale)
+    backtest = replace(backtest_from_config(cfg), sharpe_bars_per_day=scale)
+    return symbol, timeframe, strategy_from_config(cfg), backtest
 
 
 def add_config_argument(parser: argparse.ArgumentParser) -> None:

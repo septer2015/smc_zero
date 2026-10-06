@@ -33,7 +33,7 @@ import scripts._common as common
 import scripts.run_optimization as runner
 from smc_zero.backtester import FOLD_METRIC_FIELDS, aggregate_fold_metrics
 from smc_zero.backtester.engine import TRADE_COLUMNS
-from smc_zero.config import OptunaConfig, StrategyConfig
+from smc_zero.config import OptunaConfig, StrategyConfig, WalkForwardConfig
 from smc_zero.optimizer import FoldEvaluation, OptunaResult
 
 BARS = 300
@@ -295,4 +295,28 @@ def test_the_winner_is_reported_from_a_backtest_of_the_window(
     assert "initial capital" in text
     assert (folder / "trades.csv").read_text(encoding="utf-8").splitlines()[0] == ",".join(
         TRADE_COLUMNS
+    )
+
+
+def test_the_fold_windows_of_a_run_follow_its_entry_timeframe() -> None:
+    """The M5 tape of the second hierarchy folds on the 60 / 30 day windows of §7.20.
+
+    The M15 windows of §7.10 п.62 are 115 200 bars on a five minute tape - four times the bars of
+    the M15 run they were reasoned about - and would leave a 1.4 year M5 tape with three folds
+    instead of nine.  A count typed by the caller still wins over the windows of the timeframe.
+    """
+    m5 = runner.build_parser().parse_args(["--timeframe", "M5"])
+
+    config = runner._walk_forward_config(m5, "M5")
+
+    assert (config.min_train_bars, config.test_period_bars) == (288 * 60, 288 * 30)
+    assert config.train_period_bars == 288 * 60
+    # the M15 hierarchy keeps the windows it had
+    assert runner._walk_forward_config(runner.build_parser().parse_args([]), "M15") == (
+        WalkForwardConfig()
+    )
+    # a typed count outranks the windows of the timeframe, the rest keeps the timeframe's numbers
+    typed = runner.build_parser().parse_args(["--min-train-bars", "500", "--test-period-bars", "100"])
+    assert runner._walk_forward_config(typed, "M5") == WalkForwardConfig(
+        min_train_bars=500, test_period_bars=100, train_period_bars=288 * 60
     )

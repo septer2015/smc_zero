@@ -325,6 +325,32 @@ class DisplacementConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RunConfig:
+    """The ``run`` block of a live config (SPEC_SMC.md §7.20, В3-X): window, warm-up, counters.
+
+    ``start`` / ``end`` are ``YYYY-MM-DD`` words - the config layer never imports pandas - and name
+    the window a run covers.  ``warmup_days`` is how far *before* ``start`` the readable HTF tapes
+    are loaded, so the H4 / D1 legs of the second hierarchy are already warm when the window begins.
+    ``limit_valid_bars`` and ``max_bars_per_trade`` are the two engine counters of §7.9 and override
+    the :class:`BacktestConfig` defaults when they are named; ``None`` keeps the default.
+    """
+
+    start: str | None = None
+    end: str | None = None
+    warmup_days: int = 0
+    limit_valid_bars: int | None = None
+    max_bars_per_trade: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.warmup_days < 0:
+            raise ValueError("warmup_days must be >= 0")
+        if self.limit_valid_bars is not None and self.limit_valid_bars < 0:
+            raise ValueError("limit_valid_bars must be >= 0 or None")
+        if self.max_bars_per_trade is not None and self.max_bars_per_trade < 1:
+            raise ValueError("max_bars_per_trade must be >= 1 or None")
+
+
+@dataclass(frozen=True, slots=True)
 class StructureLayerConfig:
     """The structure layer of a working timeframe (SPEC_SMC.md §7.20).
 

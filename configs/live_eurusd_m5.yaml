@@ -1,0 +1,48 @@
+# Иерархия H4 -> M15 -> M5 (Э12, SPEC_SMC.md §7.20)
+# Вход M5, рабочая структура M15, bias H4 + D1 (решение Р1). D1 остаётся глобальным контекстом.
+# Период: 2025-05-06 .. 2026-09-22 (лента M5 покрывает только эти дни)
+# ВНИМАНИЕ: пипсовые пороги перенесены из M15-конфига и НЕ переоптимизированы на M5.
+# Часть M5-сигналов будет отклонена гейтами sl_realistic и spread_pct — это ожидаемо,
+# переоптимизация в следующем этапе (§7.20).
+
+symbol: EURUSD
+timeframe: M5
+hierarchy: H4_M15_M5
+
+strategy:
+  sweep_buffer_pip: 4
+  sl_buffer_pip: 10
+  min_fvg_pip: 1
+  fvg_lookback: 21
+  fvg_ready_bars: 6
+  max_fvg_age_bars: 9
+  signal_max_age_bars: 94
+  displacement:
+    atr_mult_min: 0.7453013223207354
+    body_frac_min: 0.44988154849338813
+  bias:
+    agreement: majority
+  take_profit:
+    min_tp_rr: 1.1220531901171544
+    rr_fallback: 1.6091050846893695
+
+broker:
+  spread_pip: 1.4
+  commission_per_lot_usd: 0.0
+  slippage_pip: 0.2
+  swap_long_pip: -0.70
+  swap_short_pip: 0.00
+  contract_size: 100000
+  pip_size: 0.0001
+  leverage: 40
+
+backtest:
+  initial_capital: 10000.0
+  lot: 0.1
+
+run:
+  start: 2025-05-06
+  end: 2026-09-22
+  warmup_days: 60
+  limit_valid_bars: 30
+  max_bars_per_trade: 1500

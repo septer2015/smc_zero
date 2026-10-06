@@ -67,6 +67,7 @@ from smc_zero.config import (
     BrokerSpec,
     DisplacementConfig,
     RiskConfig,
+    RunConfig,
     StrategyConfig,
     TimeframeConfig,
     TPConfig,
@@ -77,6 +78,8 @@ from smc_zero.strategy.intents import build_intents
 REPO = Path(__file__).resolve().parents[1]
 #: The config of the winner of Trial 42 - the file a live run reads (subtask 2.1).
 LIVE_CONFIG = REPO / "configs" / "live_eurusd_m15.yaml"
+#: The second hierarchy of Э12 (§7.20): M5 entry, M15 structure, H4 + D1 bias.
+M5_CONFIG = REPO / "configs" / "live_eurusd_m5.yaml"
 #: The first command of the guide: five days of the shipped tape.
 FIVE_DAYS = ("2022-08-15", "2022-08-20")
 #: The window that separates the defaults from the winner's numbers (see the module docstring).
@@ -333,6 +336,63 @@ def test_the_file_keeps_the_bias_knobs_it_may_set() -> None:
 
     assert strategy.bias.agreement == _hand_built_strategy().bias.agreement
     assert strategy.bias.timeframes == common.HIERARCHY_PRESETS["D1_H1_M15"].bias
+
+
+def test_the_run_block_sets_warmup_and_window_limits() -> None:
+    """The ``run`` block of §7.20 names the window, the warm-up and the two engine counters."""
+    cfg = common.load_config(M5_CONFIG)
+    run = common.run_from_config(cfg)
+    args = backtest_face.build_parser().parse_args([])
+
+    window = common.resolve_window(args, run)
+
+    assert run.warmup_days == 60
+    assert (window.start, window.end) == (
+        pd.Timestamp("2025-05-06", tz="UTC"),
+        pd.Timestamp("2026-09-22", tz="UTC"),
+    )
+    assert window.loaded_from == pd.Timestamp("2025-03-07", tz="UTC")
+    backtest = common.backtest_from_config(cfg, run)
+    assert backtest.limit_valid_bars == 30
+    assert backtest.max_bars_per_trade == 1500
+    # a file without the block keeps the shipped window of Э8' and no warm-up at all
+    fallback = common.resolve_window(backtest_face.build_parser().parse_args([]), RunConfig())
+    assert (fallback.start, fallback.end) == (
+        common.read_day(common.DEFAULT_START),
+        common.read_day(common.DEFAULT_END),
+    )
+    assert fallback.warmup_days == 0
+
+
+def test_an_argument_still_wins_over_the_run_block() -> None:
+    """The order of §7.19 holds for the window too: a typed day outranks the file's."""
+    args = backtest_face.build_parser().parse_args(["--start", "2025-06-01"])
+    run = common.run_from_config(common.load_config(M5_CONFIG))
+
+    window = common.resolve_window(args, run)
+
+    assert window.start == pd.Timestamp("2025-06-01", tz="UTC")
+    assert window.end == pd.Timestamp("2026-09-22", tz="UTC")
+
+
+def test_the_m5_config_loads_with_correct_bias_and_windows() -> None:
+    """The second hierarchy reads its file: M5 entry, M15 structure, H4 + D1 bias, 60 day warm-up."""
+    args = backtest_face.build_parser().parse_args(["--config-path", str(M5_CONFIG)])
+
+    symbol, timeframe, strategy, backtest = common.live_inputs(args)
+
+    assert (symbol, timeframe) == ("EURUSD", "M5")
+    assert strategy.bias.timeframes == ("H4", "D1")
+    assert strategy.fvg_ready_bars == 6
+    assert backtest.timeframes == TimeframeConfig(ltf="M5", mtf="M15", htf="H4")
+    assert backtest.sharpe_bars_per_day == 288
+    assert backtest.limit_valid_bars == 30
+    window = common.resolve_window(args)
+    assert window.warmup_days == 60
+    assert (window.start, window.end) == (
+        pd.Timestamp("2025-05-06", tz="UTC"),
+        pd.Timestamp("2026-09-22", tz="UTC"),
+    )
 
 
 def test_a_mismatch_between_timeframe_and_hierarchy_is_refused(tmp_path: Path) -> None:

@@ -30,7 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections.abc import Mapping
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,7 @@ from smc_zero.config import (
     BrokerSpec,
     InstrumentSpec,
     RiskConfig,
+    RunConfig,
     StrategyConfig,
     TimeframeConfig,
     preset_of,
@@ -84,7 +85,18 @@ DEFAULT_SYMBOL = "EURUSD"
 CONFIG_KEYS: tuple[str, ...] = ("symbol", "strategy", "broker", "backtest")
 #: The two knobs the ``backtest`` block of a live config may set: the capital of the run and the
 #: lot it trades.  Every other number of a run stays a project default (§7.19).
-RUN_KEYS: tuple[str, ...] = ("initial_capital", "lot")
+BACKTEST_KEYS: tuple[str, ...] = ("initial_capital", "lot")
+#: The optional ``run`` block of a live config (§7.20, В3-X): the window of the run, the warm-up the
+#: readable HTF tapes are loaded with and the two engine counters of §7.9.  A file without the block
+#: keeps the project window of Э8', and every key it names is applied over the defaults.
+RUN_BLOCK = "run"
+RUN_KEYS: tuple[str, ...] = (
+    "start",
+    "end",
+    "warmup_days",
+    "limit_valid_bars",
+    "max_bars_per_trade",
+)
 #: The optional key of a live config that names the entry hierarchy (SPEC_SMC.md §7.20).  It is not
 #: in :data:`CONFIG_KEYS`: a file without it keeps the D1 -> H1 -> M15 preset of Э8'.
 HIERARCHY_KEY = "hierarchy"
@@ -304,7 +316,7 @@ def broker_from_config(cfg: Mapping[str, Any]) -> BrokerSpec:
         raise ValueError(f"broker: {error}") from error
 
 
-def backtest_from_config(cfg: Mapping[str, Any]) -> BacktestConfig:
+def backtest_from_config(cfg: Mapping[str, Any], run: RunConfig | None = None) -> BacktestConfig:
     """Return the run of a live config: the ``backtest`` block over the account of ``broker``.
 
     ``initial_capital`` and ``lot`` are the two knobs a live config sets, and the lot lands in
@@ -312,21 +324,32 @@ def backtest_from_config(cfg: Mapping[str, Any]) -> BacktestConfig:
     the capital is the backtester's own start (the two answer different questions, §7.9).  The
     broker block is written into that same risk profile, which is the single home of the money
     (Э10'), so the engine, the report and the optimizer price the account of the file.
+
+    ``run`` is the optional ``run`` block (§7.20, В3-X): its two engine counters
+    (``limit_valid_bars``, ``max_bars_per_trade``) are applied over the defaults, and every other
+    key of that block is the window or the warm-up and is read by :func:`resolve_window`.
     """
     values = dict(block(cfg, "backtest"))
-    unknown = sorted(set(values) - set(RUN_KEYS))
+    unknown = sorted(set(values) - set(BACKTEST_KEYS))
     if unknown:
         raise ValueError(
             f"backtest: no such field(s) {', '.join(unknown)}: a live config sets "
-            f"{', '.join(RUN_KEYS)}"
+            f"{', '.join(BACKTEST_KEYS)}"
         )
+    settings = run_from_config(cfg) if run is None else run
     defaults = BacktestConfig()
     lot = float(values.get("lot", defaults.risk.lot))
     risk = RiskConfig(broker=broker_from_config(cfg), lot=lot)
+    counters = {
+        name: value
+        for name in ("limit_valid_bars", "max_bars_per_trade")
+        if (value := getattr(settings, name)) is not None
+    }
     return replace(
         defaults,
         risk=risk,
         initial_capital=float(values.get("initial_capital", defaults.initial_capital)),
+        **counters,
     )
 
 
@@ -426,6 +449,70 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
     return symbol, timeframe, strategy, backtest
 
 
+@dataclass(frozen=True, slots=True)
+class RunWindow:
+    """The window of a run: the two days and the warm-up of the readable tapes (§7.20).
+
+    ``loaded_from`` is the first day the readable HTF tapes are loaded from - ``start`` minus the
+    warm-up - and it is what the window validation of §7.20 (В3-У) compares with the first bar of a
+    tape: a run whose warm-up reaches past the data is refused instead of being handed a shorter
+    history than it asked for.
+    """
+
+    start: pd.Timestamp
+    end: pd.Timestamp
+    warmup_days: int = 0
+
+    @property
+    def loaded_from(self) -> pd.Timestamp:
+        """The first day the readable tapes are loaded from: ``start`` minus the warm-up."""
+        return self.start - pd.Timedelta(days=self.warmup_days)
+
+
+def run_from_config(cfg: Mapping[str, Any] | None) -> RunConfig:
+    """Return the ``run`` block of a live config, or the neutral :class:`RunConfig` without one.
+
+    The block is optional - the Э8' files do not carry it - and every key it names is checked against
+    :data:`RUN_KEYS`, so a typo is refused instead of being ignored (rule 5).  The values themselves
+    are validated by the dataclass (a negative warm-up, a zero ``max_bars_per_trade``).
+    """
+    if cfg is None or RUN_BLOCK not in cfg:
+        return RunConfig()
+    values = dict(block(cfg, RUN_BLOCK))
+    unknown = sorted(set(values) - set(RUN_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{RUN_BLOCK}: no such field(s) {', '.join(unknown)}: a run sets {', '.join(RUN_KEYS)}"
+        )
+    try:
+        return RunConfig(**values)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{RUN_BLOCK}: {error}") from error
+
+
+def resolve_window(args: argparse.Namespace, run: RunConfig | None = None) -> RunWindow:
+    """Return the window of a run: the argument, else the file's ``run`` block, else the default.
+
+    The order is the one of §7.19: what the caller typed wins over the file, and a run that names
+    neither keeps the shipped window of Э8'.  ``--start`` / ``--end`` default to ``None`` on purpose
+    (never to the project days), because such a default would outrank the file without the caller
+    ever typing it - the trap the pair of §7.19 has already taught.
+
+    ``run`` is the already read block; leaving it ``None`` reads ``--config-path`` here, so a caller
+    that has the block at hand pays for one read of the file and not two.
+    """
+    if run is None:
+        cfg = load_config(args.config_path) if args.config_path else None
+        run = run_from_config(cfg)
+    start = getattr(args, "start", None)
+    end = getattr(args, "end", None)
+    if start is None:
+        start = read_day(run.start) if run.start else read_day(DEFAULT_START)
+    if end is None:
+        end = read_day(run.end) if run.end else read_day(DEFAULT_END)
+    return RunWindow(start=start, end=end, warmup_days=run.warmup_days)
+
+
 def add_config_argument(parser: argparse.ArgumentParser) -> None:
     """Add ``--config-path``: the live YAML both faces take their numbers from (§7.19)."""
     parser.add_argument(
@@ -440,7 +527,9 @@ def add_window_arguments(parser: argparse.ArgumentParser) -> None:
 
     ``--symbol`` and ``--timeframe`` default to ``None`` on purpose and not to the project pair:
     with a ``--config-path`` the file names the traded pair, and a default would outrank it without
-    the caller ever typing it (Э8' default, §7.19 order).
+    the caller ever typing it (Э8' default, §7.19 order).  ``--start`` and ``--end`` default to
+    ``None`` for the same reason: the ``run`` block of the file may name the window, and the project
+    window of Э8' fills what neither names (:func:`resolve_window`).
     """
     parser.add_argument(
         "--symbol",
@@ -463,14 +552,14 @@ def add_window_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--start",
         type=read_day,
-        default=read_day(DEFAULT_START),
-        help="first day of the window, YYYY-MM-DD",
+        default=None,
+        help="first day of the window, YYYY-MM-DD (default: the run block, else 2022-08-15)",
     )
     parser.add_argument(
         "--end",
         type=read_day,
-        default=read_day(DEFAULT_END),
-        help="last day of the window, YYYY-MM-DD (included)",
+        default=None,
+        help="last day of the window, YYYY-MM-DD, included (default: the config's run block)",
     )
     parser.add_argument("--report-dir", default=str(REPORTS_DIR), help="report root, ./reports")
 

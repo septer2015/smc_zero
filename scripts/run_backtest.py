@@ -93,12 +93,13 @@ def run(args: argparse.Namespace) -> int:
     """Simulate the window of ``args`` with its config and write the report of the run."""
     try:
         symbol, timeframe, strategy, backtest = _common.live_inputs(args)
+        window = _common.resolve_window(args)
         tape = _common.load_windowed_tape(
-            symbol, timeframe, args.start, args.end, source=args.data_source
+            symbol, timeframe, window.start, window.end, source=args.data_source
         )
         instrument = _common.instrument_for(symbol)
         structure_timeframe, structure_frame = _common.working_frame(
-            symbol, backtest.timeframes, args.start, args.end, source=args.data_source
+            symbol, backtest.timeframes, window.start, window.end, source=args.data_source
         )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -127,7 +128,8 @@ def run(args: argparse.Namespace) -> int:
 
     summary = format_summary(result)
     folder = _common.report_folder(
-        args.report_dir, f"backtest_{_common.window_label(symbol, timeframe, args.start, args.end)}"
+        args.report_dir,
+        f"backtest_{_common.window_label(symbol, timeframe, window.start, window.end)}",
     )
     export_trades(result, folder, stem="trades")
     (folder / "summary.txt").write_text(summary + "\n", encoding="utf-8")

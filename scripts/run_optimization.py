@@ -203,6 +203,7 @@ def _report_payload(
     symbol: str,
     timeframe: str,
     tape: pd.DataFrame,
+    window: _common.RunWindow,
     walk_config: WalkForwardConfig,
     study_config: OptunaConfig,
     outcome: OptunaResult,
@@ -210,13 +211,15 @@ def _report_payload(
     """Return the payload of ``best_params.json``: the winner, its score and its fold aggregates.
 
     ``symbol`` and ``timeframe`` are the *effective* pair of the run - the arguments of the caller
-    if it typed them, else the config's (Э10'.2) - so the audit line names the tape the study read.
+    if it typed them, else the config's (Э10'.2) - so the audit line names the tape the study read;
+    ``window`` is the effective window (:func:`scripts._common.resolve_window`), for the same reason.
     """
     return {
         "symbol": symbol.upper(),
         "timeframe": timeframe.upper(),
-        "start": f"{args.start:%Y-%m-%d}",
-        "end": f"{args.end:%Y-%m-%d}",
+        "start": f"{window.start:%Y-%m-%d}",
+        "end": f"{window.end:%Y-%m-%d}",
+        "warmup_days": int(window.warmup_days),
         "bars": len(tape),
         "folds": len(outcome.best_evaluation.fold_metrics_test),
         "n_trials": int(study_config.n_trials),
@@ -240,12 +243,13 @@ def run(args: argparse.Namespace) -> int:
     """Search the parameters of ``args``, run the winner over the window and write its report."""
     try:
         symbol, timeframe, strategy, backtest = _common.live_inputs(args)
+        window = _common.resolve_window(args)
         tape = _common.load_windowed_tape(
-            symbol, timeframe, args.start, args.end, source=args.data_source
+            symbol, timeframe, window.start, window.end, source=args.data_source
         )
         instrument = _common.instrument_for(symbol)
         structure_timeframe, structure_frame = _common.working_frame(
-            symbol, backtest.timeframes, args.start, args.end, source=args.data_source
+            symbol, backtest.timeframes, window.start, window.end, source=args.data_source
         )
         walk_config = _walk_forward_config(args, timeframe)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)
@@ -255,7 +259,7 @@ def run(args: argparse.Namespace) -> int:
 
     if not split_walkforward(tape, walk_config):
         print(
-            f"error: {len(tape)} bars of {args.start:%Y-%m-%d} .. {args.end:%Y-%m-%d} "
+            f"error: {len(tape)} bars of {window.start:%Y-%m-%d} .. {window.end:%Y-%m-%d} "
             f"hold no fold: min_train_bars {walk_config.min_train_bars} + "
             f"test_period_bars {walk_config.test_period_bars} need more (SPEC_SMC.md §7.10 п.61)",
             file=sys.stderr,
@@ -306,11 +310,13 @@ def run(args: argparse.Namespace) -> int:
 
     folder = _common.report_folder(
         args.report_dir,
-        f"optimization_{_common.window_label(symbol, timeframe, args.start, args.end)}"
+        f"optimization_{_common.window_label(symbol, timeframe, window.start, window.end)}"
         f"_n{args.n_trials}",
     )
     summary = format_summary(result)
-    payload = _report_payload(args, symbol, timeframe, tape, walk_config, study_config, outcome)
+    payload = _report_payload(
+        args, symbol, timeframe, tape, window, walk_config, study_config, outcome
+    )
     export_trades(result, folder, stem="trades")
     (folder / "summary.txt").write_text(summary + "\n", encoding="utf-8")
     (folder / "best_params.json").write_text(

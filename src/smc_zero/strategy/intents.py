@@ -119,7 +119,7 @@ from smc_zero.indicators.levels import (
     retired_at,
 )
 from smc_zero.indicators.sessions import alfa_trading_mask, killzone_mask
-from smc_zero.indicators.structure import structure_breaks
+from smc_zero.indicators.structure import STRUCTURE_LAYER_COLUMNS, structure_breaks
 from smc_zero.strategy.base import TradeIntent, utc_stamps
 from smc_zero.strategy.take_profit import take_profit_for
 
@@ -240,6 +240,31 @@ def _entry_bars(ltf: pd.DataFrame) -> pd.DataFrame:
     bars = bars.copy()
     bars[TIMESTAMP_COLUMN] = _utc_stamps(bars, source="the entry frame")
     return bars.reset_index(drop=True)
+
+
+def _layer_arrays(
+    layer: pd.DataFrame, bars: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the three arrays of a recorded structure layer, checked against the entry bars.
+
+    ``layer`` is what :func:`smc_zero.indicators.structure.structure_layer` returns - the working
+    frame's break, its impulse and the *entry* bar the impulse becomes knowable at.  The chain
+    addresses ``bars`` positionally, so another length or a missing column would silently
+    mis-address every gate; both are refused instead of guessed.
+    """
+    missing = [column for column in STRUCTURE_LAYER_COLUMNS if column not in layer.columns]
+    if missing:
+        raise ValueError(f"structure is missing the {missing} column(s)")
+    if len(layer) != len(bars):
+        raise ValueError(
+            f"structure has {len(layer)} rows but the entry frame has {len(bars)}: "
+            "pass the layer built for this very frame (structure_layer)"
+        )
+    return (
+        layer["break_dir"].to_numpy(dtype="int8"),
+        layer["disp_ok"].to_numpy(dtype=bool),
+        layer["disp_known_at"].to_numpy(dtype="float64", na_value=np.nan),
+    )
 
 
 def _bias_direction(bars: pd.DataFrame, bias: pd.DataFrame) -> np.ndarray:
@@ -609,6 +634,8 @@ def build_intents(
     bias: pd.DataFrame,
     levels: pd.DataFrame,
     cfg: StrategyConfig | None = None,
+    *,
+    structure: pd.DataFrame | None = None,
 ) -> EntryChain:
     """Turn a closed M15 frame, the HTF bias and a level book into intents and a ledger.
 
@@ -629,6 +656,13 @@ def build_intents(
     produce no attempt at all and no ledger row, exactly as the skipping prefilter of Э4' made
     sure.  The sweep bar of an attempt, the counter-trend break, the gap and the stop are then
     range lookups and arithmetic over the whole instance.
+
+    ``structure`` is the optional layer of a working frame
+    (:func:`smc_zero.indicators.structure.structure_layer`, the H4 -> M15 -> M5 hierarchy of §7.20):
+    ``break_dir``, ``disp_ok`` and ``disp_known_at`` come from it instead of being measured on
+    ``ltf`` itself, and it must be the layer of *this very frame* - one row per entry bar, in the
+    entry order - or a ``ValueError``.  ``None`` keeps the v1 hierarchy, where the structure and the
+    entry share one tape.
     """
     config = StrategyConfig() if cfg is None else cfg
     _check_deferred(config)
@@ -660,15 +694,21 @@ def build_intents(
     tradable = alfa_trading_mask(stamps, config.session).to_numpy(dtype=bool) & killzone_mask(
         stamps, config.session
     ).to_numpy(dtype=bool)
-    breaks = structure_breaks(bars, config.bias.structure)
-    break_dir = breaks["break_dir"].to_numpy(dtype="int8")
+    # Gates (6) and (7) read the structure of the working frame.  A caller that hands in a recorded
+    # layer (:func:`smc_zero.indicators.structure.structure_layer`, §7.20) owns that choice: the
+    # layer already speaks in entry bars, so the chain only takes its three columns.  Without one
+    # the chain measures the entry frame itself - the v1 reading, bit for bit.
+    if structure is None:
+        breaks = structure_breaks(bars, config.bias.structure)
+        break_dir = breaks["break_dir"].to_numpy(dtype="int8")
+        impulse = displacement_gate(bars, breaks, config.displacement)
+        disp_ok = impulse["disp_ok"].to_numpy(dtype=bool)
+        disp_known = impulse["disp_known_at"].to_numpy(dtype="float64", na_value=np.nan)
+    else:
+        break_dir, disp_ok, disp_known = _layer_arrays(structure, bars)
     # Gate (6) reads the break of one direction only: an upper level needs a downward break.
     down_breaks = np.flatnonzero(break_dir == -1)
     up_breaks = np.flatnonzero(break_dir == 1)
-    # Gate (7): the impulse of the CHoCH break, read from its own ``disp_known_at`` (§7.8 п.40).
-    impulse = displacement_gate(bars, breaks, config.displacement)
-    disp_ok = impulse["disp_ok"].to_numpy(dtype=bool)
-    disp_known = impulse["disp_known_at"].to_numpy(dtype="float64", na_value=np.nan)
     gaps = fair_value_gaps(bars, replace(config.fvg, min_gap_size=config.min_fvg_pip * pip))
     bearish_gaps = np.flatnonzero(gaps["bearish"].to_numpy(dtype=bool))
     bullish_gaps = np.flatnonzero(gaps["bullish"].to_numpy(dtype=bool))

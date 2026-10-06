@@ -50,6 +50,7 @@ from smc_zero.indicators.levels import (
     PDH,
     PDL,
 )
+from smc_zero.indicators.structure import structure_layer
 from smc_zero.strategy.base import INTENT_COLUMNS, intents_frame
 from smc_zero.strategy.intents import (
     REASON_BIAS_SKIP,
@@ -188,20 +189,23 @@ def _chain(
     frame: pd.DataFrame | None = None,
     bias_frame: pd.DataFrame | None = None,
     bias_value: int = -1,
+    structure: pd.DataFrame | None = None,
     **cfg_kw,
 ) -> EntryChain:
     """Run the chain on the scenario with ``pip_size`` pinned and the kwargs overridden.
 
     The FX pip is part of the C7 risk profile (§7.8 п.37), so it is pinned there - one copy of
     the broker numbers (Э10': inside ``BrokerSpec``, never beside it), and a ``risk`` override of
-    the caller keeps it.
+    the caller keeps it.  ``structure`` is the optional working-frame layer of §7.20.
     """
     bars = _frame(rows) if frame is None else frame
     book = PDH_LEVEL if levels is None else levels
     markup = _bias(bars, bias_value) if bias_frame is None else bias_frame
     base_risk = cfg_kw.pop("risk", RiskConfig())
     risk = replace(base_risk, broker=replace(base_risk.broker, pip_size=PIP))
-    return build_intents(bars, markup, book, StrategyConfig(risk=risk, **cfg_kw))
+    return build_intents(
+        bars, markup, book, StrategyConfig(risk=risk, **cfg_kw), structure=structure
+    )
 
 
 def _pairs(chain: EntryChain) -> list[tuple[int, str]]:
@@ -247,6 +251,52 @@ def test_the_ready_delay_of_a_gap_is_a_knob_of_the_config() -> None:
 
     with pytest.raises(ValueError, match="fvg_ready_bars"):
         StrategyConfig(fvg_ready_bars=-1)
+
+
+def test_the_layer_of_the_entry_frame_answers_what_the_chain_computes_itself() -> None:
+    """A layer of the entry frame is read exactly as the v1 chain measures the same frame.
+
+    This is the bit-for-bit agreement of :func:`structure_layer` (its ``structure=None`` reading)
+    with the walk of the default hierarchy - the reason the second hierarchy cannot quietly change
+    the first one, where the structure and the entry share a single tape.
+    """
+    frame = _frame(_REVERSAL)
+    own = _chain(frame=frame)
+    handed = _chain(frame=frame, structure=structure_layer(frame))
+
+    assert handed.intents == own.intents
+    assert handed.rejections.equals(own.rejections)
+
+
+def test_the_chain_reads_the_recorded_layer_instead_of_its_own() -> None:
+    """A handed-in layer is read as it is: zeroing its break removes the setup (m3).
+
+    The bias, the levels and the tape stay the same, so a chain that measured the structure for
+    itself would still find the setup of bar 32; only a chain that *reads* the layer loses it.
+    """
+    frame = _frame(_REVERSAL)
+    silent = structure_layer(frame).assign(break_dir=0)
+
+    chain = _chain(frame=frame, structure=silent)
+
+    assert chain.intents == ()
+    assert _pairs(chain) == _ledger((tuple(range(26, 36)), REASON_CHOCH_NOT_FOUND))
+
+
+def test_a_structure_frame_with_wrong_length_is_refused() -> None:
+    """A layer of another length would mis-address every gate: it is refused, not trimmed."""
+    frame = _frame(_REVERSAL)
+
+    with pytest.raises(ValueError, match="rows"):
+        _chain(frame=frame, structure=structure_layer(frame).iloc[:-1])
+
+
+def test_a_structure_frame_missing_columns_is_refused() -> None:
+    """A layer without one of the three columns is refused by name instead of being half-read."""
+    frame = _frame(_REVERSAL)
+
+    with pytest.raises(ValueError, match="missing"):
+        _chain(frame=frame, structure=structure_layer(frame).drop(columns=["disp_ok"]))
 
 
 def test_the_reversal_setup_is_accepted_once_with_the_core_geometry() -> None:

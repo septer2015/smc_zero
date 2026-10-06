@@ -49,9 +49,10 @@ Two profiles make the runner serve both hierarchies without a second script:
   ``m5`` the narrowed five-knob space of §7.22, and ``auto`` (the default) reads the *entry
   timeframe* of the run - an M5 tape gets ``m5``, everything else keeps ``default``;
 * ``--score`` picks how a trial is ranked: ``default`` is the out-of-sample score of §7.11,
-  ``m5`` the trade-count score ``pf * min(1, trades / target)`` of §7.22 with the ``--target-trades``
-  / ``--min-trades`` numbers of :class:`~smc_zero.config.TradeTargetScore`, and ``auto`` follows
-  the same timeframe rule.
+  ``m5`` the pooled trade-count score ``pf_pool * min(1, trades / target)`` of §7.22 with the
+  numbers of :class:`~smc_zero.config.TradeTargetScore` (the ``--target-trades`` / ``--min-trades``
+  pair and the shipped density and pool gates of that dataclass), and ``auto`` follows the same
+  timeframe rule.
 
 If a ``--ranges`` profile names a knob the cache was built from, the run is refused before the study
 starts (the guard of :func:`~smc_zero.optimizer.cache_mismatches`), so a profile cannot silently
@@ -94,7 +95,7 @@ from smc_zero.optimizer import (
     build_tape_marks,
     degradation_factor,
     run_optimization,
-    trades_scaled_score,
+    trades_pool_scorer,
 )
 from smc_zero.strategy.intents import build_intents
 
@@ -171,15 +172,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _trade_target_scorer(args: argparse.Namespace) -> Scorer:
-    """Return the trade-count scorer of §7.22 with the targets of the command line.
+    """Return the pooled trade-count scorer of §7.22 with the targets of the command line.
 
-    The two counts are validated by :class:`~smc_zero.config.TradeTargetScore` before the study
-    starts, so a ``--target-trades 0`` is a ``ValueError`` and not a score that always saturates.
-    Binding them here keeps the study itself free of the numbers: :data:`Scorer` is a plain
-    function of the two fold tables, exactly like the out-of-sample score it replaces.
+    The counts are validated by :class:`~smc_zero.config.TradeTargetScore` before the study starts,
+    so a ``--target-trades 0`` is a ``ValueError`` and not a score that always saturates.  Binding
+    them here keeps the study itself free of the numbers: :data:`Scorer` is a plain function of the
+    trial's whole fold evaluation, and :func:`~smc_zero.optimizer.score.trades_pool_scorer` reads
+    the out-of-sample half of it - the same seam the out-of-sample score of §7.11 plugs into.  The
+    density and pool gates of the dataclass (``min_fold_trades``, ``min_valid_folds``, ``pf_cap``)
+    travel with it and are *not* command-line flags: they guard the reading itself, while the two
+    flags below choose the search budget (Э13.1).
     """
     targets = TradeTargetScore(target_trades=args.target_trades, min_trades=args.min_trades)
-    return partial(trades_scaled_score, cfg=targets)
+    return partial(trades_pool_scorer, cfg=targets)
 
 
 def _search_profile(
@@ -286,9 +291,11 @@ def _test_note(trial: Any) -> str:
 
     A real trial of a study records both aggregate tables as user attributes (``set_user_attr`` in
     the objective of §7.11), so the console can name what each rank was bought with: the trades the
-    out-of-sample folds carried, their profit factor and their win rate.  A stub trial carries no
-    attributes and the note stays empty - the table is a *reading* of the study, never a second
-    computation (rule 5).
+    out-of-sample folds carried, their *mean* profit factor and their mean win rate.  The mean is
+    labelled as such on purpose: under the pooled score of §7.22 it is not the number the rank was
+    bought with (that one is the pool of the dense folds, Э13.1), and a note that read as the score
+    would misname the study.  A stub trial carries no attributes and the note stays empty - the
+    table is a *reading* of the study, never a second computation (rule 5).
     """
     attributes = getattr(trial, "user_attrs", None)
     if not isinstance(attributes, Mapping):
@@ -298,7 +305,7 @@ def _test_note(trial: Any) -> str:
         return ""
     return (
         f"  test: trades {float(test['trades_total']):.0f}, "
-        f"pf {float(test.get('pf_mean', 0.0)):.3f}, "
+        f"pf_fold_mean {float(test.get('pf_mean', 0.0)):.3f}, "
         f"win {float(test.get('win_rate_mean', 0.0)):.1f}%"
     )
 

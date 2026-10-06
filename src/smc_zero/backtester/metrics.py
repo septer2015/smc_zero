@@ -13,7 +13,9 @@ recomputes.  Three decisions of this layer are pinned here:
 * **``pf`` is capped at ``cfg.pf_cap``** (prod's ``PF_CAP = 5.0``) inside the metric, so
   the published number can never come from a single outlier.  A run *without* losses has
   no profit factor at all: it is reported as the cap (prod returned ``999`` and capped it
-  at scoring time instead - see §7.9).
+  at scoring time instead - see §7.9).  The two sums behind it (``gross_win`` /
+  ``gross_loss``) are reported *uncapped*: the pooled score of §7.22 adds them over the
+  folds and divides once, which a per-fold capped ``pf`` cannot serve (§7.22 п.115).
 * **``sharpe`` is prod's scale** - the mean/σ of the *bar-to-bar* equity returns times
   ``sqrt(cfg.sharpe_bars_per_day)`` (96 M15 bars of a day) - not an annualisation over 252
   trading days.  The equity curve is flat between trades, so the series is prod's own.
@@ -61,6 +63,9 @@ def _empty_metrics(cfg: BacktestConfig) -> dict[str, float]:
         "profit": 0.0,
         "win_rate": 0.0,
         "pf": 0.0,
+        # The two sums behind ``pf``, uncapped: the pooled score of §7.22 reads them (§7.22 п.115).
+        "gross_win": 0.0,
+        "gross_loss": 0.0,
         "max_dd": 0.0,
         "sharpe": 0.0,
         "expected": 0.0,
@@ -118,9 +123,10 @@ def calc_metrics(
     wins = profits[profits > 0]
     losses = profits[profits < 0]
 
+    gross_win = float(wins.sum())
     gross_loss = float(abs(losses.sum()))
     # A run without losses has no finite profit factor: the cap is the honest report of it.
-    pf = min(float(wins.sum()) / gross_loss, config.pf_cap) if gross_loss else config.pf_cap
+    pf = min(gross_win / gross_loss, config.pf_cap) if gross_loss else config.pf_cap
 
     peak = np.maximum.accumulate(values)
     drawdown = (values - peak) / peak
@@ -144,6 +150,10 @@ def calc_metrics(
         "profit": round(float(profits.sum()), 2),
         "win_rate": round(len(wins) / len(trades) * 100.0, 2),
         "pf": round(pf, 3),
+        # The sums ``pf`` was built from, left *uncapped*: the pooled score of §7.22 adds the folds'
+        # gross wins and gross losses up before it divides, which the capped ``pf`` cannot serve.
+        "gross_win": round(gross_win, 2),
+        "gross_loss": round(gross_loss, 2),
         "max_dd": round(max_dd, 2),
         "sharpe": round(sharpe, 3),
         "expected": round(float(np.mean(profits)), 2),

@@ -35,7 +35,7 @@ The mutations the layer is one line away from, and the test each one must break:
   :func:`test_the_objective_honours_a_narrowed_search_space`.
 * m8 "drop the trade-count floor of §7.22" (``min_trades`` ignored) - a walk-forward of four trades
   outranks one of forty by its profit factor alone, i.e. the study optimizes noise; breaks
-  :func:`test_the_trade_count_score_is_flat_below_its_floor`.
+  :func:`test_the_trade_count_score_is_flat_below_its_floor_and_needs_the_fold_sums`.
 * m9 "hand the chain the raw cut of the structure layer" (``_fold_structure`` reduced to
   ``structure.loc[bars.index]``, or the builder forgetting to call it) - ``disp_known_at`` keeps
   the positions of the whole tape inside a fold that starts at zero, so the gate
@@ -43,6 +43,18 @@ The mutations the layer is one line away from, and the test each one must break:
   live M5 tape: nine folds, zero trades each, against twelve trades of the whole-window run); breaks
   :func:`test_a_fold_layer_is_rebased_on_its_own_positions` and
   :func:`test_the_fold_builder_rebases_the_layer_it_hands_to_the_chain`.
+* m10 "average the per-fold profit factors instead of pooling them" (``trades_scaled_score``
+  divides a mean of the folds rather than their gross wins over their gross losses, i.e. the reading
+  of Э13) - the first M5 study ranked a *losing* parameter set first that way, because one fold of
+  four trades with a perfect win rate is capped at ``5.0`` and lifts the mean; breaks
+  :func:`test_the_m5_score_rejects_a_negative_profit_oos_set` and
+  :func:`test_the_m5_winner_is_now_consistent_with_pool_metrics`.
+* m11 "pool the thin folds back in" (the ``min_fold_trades`` gate dropped, or the density read on
+  the aggregate) - a one-trade fold with an ideal profit factor moves the pool of a fourteen-trade
+  one; breaks :func:`test_the_m5_score_ignores_thin_folds_below_three_trades`.
+* m12 "read a pool of two or three folds" (the ``min_valid_folds`` gate dropped) - the score is
+  read on a sample the stage itself calls statistically empty (nine folds of 1.4 years, §7.22
+  п.120); breaks :func:`test_the_m5_score_requires_minimum_valid_folds`.
 """
 
 from __future__ import annotations
@@ -69,10 +81,12 @@ from smc_zero.optimizer import (
     degradation_factor,
     drawdown_factor,
     make_objective,
+    pool_profit_factor,
     resolve_path,
     run_optimization,
     score_from_aggregates,
     suggest_params,
+    trades_pool_scorer,
     trades_scaled_score,
 )
 from smc_zero.optimizer.optimize import _fold_structure, _intents_fn
@@ -536,18 +550,28 @@ def test_a_run_refuses_a_stale_cache_before_creating_its_study() -> None:
     assert created == []
 
 
-#: The two aggregate tables of the trade-count example of §7.22: a walk-forward whose test folds
-#: carried 20 trades at a profit factor of 2.0, under the shipped target of 25 and floor of 10.
-TRADES_TEST = {"pf_mean": 2.0, "trades_total": 20.0}
+def _pool_folds(
+    count: int, trades: int, gross_win: float, gross_loss: float
+) -> list[dict[str, float]]:
+    """Return ``count`` identical dense fold tables for the pooled score of §7.22."""
+    return [
+        {
+            "trades": trades,
+            "profit": gross_win - gross_loss,
+            "gross_win": gross_win,
+            "gross_loss": gross_loss,
+        }
+        for _ in range(count)
+    ]
 
 
-def test_the_trade_count_score_scales_the_profit_factor_by_the_trade_share() -> None:
-    """Below the target the score is ``pf * trades / target``; at the target it is the pf itself."""
+def test_the_trade_count_score_scales_the_pooled_profit_factor_by_the_trade_share() -> None:
+    """Below the target the score is ``pf_pool * trades / target``; at the target it is the pf."""
     cfg = TradeTargetScore()
 
-    below = trades_scaled_score({}, TRADES_TEST, cfg)
-    at_target = trades_scaled_score({}, {"pf_mean": 2.0, "trades_total": 25.0}, cfg)
-    above = trades_scaled_score({}, {"pf_mean": 2.0, "trades_total": 60.0}, cfg)
+    below = trades_scaled_score(_pool_folds(5, 4, 40.0, 20.0), cfg)
+    at_target = trades_scaled_score(_pool_folds(5, 5, 40.0, 20.0), cfg)
+    above = trades_scaled_score(_pool_folds(5, 8, 40.0, 20.0), cfg)
 
     assert below == pytest.approx(2.0 * 20.0 / 25.0)
     assert at_target == pytest.approx(2.0)
@@ -555,27 +579,108 @@ def test_the_trade_count_score_scales_the_profit_factor_by_the_trade_share() -> 
     assert above == pytest.approx(2.0)
 
 
-def test_the_trade_count_score_is_flat_below_its_floor_and_on_a_flat_edge() -> None:
-    """Fewer trades than the floor scores zero whatever the profit factor says (m8)."""
-    cfg = TradeTargetScore()
+def test_the_trade_count_score_is_flat_below_its_floor_and_needs_the_fold_sums() -> None:
+    """Fewer trades than the floor scores zero whatever the pool says (m8)."""
+    cfg = TradeTargetScore(min_valid_folds=2)
 
     assert cfg.min_trades == 10
-    assert trades_scaled_score({}, {"pf_mean": 9.0, "trades_total": 9.0}, cfg) == 0.0
-    # A test window whose folds never made a profit factor (no trade, or no win) scores zero as well.
-    assert trades_scaled_score({}, {"pf_mean": 0.0, "trades_total": 30.0}, cfg) == 0.0
+    # Two dense folds carry six trades: below the floor of ten, whatever their profit factor is.
+    assert trades_scaled_score(_pool_folds(2, 3, 9.0, 0.0), cfg) == 0.0
+    # A pool that never made a win has no profit factor at all: a flat zero as well.
+    assert trades_scaled_score(_pool_folds(5, 5, 0.0, 25.0), TradeTargetScore()) == 0.0
+    # The aggregate table of §7.11 is not a fold table: the pooled score names what it needs.
+    with pytest.raises(ValueError, match="gross_win"):
+        trades_scaled_score([{"trades": 20, "profit": 1.0}] * 5, TradeTargetScore())
 
 
-def test_the_trade_count_score_reads_the_test_half_and_needs_the_total() -> None:
-    """The train table is part of the shared signature and is not read; the sum is required."""
-    cfg = TradeTargetScore(target_trades=10, min_trades=1)
+def test_the_trade_count_score_reads_only_the_out_of_sample_folds_of_the_evaluation() -> None:
+    """The ``Scorer`` seam hands the whole evaluation over; the pooled score reads its test half."""
+    cfg = TradeTargetScore()
+    folds = _pool_folds(5, 5, 40.0, 20.0)
+    evaluation = SimpleNamespace(
+        fold_metrics_train=[{"trades": 1, "profit": 99.0, "gross_win": 99.0, "gross_loss": 0.0}],
+        fold_metrics_test=folds,
+    )
 
-    # A rich *train* window changes nothing: this score has no decay gate (unlike §7.11).
-    assert trades_scaled_score(
-        {"pf_mean": 99.0, "trades_total": 1.0}, {"pf_mean": 1.5, "trades_total": 10.0}, cfg
-    ) == pytest.approx(1.5)
-    # The mean of the folds is not the sample size of the period the score is read on.
-    with pytest.raises(ValueError, match="trades_total"):
-        trades_scaled_score({}, {"pf_mean": 2.0, "trades_mean": 4.0}, cfg)
+    assert trades_pool_scorer(evaluation, cfg) == pytest.approx(2.0)
+
+
+def test_the_m5_score_rejects_a_negative_profit_oos_set() -> None:
+    """A pool with a fine mean profit factor but no money in it scores a flat zero (m10)."""
+    capped = _pool_folds(2, 5, 50.0, 10.0)  # a profit factor of 5.0 in both folds, +40 each
+    bleeding = _pool_folds(3, 5, 1.0, 100.0)  # a profit factor of 0.01 in all three, -99 each
+    pool = capped + bleeding
+
+    # The old reading averaged the per-fold profit factors (capped at 5.0): that mean is above one...
+    assert (5.0 + 5.0 + 0.01 * 3) / len(pool) > 1.0
+    # ... while the pool those folds traded lost money, so the pooled score is a flat zero.
+    assert sum(table["profit"] for table in pool) < 0.0
+    assert trades_scaled_score(pool, TradeTargetScore()) == 0.0
+
+
+def test_the_m5_score_ignores_thin_folds_below_three_trades() -> None:
+    """A one-trade fold never enters the pool: the aggregate is the dense folds' alone (m11)."""
+    thin = _pool_folds(2, 1, 5.0, 0.0)  # an ideal profit factor on a single trade, ignored
+    dense = _pool_folds(1, 10, 12.0, 10.0)  # a profit factor of 1.2 on ten trades
+    cfg = TradeTargetScore(min_valid_folds=1, min_trades=1)
+
+    assert pool_profit_factor(dense) == pytest.approx(1.2)
+    assert trades_scaled_score(dense + thin, cfg) == pytest.approx(1.2 * 10.0 / 25.0)
+    assert trades_scaled_score(dense, cfg) == pytest.approx(1.2 * 10.0 / 25.0)
+    # The gate is what keeps them out: pooled without it, the two one-trade folds lift the factor.
+    assert pool_profit_factor(dense + thin) == pytest.approx(2.2)
+
+
+def test_the_m5_score_requires_minimum_valid_folds() -> None:
+    """Fewer dense folds than the minimum is not a pool: the score is a flat zero (m12)."""
+    cfg = TradeTargetScore()
+
+    assert cfg.min_valid_folds == 5
+    assert trades_scaled_score(_pool_folds(4, 5, 40.0, 20.0), cfg) == 0.0
+    assert trades_scaled_score(_pool_folds(5, 5, 40.0, 20.0), cfg) == pytest.approx(2.0)
+
+
+#: The nine out-of-sample folds of trial #6 of the 100-trial M5 run of 2026-10-06, as the run
+#: reported them (``fold_metrics.csv`` of that report): ``(trades, profit, pf)`` of every fold.  Four
+#: folds are dense (``>= 3`` trades) and their profits sum to ``-11.30``, while the old
+#: fold-averaged score of §7.22 ranked this trial first with ``1.0304`` (Э13.1).
+E13_WINNER_FOLDS: tuple[tuple[int, float, float], ...] = (
+    (1, -31.6, 0.0),
+    (2, 8.2, 1.321),
+    (0, 0.0, 0.0),
+    (5, -113.45, 0.0),
+    (1, -13.4, 0.0),
+    (4, 98.9, 5.0),
+    (3, -15.0, 0.639),
+    (5, 18.25, 1.303),
+    (2, 17.2, 1.798),
+)
+
+
+def _fold_from_pf(trades: int, profit: float, pf: float) -> dict[str, float]:
+    """Return a fold table with the two sums behind ``pf`` (``pf <= 0`` is a fold without a win)."""
+    if pf <= 0.0:
+        return {"trades": trades, "profit": profit, "gross_win": 0.0, "gross_loss": abs(profit)}
+    gross_loss = profit / (pf - 1.0)
+    return {
+        "trades": trades,
+        "profit": profit,
+        "gross_win": gross_loss * pf,
+        "gross_loss": gross_loss,
+    }
+
+
+def test_the_m5_winner_is_now_consistent_with_pool_metrics() -> None:
+    """The trial the old score ranked first is a flat zero under the pooled reading (m10 / m12)."""
+    folds = [_fold_from_pf(trades, profit, pf) for trades, profit, pf in E13_WINNER_FOLDS]
+    dense = [table for table in folds if table["trades"] >= 3]
+
+    # Four of the nine folds are dense - below the minimum of five, so there is no pool to read.
+    assert len(dense) == 4
+    assert trades_scaled_score(folds, TradeTargetScore()) == 0.0
+    # Even a relaxed density minimum does not save the trial: the dense folds lost money together.
+    assert sum(table["profit"] for table in dense) == pytest.approx(-11.30)
+    assert trades_scaled_score(folds, TradeTargetScore(min_valid_folds=1)) == 0.0
 
 
 def test_the_objective_honours_a_narrowed_search_space() -> None:
@@ -606,11 +711,11 @@ def test_the_objective_honours_a_narrowed_search_space() -> None:
 
 def test_a_custom_scorer_ranks_the_trial_instead_of_the_out_of_sample_one() -> None:
     """The ``score`` seam replaces the reading of the walk-forward and nothing else."""
-    seen: list[tuple[object, object]] = []
+    seen: list[FoldEvaluation] = []
 
-    def scorer(train: object, test: object) -> float:
-        """Record the two tables and answer a fixed number."""
-        seen.append((train, test))
+    def scorer(evaluation: FoldEvaluation) -> float:
+        """Record the evaluation and answer a fixed number."""
+        seen.append(evaluation)
         return 4.25
 
     evaluator = _RecordingEvaluator()
@@ -619,7 +724,7 @@ def test_a_custom_scorer_ranks_the_trial_instead_of_the_out_of_sample_one() -> N
     score = objective(_StubTrial())
 
     assert score == pytest.approx(4.25)
-    assert seen == [(TRAIN, TEST)]
+    assert [item.test_aggregated for item in seen] == [TEST]
     assert len(evaluator.configs) == 1
 
 

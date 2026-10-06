@@ -32,17 +32,26 @@ The edge rules of the factors (a losing train window has no edge to decay, a los
 window cannot flip the sign of the ratio, a curve that never drew down is not rewarded)
 are stated on the functions below and pinned by tests.
 
-The module is a pair of pure functions over ``dict`` tables: it knows nothing about
-optuna, the engine or the strategy, so the formula can be read, argued about and tested
-on numbers a reader can redo on paper.
+The score of the *second* hierarchy is the other side of the same seam and is documented on
+:func:`trades_scaled_score`: it ranks by the **pooled** profit factor of the dense out-of-sample
+folds times a trade-count factor (SPEC_SMC.md §7.22, ред. Э13.1).  The first M5 study showed why a
+per-fold mean cannot play that role: a fold of four trades with a perfect win rate is capped at
+``5.0`` and lifts the *mean* of a losing study, while the same trades read as one pool lose money.
+The pooled reading sums the folds' gross wins and gross losses and divides once, and it refuses to
+read a period of too few dense folds at all.
+
+The module is a family of pure functions over ``dict`` tables and fold sequences: it knows nothing
+about optuna, the engine or the strategy, so the formula can be read, argued about and tested on
+numbers a reader can redo on paper.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import Protocol
 
-from smc_zero.config import OptunaConfig, TradeTargetScore
+from smc_zero.config import DEFAULT_SCORE_PF_CAP, OptunaConfig, TradeTargetScore
 
 
 def _metric(table: Mapping[str, float], key: str) -> float:
@@ -148,53 +157,122 @@ def score_from_aggregates(
     return leading * profit * drawdown * decay
 
 
-def trades_scaled_score(
-    train_aggregated: Mapping[str, float],
-    test_aggregated: Mapping[str, float],
+#: The fields a fold table must carry for the pooled reading of §7.22: the count of trades, the
+#: profit of the fold and the two *uncapped* sums behind its profit factor
+#: (:func:`~smc_zero.backtester.metrics.calc_metrics`).
+POOL_FOLD_FIELDS: tuple[str, ...] = ("trades", "profit", "gross_win", "gross_loss")
+
+
+class PoolEvaluation(Protocol):
+    """The slice of a fold evaluation the pooled score reads: its out-of-sample fold tables.
+
+    The score is a pure function of the folds, and the ``Scorer`` seam of §7.11 hands it the whole
+    evaluation of a trial - :class:`~smc_zero.optimizer.optimize.FoldEvaluation` satisfies this
+    protocol by carrying ``fold_metrics_test``.  The protocol stands here instead of an import
+    because ``optimizer.optimize`` imports this module and never the reverse.
+    """
+
+    fold_metrics_test: Sequence[Mapping[str, float]]
+
+
+def pool_profit_factor(
+    folds: Sequence[Mapping[str, float]],
+    pf_cap: float = DEFAULT_SCORE_PF_CAP,
+) -> float:
+    """Return the profit factor of the *pool* of ``folds``: their gross wins over their gross losses.
+
+    This is the number the first M5 study should have ranked by (Э13.1).  A per-fold profit factor
+    is a ratio of two small samples, and its arithmetic mean over nine folds is dominated by
+    whichever fold happened to hold four trades: the winner of that study was a *losing* parameter
+    set whose one fold of four winning trades was capped at ``5.0``.  Adding the folds' gross wins
+    and gross losses up first and dividing once reads the same trades as *one* out-of-sample period,
+    which is what the parameter set would actually have traded.
+
+    A pool without a single loss has no finite profit factor and is reported as ``pf_cap`` - the
+    same edge rule the Э5' metric applies to a single run.  Every table must carry the sums of
+    :data:`POOL_FOLD_FIELDS`, or :func:`_metric` raises naming the miss instead of scoring an
+    invented number.
+    """
+    gross_win = sum(_metric(table, "gross_win") for table in folds)
+    gross_loss = sum(_metric(table, "gross_loss") for table in folds)
+    if gross_loss <= 0.0:
+        return pf_cap
+    return min(gross_win / gross_loss, pf_cap)
+
+
+def trades_pool_scorer(
+    evaluation: PoolEvaluation,
     cfg: TradeTargetScore | None = None,
 ) -> float:
-    """Return the trade-target score of the second hierarchy: ``pf * min(1, trades / target)``.
+    """Adapt :func:`trades_scaled_score` to the ``Scorer`` seam: score the pool of the OOS folds.
+
+    ``make_objective`` / ``run_optimization`` rank a trial with a ``Scorer``, which receives the
+    whole fold evaluation of one parameter set (§7.11).  The pooled score of §7.22 reads the
+    out-of-sample half of that evaluation and nothing else, so this one line is the whole adapter -
+    :func:`trades_scaled_score` itself stays a pure function of fold tables.
+    """
+    return trades_scaled_score(evaluation.fold_metrics_test, cfg)
+
+
+def trades_scaled_score(
+    folds: Sequence[Mapping[str, float]],
+    cfg: TradeTargetScore | None = None,
+) -> float:
+    """Return the trade-target score of the second hierarchy over the *pool* of ``folds``.
 
     The default score of §7.11 maximises a *ratio* (Sharpe, then profit) and is blind to how many
     trades produced it - a study of a five minute tape would then happily rank a parameter set
-    whose whole out-of-sample period carried four trades.  This score ranks the same walk-forward
-    by how *often* the edge showed up, which is what the second hierarchy needs (SPEC_SMC.md §7.22):
+    whose whole out-of-sample period carried four trades.  This score ranks the same walk-forward by
+    how *often* the edge showed up, which is what the second hierarchy needs (SPEC_SMC.md §7.22):
 
-        score = pf_mean(test) * min(1, trades_total(test) / target_trades)
-              = 0                                        if trades_total(test) < min_trades
+        valid = [fold for fold in folds if fold.trades >= min_fold_trades]
+        score = pf_pool(valid) * min(1, trades(valid) / target_trades)
+              = 0                                          if len(valid) < min_valid_folds
+              = 0                                          if profit(valid) <= 0
+              = 0                                          if trades(valid) < min_trades
 
     The factors:
 
-    * ``pf_mean(test)`` - the profit factor of the out-of-sample folds, read through and never
-      recomputed.  The profit factor is the headline here and not the Sharpe: an edge that shows up
-      more often with the same win/loss size moves neither the win rate nor the average, but it
-      does move the product of gross profit and gross loss.
-    * ``min(1, trades_total / target_trades)`` - the trade-count factor: it *caps* at one, so a
+    * the **density gate** - only a fold that carried at least ``min_fold_trades`` trades enters the
+      pool.  A fold of one or two trades is a reading of noise, and the first M5 study paid for
+      learning it: its winner's top rank was bought by a single fold of four trades whose profit
+      factor the metric capped at ``5.0`` (Э13.1);
+    * ``pf_pool(valid)`` - the pooled profit factor of the dense folds
+      (:func:`pool_profit_factor`).  It is a ratio of *sums*, never an average of ratios: the mean
+      of the folds can be lifted by one small fold, the pool cannot, because it reads the same
+      trades as one out-of-sample period (Э13.1);
+    * ``min(1, trades(valid) / target_trades)`` - the trade-count factor: it *caps* at one, so a
       parameter set is never rewarded for opening trades for their own sake past the target.  The
-      total is the sum over the folds (``trades_total`` of
-      :func:`~smc_zero.backtester.walkforward.aggregate_fold_metrics`), because the target is a
-      statement about the whole out-of-sample period and not about one 30 day fold.
-    * the ``min_trades`` floor returns a flat zero *before* the factors are multiplied, so a study
-      cannot buy rank with a profit factor computed on a handful of trades - the same shape of
-      guard as the ``profit_mean(test) <= 0`` of :func:`score_from_aggregates`, and for the same
-      reason: ranking noise is worse than ranking nothing.
+      count is the sum over the dense folds, because the target is a statement about the whole
+      out-of-sample period and not about one fold;
+    * the ``min_valid_folds`` gate returns a flat zero *before* anything is pooled: a "pool" of two
+      or three folds is the artifact this score exists to remove, and a study must not prefer a
+      parameter set measured on the fewest folds (Э13.1).  The ``min_trades`` and ``profit <= 0``
+      gates are the same shape of guard as the ``profit_mean(test) <= 0`` of
+      :func:`score_from_aggregates`: a period that lost money scores the flat zero of the bottom,
+      never a magnitude.
 
-    ``train_aggregated`` is part of the signature every scorer of a study shares and is
-    deliberately **not read**: this score has no OOS decay gate - it is the honest "how much of
-    the period did you trade, and how well" reading, and asking it for the fit ratio would punish
-    a parameter set for an in-sample window this hierarchy is not about.  A scorer that does weigh
-    the past is :func:`score_from_aggregates` with its ``penalty_power``.
+    Only the out-of-sample folds are read, and only through the sums of :data:`POOL_FOLD_FIELDS`:
+    this score has no OOS decay gate - it is the honest "how much of the period did you trade, and
+    how well" reading, and asking it for the fit ratio would punish a parameter set for an
+    in-sample window this hierarchy is not about.  A scorer that does weigh the past is
+    :func:`score_from_aggregates` with its ``penalty_power``; the ``Scorer``-shaped entry point of
+    this score is :func:`trades_pool_scorer`.
 
-    ``cfg`` is :class:`~smc_zero.config.TradeTargetScore`: ``target_trades`` (the count the factor
-    reaches one at) and ``min_trades`` (below which the score is a flat zero).  A table missing
-    ``pf_mean`` / ``trades_total`` - or carrying a non-finite number - raises ``ValueError``,
-    exactly as in :func:`score_from_aggregates`.
+    ``cfg`` is :class:`~smc_zero.config.TradeTargetScore`: ``min_fold_trades`` (the count that makes
+    a fold dense enough to enter the pool), ``min_valid_folds`` (how many dense folds the pool needs
+    at all), ``target_trades`` (the count the factor reaches one at), ``min_trades`` (below which the
+    score is a flat zero) and ``pf_cap`` (the cap of the pooled factor).  A table missing a field of
+    :data:`POOL_FOLD_FIELDS` - or carrying a non-finite number - raises ``ValueError``, exactly as in
+    :func:`score_from_aggregates`.
     """
     config = TradeTargetScore() if cfg is None else cfg
-    trades = _metric(test_aggregated, "trades_total")
+    valid = [table for table in folds if _metric(table, "trades") >= config.min_fold_trades]
+    if len(valid) < config.min_valid_folds:
+        return 0.0
+    if sum(_metric(table, "profit") for table in valid) <= 0.0:
+        return 0.0
+    trades = sum(_metric(table, "trades") for table in valid)
     if trades < config.min_trades:
         return 0.0
-    profit_factor = _metric(test_aggregated, "pf_mean")
-    if profit_factor <= 0.0:
-        return 0.0
-    return profit_factor * min(trades / config.target_trades, 1.0)
+    return pool_profit_factor(valid, config.pf_cap) * min(trades / config.target_trades, 1.0)

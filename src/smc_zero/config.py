@@ -1246,22 +1246,35 @@ class OptunaConfig:
 
 
 #: The shipped targets of the trade-count score of §7.22: the count the factor of
-#: :func:`smc_zero.optimizer.score.trades_scaled_score` saturates at, and the floor below which that
-#: score is a flat zero.  They are module constants and not only dataclass defaults because the two
-#: command lines of the M5 study name them as ``--target-trades`` / ``--min-trades``, and a help
-#: string that repeated the numbers would be a second copy of a trading decision (rule 5).
+#: :func:`smc_zero.optimizer.score.trades_scaled_score` saturates at, the floor below which that
+#: score is a flat zero, the trade count that makes a *fold* dense enough to enter the pool, the
+#: number of dense folds the pool needs at all, and the cap of the pooled profit factor.  They are
+#: module constants and not only dataclass defaults because the two command lines of the M5 study
+#: name the first pair as ``--target-trades`` / ``--min-trades``, and a help string that repeated
+#: the numbers would be a second copy of a trading decision (rule 5).
 DEFAULT_TARGET_TRADES = 25
 DEFAULT_MIN_TRADES = 10
+#: A fold of fewer trades than this never enters the pool of §7.22: its profit factor is taken on
+#: too small a sample to move the aggregate (Э13.1).
+DEFAULT_MIN_FOLD_TRADES = 3
+#: The number of dense folds a pool needs before it is read at all: below it the score is a flat
+#: zero, because averaging a couple of folds is the artifact the Э13.1 fix removes (Э13.1).
+DEFAULT_MIN_VALID_FOLDS = 5
+#: The cap of the *pooled* profit factor.  It guards the division of the pool: a pool whose gross
+#: loss is nearly zero divides into a huge number, and an uncapped one would outrank every honest
+#: parameter set (Э13.1).
+DEFAULT_SCORE_PF_CAP = 10.0
 
 
 @dataclass(frozen=True, slots=True)
 class TradeTargetScore:
-    """The two numbers of the trade-target score of the second hierarchy (SPEC_SMC.md §7.22).
+    """The numbers of the trade-count score of the second hierarchy (SPEC_SMC.md §7.22).
 
-    The score of :func:`smc_zero.optimizer.score.trades_scaled_score` ranks a parameter set by
-    the profit factor of its out-of-sample folds, scaled by how many trades those folds carried
-    relative to a target.  Both numbers are a *search decision* and not a code one, so they live
-    here and not in the score function:
+    The score of :func:`smc_zero.optimizer.score.trades_scaled_score` ranks a parameter set by the
+    *pooled* profit factor of its dense out-of-sample folds - the gross wins of every dense fold
+    over their gross losses - scaled by how many trades those folds carried relative to a target.
+    Every number is a *search decision* and not a code one, so they live here and not in the score
+    function:
 
     * ``target_trades`` - how many trades the whole out-of-sample period should carry before the
       count factor saturates at one.  The shipped 25 is the middle of the 25 - 40 trades the M5
@@ -1269,15 +1282,31 @@ class TradeTargetScore:
       parameter set is not rewarded for opening trades past the target;
     * ``min_trades`` - the floor below which the score is a flat zero whatever the profit factor
       says.  The shipped 10 is a fifth of the baseline run (12 trades) and the smallest sample a
-      profit factor of this hierarchy has been read on, so a study cannot win on noise.
+      profit factor of this hierarchy has been read on, so a study cannot win on noise;
+    * ``min_fold_trades`` - the trade count a fold needs to enter the pool.  A fold of one or two
+      trades says nothing about the parameter set, and the first M5 run proved how much it can
+      invent: a fold of four trades with a perfect win rate lifted the *mean* profit factor of a
+      losing study to its top (Э13.1);
+    * ``min_valid_folds`` - how many dense folds the pool needs.  Below it the score is a flat
+      zero: the period is simply too short to read a profit factor on, and a study must not
+      prefer a parameter set because it was measured on the fewest folds (Э13.1);
+    * ``pf_cap`` - the cap of the pooled profit factor.  It is *not* the ``pf_cap`` of
+      :class:`~smc_zero.config.BacktestConfig` (5.0, the cap of a single run's metric): the pool
+      adds many folds up, and a pool whose gross loss is a few cents would otherwise divide into
+      a number no honest parameter set can beat.
 
-    Both are integers and both are validated: a target the floor exceeds is a contradiction (every
-    trial would score zero), and a floor of zero would let a walk-forward that never traded win by
-    a profit factor of ``0.0`` - which is why ``min_trades`` is ``>= 1``.
+    All are validated: a target the floor exceeds is a contradiction (every trial would score
+    zero), a floor of zero would let a walk-forward that never traded win by a profit factor of
+    ``0.0``, a density of zero would pool the noise back in, and a pool cap below one would make
+    every profitable set score below one (which is why ``min_trades >= 1``, ``min_fold_trades >= 1``,
+    ``min_valid_folds >= 1`` and ``pf_cap >= 1``).
     """
 
     target_trades: int = DEFAULT_TARGET_TRADES
     min_trades: int = DEFAULT_MIN_TRADES
+    min_fold_trades: int = DEFAULT_MIN_FOLD_TRADES
+    min_valid_folds: int = DEFAULT_MIN_VALID_FOLDS
+    pf_cap: float = DEFAULT_SCORE_PF_CAP
 
     def __post_init__(self) -> None:
         if self.target_trades < 1:
@@ -1288,3 +1317,9 @@ class TradeTargetScore:
             raise ValueError(
                 f"min_trades must be <= target_trades, got {self.min_trades} > {self.target_trades}"
             )
+        if self.min_fold_trades < 1:
+            raise ValueError("min_fold_trades must be >= 1")
+        if self.min_valid_folds < 1:
+            raise ValueError("min_valid_folds must be >= 1")
+        if self.pf_cap < 1.0:
+            raise ValueError(f"pf_cap must be >= 1, got {self.pf_cap}")

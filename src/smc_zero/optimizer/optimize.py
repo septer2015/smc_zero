@@ -88,12 +88,14 @@ Evaluator: TypeAlias = Callable[
     FoldEvaluation,
 ]
 
-#: How one trial is turned into a number: the two aggregated fold tables of Э6' in, a score out.
-#: ``score_from_aggregates`` (§7.11) is the default and reads the out-of-sample half with its
-#: drawdown and decay factors; ``trades_scaled_score`` (§7.22) is the trade-count score of the
-#: second hierarchy.  The seam exists so a study can be ranked by another honest reading of the
-#: same walk-forward without a second optimizer: nothing else about the trial plumbing changes.
-Scorer: TypeAlias = Callable[[Mapping[str, float], Mapping[str, float]], float]
+#: How one trial is turned into a number: the trial's own fold evaluation in, a score out.
+#: ``score_from_aggregates`` (§7.11) is the default and reads the out-of-sample half of the
+#: aggregates with its drawdown and decay factors; the pooled trade-count score of §7.22
+#: (:func:`~smc_zero.optimizer.score.trades_pool_scorer`) reads the out-of-sample fold tables that
+#: the same evaluation carries.  The seam exists so a study can be ranked by another honest reading
+#: of the same walk-forward without a second optimizer: nothing else about the trial plumbing
+#: changes.
+Scorer: TypeAlias = Callable[[FoldEvaluation], float]
 
 #: How a study is created; :func:`_create_study` is the optuna one.
 StudyFactory: TypeAlias = Callable[[OptunaConfig], Any]
@@ -209,14 +211,17 @@ def _out_of_sample_scorer(config: OptunaConfig) -> Scorer:
     """Return the default scorer of a study: the §7.11 reading of the test window.
 
     The score of :func:`~smc_zero.optimizer.score.score_from_aggregates` with the run's own
-    ``score_metric`` and ``penalty_power`` bound to it.  A :data:`Scorer` is a pure function of
-    the two aggregated fold tables, so the two decisions of the budget travel in the closure and
-    the seam in :func:`make_objective` stays a plain ``Callable``.
+    ``score_metric`` and ``penalty_power`` bound to it.  A :data:`Scorer` receives the whole
+    evaluation of one trial - both aggregate tables *and* the fold tables the pooled score of §7.22
+    reads - so the two decisions of the budget travel in the closure and the seam in
+    :func:`make_objective` stays a plain ``Callable``.
     """
 
-    def score(train: Mapping[str, float], test: Mapping[str, float]) -> float:
+    def score(evaluation: FoldEvaluation) -> float:
         """Return the out-of-sample score of one trial under this run's decisions."""
-        return score_from_aggregates(train, test, config)
+        return score_from_aggregates(
+            evaluation.train_aggregated, evaluation.test_aggregated, config
+        )
 
     return score
 
@@ -247,8 +252,9 @@ def make_objective(
     for instance) is a legitimate experiment, because only the paths it names are proposed -
     the others keep the values of ``base``.  ``score`` is how the trial is ranked and defaults
     to :func:`_out_of_sample_scorer`, i.e. the §7.11 score with this run's metric and gate;
-    another honest reading of the same walk-forward (the trade-count score of §7.22) plugs in
-    here without touching the trial plumbing.
+    another honest reading of the same walk-forward (the pooled trade-count score of §7.22,
+    :func:`~smc_zero.optimizer.score.trades_pool_scorer`) plugs in here without touching the
+    trial plumbing.
 
     ``marks`` is the markup cache, built here with :func:`build_tape_marks` when not handed
     in - once for the whole study, never per trial.  ``base`` is the configuration a trial
@@ -280,7 +286,7 @@ def make_objective(
         evaluation = evaluate(df, cache, cfg_strategy, walk_cfg, backtest_cfg, spec)
         trial.set_user_attr("train", evaluation.train_aggregated)
         trial.set_user_attr("test", evaluation.test_aggregated)
-        return scorer(evaluation.train_aggregated, evaluation.test_aggregated)
+        return scorer(evaluation)
 
     return objective
 

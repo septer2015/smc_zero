@@ -12,6 +12,10 @@ below are the whole public surface:
 * :func:`score_from_aggregates` is the score: the out-of-sample metric, profit and drawdown of the
   folds, times the (weighted) train -> test decay of the parameter set, and a flat zero for a test
   window that made no money;
+* :func:`trades_scaled_score` / :func:`pool_profit_factor` are the pooled trade-count score of the
+  second hierarchy (§7.22): the profit factor of the out-of-sample folds read as *one* pool of
+  trades, times a trade-count factor, with gates on the fold density and the pool's profit
+  (:func:`trades_pool_scorer` is its ``Scorer``-shaped entry point);
 * :func:`build_tape_marks` / :func:`cache_mismatches` are the cache built once per run and the
   guard that refuses a configuration it does not cover;
 * :data:`PARAM_RANGES` / :func:`suggest_params` / :func:`apply_params` / :func:`resolve_path`
@@ -50,7 +54,9 @@ from smc_zero.optimizer.ranges import (
 from smc_zero.optimizer.score import (
     degradation_factor,
     drawdown_factor,
+    pool_profit_factor,
     score_from_aggregates,
+    trades_pool_scorer,
     trades_scaled_score,
 )
 
@@ -75,9 +81,11 @@ __all__ = [
     "drawdown_factor",
     "evaluate_params",
     "make_objective",
+    "pool_profit_factor",
     "resolve_path",
     "run_optimization",
     "score_from_aggregates",
     "suggest_params",
+    "trades_pool_scorer",
     "trades_scaled_score",
 ]

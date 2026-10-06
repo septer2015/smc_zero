@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -357,11 +358,16 @@ def test_the_profile_of_a_run_follows_its_entry_timeframe() -> None:
 
 
 def test_the_trade_count_scorer_carries_the_targets_of_the_command_line() -> None:
-    """The two counts are the caller's: they reach the score through a validated ``TradeTargetScore``."""
+    """The counts are the caller's and reach the pooled score through a validated dataclass."""
     args = runner.build_parser().parse_args(["--target-trades", "40", "--min-trades", "5"])
     scorer = runner._trade_target_scorer(args)
+    folds = [
+        {"trades": 4, "profit": 80.0, "gross_win": 120.0, "gross_loss": 40.0} for _ in range(5)
+    ]
 
-    assert scorer({}, {"pf_mean": 3.0, "trades_total": 20.0}) == pytest.approx(3.0 * 20.0 / 40.0)
+    assert scorer(SimpleNamespace(fold_metrics_test=folds)) == pytest.approx(3.0 * 20.0 / 40.0)
+    # The gates of the dataclass travel with the counts: a pool of two dense folds scores zero.
+    assert scorer(SimpleNamespace(fold_metrics_test=folds[:2])) == 0.0
     # A pair the dataclass cannot accept - a floor above the target - is refused before the study.
     with pytest.raises(ValueError, match="target_trades"):
         runner._trade_target_scorer(

@@ -768,6 +768,10 @@ class StrategyConfig:
       fall-throughs are 1, which is the v1 value;
     * ``fvg_lookback`` - prod's ``fvg_lookback`` (grid 10-30 step 5, diagnostic
       default 20): how far after the CHoCH a gap is still accepted;
+    * ``fvg_ready_bars`` - prod's ``i - choch_idx < 2`` (core.py line 680): a gap needs the
+      bar after its own middle candle before it exists, so an attempt is not judged against
+      a gap before this many bars after the CHoCH.  The M15 entry keeps prod's 2; the five
+      minute hierarchy of §7.20 raises it, because its bars are three times shorter;
     * ``max_fvg_age_bars`` - ``DEFAULT_MAX_FVG_AGE_BARS = 12``: gap age at entry;
     * ``choch_wait_bars`` - ``CHOCH_WAIT_BARS = 20``: prod's CHoCH window, which
       starts at the sweep bar and runs forward;
@@ -818,6 +822,7 @@ class StrategyConfig:
     sweep_buffer_pip: float = 1.0
     min_fvg_pip: float = 1.0
     fvg_lookback: int = 20
+    fvg_ready_bars: int = 2
     max_fvg_age_bars: int = 12
     choch_wait_bars: int = 20
     fvg_select: FVGSelect = "first"
@@ -851,6 +856,8 @@ class StrategyConfig:
             raise ValueError("signal_max_age_bars must be >= 0")
         if self.fvg_lookback < 1:
             raise ValueError("fvg_lookback must be >= 1")
+        if self.fvg_ready_bars < 0:
+            raise ValueError("fvg_ready_bars must be >= 0")
         if self.max_fvg_age_bars < 0:
             raise ValueError("max_fvg_age_bars must be >= 0")
         if self.choch_wait_bars < 1:

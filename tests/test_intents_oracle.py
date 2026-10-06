@@ -29,6 +29,12 @@ restore a profile whose values sit in the wrong fields.  Each recorder therefore
 the config on the current classes through their deprecated keywords, which migrate those numbers by
 money - the pin itself stays what it is, a commit in history, and not a copy that would drift.
 
+Э12 opened the same gap on the strategy class: a field the pin never had (``fvg_ready_bars``, §7.20)
+shifts every later slot by one when the pinned object is unpickled into the current class, so the
+strategy config travels as data as well and is rebuilt leaf by leaf on the working tree
+(:func:`_config_from_record`) - the values the pin did have travel unchanged, and a field it did not
+know keeps the default of the working tree, which is where the pinned chain left it.
+
 The one place the two chains are *meant* to disagree is the same-bar rule Э9''.1 added to п.35:
 prod - and therefore the pinned head - placed every setup of a bar, while the new chain keeps the
 most significant level of it (:func:`smc_zero.strategy.intents._one_intent_per_bar`).  The record
@@ -55,7 +61,7 @@ import pickle
 import subprocess
 import sys
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -63,7 +69,7 @@ from typing import Any
 
 from pandas.testing import assert_frame_equal
 
-from smc_zero.config import RiskConfig
+from smc_zero.config import RiskConfig, StrategyConfig
 from smc_zero.indicators.levels import (
     ASIAN_HIGH,
     ASIAN_LOW,
@@ -78,6 +84,7 @@ from smc_zero.indicators.levels import (
     PWH,
     PWL,
 )
+from smc_zero.optimizer.ranges import apply_params
 from smc_zero.strategy.base import intents_frame
 from smc_zero.strategy.intents import build_intents
 
@@ -122,23 +129,29 @@ def _config(args, kwargs):
 
 
 def recording(*args, **kwargs):
-    """Record one call: the arguments, the risk profile as data and both faces of the verdict.
+    """Record one call: the arguments, the config and the risk profile as data, both verdict faces.
 
     The profile is written with ``dataclasses.asdict`` and not as the object: a pickle of a slotted
     dataclass carries the *values* of its slots, and Э10' moved the six Э5' cost fields of
     ``RiskConfig`` into ``BrokerSpec``, so a pickle of the pinned class would have them land in the
     wrong fields of the current one.  Data travels instead of the class, and the oracle rebuilds
     the config through the current constructor's deprecated keywords.
+
+    The *strategy* config is written as data for the very same reason (Э12): a field the pin did not
+    have (``fvg_ready_bars``) shifts every later slot by one when the pinned object is unpickled into
+    the current class, so a restored object cannot be read at all.
     """
     global _count
     out = _original(*args, **kwargs)
     _count += 1
+    config = _config(args, kwargs)
     with (_out / f"synthetic_{_count:04d}.pkl").open("wb") as handle:
         pickle.dump(
             {
                 "args": args,
                 "kwargs": kwargs,
-                "risk": dataclasses.asdict(_config(args, kwargs).risk),
+                "config": dataclasses.asdict(config),
+                "risk": dataclasses.asdict(config.risk),
                 "intents": out.intents,
                 "rejections": out.rejections,
             },
@@ -186,6 +199,7 @@ with Path(os.environ["ORACLE_OUT"], "real_window.pkl").open("wb") as handle:
         {
             "args": (tape, marks.bias_frame(), marks.levels, config),
             "kwargs": {},
+            "config": dataclasses.asdict(config),
             "risk": dataclasses.asdict(config.risk),
             "intents": chain.intents,
             "rejections": chain.rejections,
@@ -332,35 +346,63 @@ def _one_intent_per_bar(intents: tuple[Any, ...]) -> tuple[Any, ...]:
 CONFIG_ARGUMENT = 3
 
 
+def _flatten(value: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Return a nested mapping as the dotted ``{path: leaf}`` pairs ``apply_params`` reads."""
+    flat: dict[str, Any] = {}
+    for name, item in value.items():
+        path = f"{prefix}{name}"
+        if isinstance(item, Mapping):
+            flat.update(_flatten(item, f"{path}."))
+            continue
+        flat[path] = item
+    return flat
+
+
+def _config_from_record(recorded: Mapping[str, Any], risk: Mapping[str, Any]) -> StrategyConfig:
+    """Rebuild a recorded config as *data* on the current classes (Э10', Э12).
+
+    The record cannot be unpickled into the current class: a slotted dataclass restores its values
+    *positionally*, so a field Э12 added in the middle of the strategy (``fvg_ready_bars``, §7.20)
+    shifts every later value into its neighbour's slot - the restored object would carry a string in
+    ``choch_wait_bars``.  Both recorders therefore write ``dataclasses.asdict`` of the config, and
+    this helper rebuilds it: every leaf goes through
+    :func:`smc_zero.optimizer.ranges.apply_params` (one ``replace`` per level of the tree), while the
+    risk profile is built separately from its own data through the deprecated Э5' keywords, which
+    migrate the six old fields *by money* (:func:`smc_zero.config._legacy_broker`, the Э10' note of
+    the module docstring).
+
+    A field the pin did not have keeps the default of the working tree - which is what the pinned
+    chain itself ran with, since the field did not exist there.  The gate stays what it is: an
+    equivalence check of the two *chains*, not a comparison of two configs.
+    """
+    leaves = {
+        path: value for path, value in _flatten(recorded).items() if not path.startswith("risk.")
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        profile = RiskConfig(**risk)
+    return replace(apply_params(StrategyConfig(), leaves), risk=profile)
+
+
 def _rebuilt_call(case: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Return the recorded call with its config rebuilt on the current classes (Э10').
+    """Return the recorded call with its config rebuilt on the current classes (Э10', Э12).
 
-    The pinned config cannot simply be unpickled: ``RiskConfig`` is a slotted dataclass, so a pickle
-    of it carries the *values* of its slots in declaration order, and Э10' moved the six Э5' cost
-    fields (commission, spread, slippage, pip_size, contract_size, leverage) out of it into
-    :class:`~smc_zero.config.BrokerSpec` - unpickled into the smaller current class those values
-    land in the wrong fields instead of raising.
-
-    The recorder therefore writes ``dataclasses.asdict`` of the pinned risk profile beside the
-    arguments, and the profile is rebuilt here through the current constructor, whose deprecated
-    keywords migrate those numbers *by money* (:func:`smc_zero.config._legacy_broker`) - the same
-    migration the pin's own call sites go through.  The gate stays what it is: an equivalence check
-    of the two *chains*, not a comparison of two cost profiles.
+    ``RiskConfig`` is a slotted dataclass and Э10' moved its six Э5' cost fields into
+    :class:`~smc_zero.config.BrokerSpec`, so the profile of the pin is rebuilt here through the
+    current constructor, whose deprecated keywords migrate those numbers by money - the same
+    migration the pin's own call sites go through (:func:`_config_from_record`).
 
     The migration warning is silenced on purpose - one per case would drown the gate - and the money
     itself is what the comparison watches: a wrong spread, commission or pip moves the prices the
     chain rounds with, so the frames would differ.
     """
+    config = _config_from_record(case["config"], case["risk"])
     args = list(case["args"])
     kwargs = dict(case["kwargs"])
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        if len(args) > CONFIG_ARGUMENT:
-            args[CONFIG_ARGUMENT] = replace(
-                args[CONFIG_ARGUMENT], risk=RiskConfig(**case["risk"])
-            )
-        else:
-            kwargs["config"] = replace(kwargs["config"], risk=RiskConfig(**case["risk"]))
+    if len(args) > CONFIG_ARGUMENT:
+        args[CONFIG_ARGUMENT] = config
+    else:
+        kwargs["config"] = config
     return tuple(args), kwargs
 
 

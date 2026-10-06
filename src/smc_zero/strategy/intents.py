@@ -187,10 +187,10 @@ LEVEL_PRIORITY: Mapping[str, int] = {
 }
 UNKNOWN_LEVEL_PRIORITY = 99
 
-# prod's ``i - choch_idx < 2`` (core.py line 680): a gap needs the bar after its middle candle
-# before it exists (``fair_value_gaps`` marks it from ``k + 1``), so two bars after the CHoCH are
-# the earliest a lookup can succeed - prod rejects earlier attempts instead of looking.
-FVG_READY_BARS = 2
+# prod's ``i - choch_idx < 2`` (core.py line 680) now lives in ``StrategyConfig.fvg_ready_bars``: a
+# gap needs the bar after its own middle candle before it exists (``fair_value_gaps`` marks it from
+# ``k + 1``), so the earliest a lookup can succeed is that many bars after the CHoCH - prod rejects
+# earlier attempts instead of looking, and the M5 hierarchy of §7.20 raises the number.
 #: What a missing stamp becomes on the integer clock of Э9': ``NaT`` is ``iNaT``, the smallest
 #: ``int64``, so one comparison recognises a missing ``available_at`` (never fresh) and a missing
 #: ``broken_at`` / ``retired_at`` (no limit) without a second ``isna`` pass over the column.
@@ -757,7 +757,7 @@ def build_intents(
             )
             refuse(~impulse_ok, REASON_DISPLACEMENT_SKIP)
         # (8) a gap needs the bar after its middle candle before it can exist at all
-        refuse(attempts - choch < FVG_READY_BARS, REASON_FVG_NOT_READY)
+        refuse(attempts - choch < config.fvg_ready_bars, REASON_FVG_NOT_READY)
         # (9) the first gap inside ``(choch, choch + fvg_lookback]``, nowhere later than ``i - 1``
         fvg = _first_in_window(
             bearish_gaps if upper else bullish_gaps,

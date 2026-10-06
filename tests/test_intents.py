@@ -227,6 +227,28 @@ _REVERSAL_LEDGER = _ledger(
 )
 
 
+def test_the_ready_delay_of_a_gap_is_a_knob_of_the_config() -> None:
+    """The gap gate waits ``fvg_ready_bars`` bars after the CHoCH - a field, not a constant (ОМ-7).
+
+    The default 2 is prod's own (core.py line 680); the five minute hierarchy of §7.20 raises it,
+    because a five minute bar carries a different amount of structure.  With 0 the gate never fires,
+    and with 4 it swallows the bar whose gap window the default already reaches.
+    """
+    default = _chain()
+    assert _pairs(default) == _REVERSAL_LEDGER
+    assert StrategyConfig().fvg_ready_bars == 2
+
+    eager = dict(_pairs(_chain(fvg_ready_bars=0)))
+    assert REASON_FVG_NOT_READY not in eager.values()
+
+    strict = dict(_pairs(_chain(fvg_ready_bars=4)))
+    assert strict[31] == REASON_FVG_NOT_READY
+    assert strict[29] == REASON_FVG_NOT_READY and strict[30] == REASON_FVG_NOT_READY
+
+    with pytest.raises(ValueError, match="fvg_ready_bars"):
+        StrategyConfig(fvg_ready_bars=-1)
+
+
 def test_the_reversal_setup_is_accepted_once_with_the_core_geometry() -> None:
     chain = _chain()
     assert len(chain.intents) == 1

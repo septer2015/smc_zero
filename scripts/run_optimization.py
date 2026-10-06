@@ -251,6 +251,9 @@ def run(args: argparse.Namespace) -> int:
         structure_timeframe, structure_frame = _common.working_frame(
             symbol, backtest.timeframes, window.start, window.end, source=args.data_source
         )
+        htf_frames = _common.markup_frames(
+            symbol, backtest.timeframes, window, source=args.data_source
+        )
         walk_config = _walk_forward_config(args, timeframe)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)
     except (OSError, ValueError) as error:
@@ -274,6 +277,7 @@ def run(args: argparse.Namespace) -> int:
         tape,
         base,
         ltf=backtest.timeframes.ltf,
+        htf_frames=htf_frames or None,
         structure_frame=structure_frame,
         structure_timeframe=structure_timeframe,
     )

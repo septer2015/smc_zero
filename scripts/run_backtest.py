@@ -101,6 +101,9 @@ def run(args: argparse.Namespace) -> int:
         structure_timeframe, structure_frame = _common.working_frame(
             symbol, backtest.timeframes, window.start, window.end, source=args.data_source
         )
+        htf_frames = _common.markup_frames(
+            symbol, backtest.timeframes, window, source=args.data_source
+        )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -114,6 +117,7 @@ def run(args: argparse.Namespace) -> int:
         tape,
         strategy,
         ltf=backtest.timeframes.ltf,
+        htf_frames=htf_frames or None,
         structure_frame=structure_frame,
         structure_timeframe=structure_timeframe,
     )

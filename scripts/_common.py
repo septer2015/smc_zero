@@ -206,6 +206,52 @@ def working_frame(
     return preset.structure, load_windowed_tape(symbol, preset.structure, start, end, source=source)
 
 
+def markup_frames(
+    symbol: str,
+    timeframes: TimeframeConfig,
+    window: RunWindow,
+    *,
+    source: str = PROJECT_SOURCE,
+) -> dict[str, pd.DataFrame]:
+    """Return the HTF frames of a separated bias hierarchy, loaded from their own files (В2-B).
+
+    The second hierarchy (§7.20) reads H4 and D1 from ``<SYMBOL>_<TF>.csv`` over
+    ``[start - warmup_days, end]``: resampling them out of a five minute tape would hand the bias
+    bars nobody exported, and the warm-up is what lets the first bars of the window carry a defined
+    trend instead of ``NaN`` until the first swing.  The v1 hierarchy keeps resampling its HTF
+    frames inside :func:`~smc_zero.optimizer.marks.build_tape_marks` and this answers an empty
+    mapping, so its behaviour stays bit for bit.
+
+    В3-У: a window whose warm-up reaches past the first bar of a tape is a ``ValueError`` naming the
+    earliest start that tape supports - a run may not be handed a shorter warm-up than it asked for.
+    A tape that is not there raises the :class:`FileNotFoundError` of :func:`tape_path`'s loader,
+    which names the file and the folder to fetch it into.
+    """
+    preset = preset_of(timeframes)
+    if preset.structure is None:
+        return {}
+    frames: dict[str, pd.DataFrame] = {}
+    for timeframe in preset.bias:
+        path = tape_path(symbol, timeframe, source=source)
+        if not path.is_file():
+            hint = (
+                f"run from the repository root, or fetch the CSV into {path.parent}"
+                if source == PROJECT_SOURCE
+                else f"point {SMC_DATA_DIR_ENV} at the export folder (now {path.parent})"
+            )
+            raise FileNotFoundError(f"no tape at {path}: {hint}")
+        tape = load_csv(path) if source == PROJECT_SOURCE else load_ohlcv(path, format=AUTO_FORMAT)
+        first = tape[TIMESTAMP_COLUMN].min()
+        earliest = first + pd.Timedelta(days=window.warmup_days)
+        if window.start < earliest:
+            raise ValueError(
+                f"нужен --start >= {earliest:%Y-%m-%d} (лента {timeframe} начинается "
+                f"{first:%Y-%m-%d}, прогрев {window.warmup_days} дней)"
+            )
+        frames[timeframe] = slice_window(tape, window.loaded_from, window.end)
+    return frames
+
+
 def instrument_for(symbol: str) -> InstrumentSpec:
     """Return the C6 price list row of ``symbol``; an unpriced symbol is refused, not guessed.
 

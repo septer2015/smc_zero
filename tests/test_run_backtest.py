@@ -85,14 +85,19 @@ def _argv(report_dir: Path, timeframe: str = "M15", **overrides: str) -> list[st
 def stubbed_tape(monkeypatch: pytest.MonkeyPatch) -> None:
     """Serve the fixture tape to the runner instead of reading ``./data``.
 
-    The five minute tape of the second hierarchy is served as well, so a run of the M5 mode reads
-    both its entry frame and its working frame from the fixture and never from the repository.
+    The five minute tape of the second hierarchy is served as well - together with the H4 / D1 legs
+    its bias reads from their own files (В2-B) - so a run of the M5 mode never touches the repo.
     """
 
     def load_csv(path: Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
         """Return the fixture tape of the timeframe the path names."""
-        grid = {"EURUSD_M5.csv": "5min", "EURUSD_M15.csv": "15min"}.get(path.name)
-        assert grid is not None, f"the fixture serves M5 and M15, not {path.name}"
+        grid = {
+            "EURUSD_M5.csv": "5min",
+            "EURUSD_M15.csv": "15min",
+            "EURUSD_H4.csv": "4h",
+            "EURUSD_D1.csv": "1D",
+        }.get(path.name)
+        assert grid is not None, f"the fixture serves M5, M15, H4 and D1, not {path.name}"
         return _tape(freq=grid)
 
     monkeypatch.setattr(common, "load_csv", load_csv)

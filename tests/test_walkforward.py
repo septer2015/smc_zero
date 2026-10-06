@@ -14,6 +14,9 @@ The three mutations the module is one line away from, and the test each one must
   :func:`test_the_anchored_folds_always_start_at_the_first_bar`;
 * m3 "sum the folds instead of averaging them" - the aggregate reports the total, not the mean;
   breaks :func:`test_the_aggregate_averages_the_folds_and_reports_their_spread`.
+* m4 "report ``trades_total`` as the mean of the folds" - the sample size a trade-count score of
+  §7.22 is read on is divided by the fold count, so a study of nine folds sees a quarter of the
+  trades it actually took; breaks :func:`test_the_aggregate_averages_the_folds_and_reports_their_spread`.
 """
 
 from __future__ import annotations
@@ -203,9 +206,11 @@ def test_the_aggregate_averages_the_folds_and_reports_their_spread() -> None:
     assert aggregate["max_dd_std"] == pytest.approx(4.08, abs=0.005)
     assert aggregate["sharpe_mean"] == pytest.approx(1.0)
     assert aggregate["sharpe_std"] == pytest.approx(0.41, abs=0.005)
-    assert set(aggregate) == {"folds"} | {
+    assert set(aggregate) == {"folds", "trades_total"} | {
         f"{field}_{suffix}" for field in FOLD_METRIC_FIELDS for suffix in ("mean", "std")
     }
+    # The sum beside the mean: the count of the whole walk-forward, not of one fold (m4).
+    assert aggregate["trades_total"] == pytest.approx(6.0)
 
 
 def test_the_aggregate_of_one_fold_is_that_fold() -> None:

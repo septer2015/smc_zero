@@ -28,11 +28,14 @@ from smc_zero.optimizer.marks import TapeMarks, build_tape_marks, cache_mismatch
 from smc_zero.optimizer.optimize import (
     FoldEvaluation,
     OptunaResult,
+    Scorer,
     evaluate_params,
     make_objective,
     run_optimization,
 )
 from smc_zero.optimizer.ranges import (
+    M5_PARAM_RANGES,
+    PARAM_PROFILES,
     PARAM_RANGES,
     ChoiceRange,
     FloatRange,
@@ -48,9 +51,12 @@ from smc_zero.optimizer.score import (
     degradation_factor,
     drawdown_factor,
     score_from_aggregates,
+    trades_scaled_score,
 )
 
 __all__ = [
+    "M5_PARAM_RANGES",
+    "PARAM_PROFILES",
     "PARAM_RANGES",
     "ChoiceRange",
     "FloatRange",
@@ -59,6 +65,7 @@ __all__ = [
     "OptunaResult",
     "ParamRange",
     "ParamValue",
+    "Scorer",
     "TapeMarks",
     "TrialLike",
     "apply_params",
@@ -72,4 +79,5 @@ __all__ = [
     "run_optimization",
     "score_from_aggregates",
     "suggest_params",
+    "trades_scaled_score",
 ]

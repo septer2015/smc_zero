@@ -91,6 +91,23 @@ smc-optimize --symbol EURUSD --n-trials 100 --jobs 4
   на строках `mean` лежат ещё `train_profit_mean`, `test_profit_mean` и
   `degradation_ratio` запуска).
 
+Оптимизация второй иерархии (H4 → M15 → M5, SPEC_SMC.md §7.22) берёт другое пространство и другой
+счёт. Оба выбираются по входному таймфрейму и перебиваются флагами:
+
+```bash
+env SMC_DATA_DIR=/path/to/mt5 \
+  smc-optimize --config-path configs/live_eurusd_m5.yaml --data-source mt5 \
+    --n-trials 100 --jobs 4 --ranges m5 --score m5 --target-trades 25 --min-trades 10
+```
+
+`--ranges m5` двигает пять кнобов, которые меняют смысл на пятиминутных барах (барные окна
+`fvg_lookback` / `choch_wait_bars` / `signal_max_age_bars` и два гейта `min_sl_realistic_pip` /
+`displacement.atr_mult_min`); `--score m5` ранжирует набор по числу сделок:
+`profit factor × min(1, trades / 25)`, с нулём ниже десяти сделок за период проверки. Значение
+`--ranges auto` / `--score auto` (по умолчанию) само выбирает профиль `m5` для ленты M5 и прежний
+профиль §7.11 для M15.
+
+
 Каждый запуск помечается признаком наличия издержек. Издержки приходят из профиля брокера
 `BrokerSpec` (SPEC_SMC.md §7.18): штамп `has_costs` выключается только тогда, когда все три
 параметра профиля — `spread_pip`, `commission_per_lot_usd`, `slippage_pip` — равны нулю, и тогда

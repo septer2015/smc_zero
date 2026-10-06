@@ -174,6 +174,43 @@ PARAM_RANGES: dict[str, ParamRange] = {
 }
 
 
+#: The search space of the second hierarchy (H4 -> M15 -> M5, SPEC_SMC.md §7.22): the five knobs
+#: that decide how many setups of a five minute tape survive to an entry.  The space is *narrowed*
+#: on purpose - the pip-sized gates of the M15 chain (sweep buffer, SL buffer, FVG size, gap age,
+#: take-profit ratios, ``bias.agreement``) are carried by the live config of §7.20 and are not
+#: re-searched here, so the study moves only what the shorter bars changed the meaning of:
+#:
+#: * ``fvg_lookback`` / ``choch_wait_bars`` / ``signal_max_age_bars`` are *bar* windows, and an M5
+#:   bar is three times shorter than an M15 one - the shipped 21 / 20 / 94 are the M15 readings of
+#:   the same minutes, so the ranges start above them and let the study pick the length that keeps
+#:   the sweep -> CHoCH -> FVG sequence alive on five minute bars;
+#: * ``min_sl_realistic_pip`` / ``displacement.atr_mult_min`` are the two gates that turned most M5
+#:   intents into ``sl_rejected_wide``: a five minute sweep sits closer to its level, so the
+#:   realistic SL band that M15 arithmetic asked for has to be lowered before the setup is tradeable.
+#:
+#: The bounds bracket the values the shipped M5 config carries where it has a counterpart
+#: (``fvg_lookback=21``, ``displacement.atr_mult_min=0.745``) and *deliberately* start above the
+#: M15 readings of the bar windows, which is the point of the narrowing: those two are the knobs a
+#: study of the second hierarchy exists to move.  A trial may vary these paths and nothing else -
+#: the markup cache of :mod:`smc_zero.optimizer.marks` is built from the frozen remainder.
+M5_PARAM_RANGES: dict[str, ParamRange] = {
+    "fvg_lookback": IntRange(20, 80),
+    "choch_wait_bars": IntRange(30, 120),
+    "min_sl_realistic_pip": FloatRange(10.0, 25.0),
+    "displacement.atr_mult_min": FloatRange(0.5, 1.0),
+    "signal_max_age_bars": IntRange(150, 400),
+}
+
+#: The search spaces a run may name (SPEC_SMC.md §7.22): ``default`` is the M15 space of §7.11,
+#: ``m5`` the narrowed one of the second hierarchy.  The runner picks by the entry timeframe and
+#: an explicit ``--ranges`` overrides that pick, so a study is always reproducible from its command
+#: line: the profile *is* the space, and nothing here widens it behind a caller's back.
+PARAM_PROFILES: dict[str, dict[str, ParamRange]] = {
+    "default": PARAM_RANGES,
+    "m5": M5_PARAM_RANGES,
+}
+
+
 def resolve_path(cfg: StrategyConfig, path: str) -> Any:
     """Return what the dotted ``path`` of ``cfg`` points at.
 

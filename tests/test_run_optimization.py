@@ -34,7 +34,7 @@ import scripts.run_optimization as runner
 from smc_zero.backtester import FOLD_METRIC_FIELDS, aggregate_fold_metrics
 from smc_zero.backtester.engine import TRADE_COLUMNS
 from smc_zero.config import OptunaConfig, StrategyConfig, WalkForwardConfig
-from smc_zero.optimizer import FoldEvaluation, OptunaResult
+from smc_zero.optimizer import M5_PARAM_RANGES, PARAM_RANGES, FoldEvaluation, OptunaResult
 
 BARS = 300
 START = "2026-06-08"
@@ -182,6 +182,11 @@ def test_the_optimization_runner_returns_zero_and_writes_its_report(
     # The report records how the score was computed: its metric and the weight of the decay gate.
     assert payload["score_metric"] == "sharpe"
     assert payload["penalty_power"] == pytest.approx(0.0)
+    # ... and which profile of §7.22 ranked the study: an M15 run keeps the Э7' pair, so the file
+    # of a first-hierarchy run does not pretend to be a trade-count one.
+    assert payload["param_ranges"] == "default"
+    assert payload["score_profile"] == "default"
+    assert "target_trades" not in payload
     assert payload["test"]["profit_mean"] == pytest.approx(0.6)
     assert payload["train"]["profit_mean"] == pytest.approx(1.5)
     assert (folder / "summary.txt").read_text(encoding="utf-8").startswith("SMC backtest")
@@ -322,3 +327,43 @@ def test_the_fold_windows_of_a_run_follow_its_entry_timeframe() -> None:
     assert runner._walk_forward_config(typed, "M5") == WalkForwardConfig(
         min_train_bars=500, test_period_bars=100, train_period_bars=288 * 60
     )
+
+
+def test_the_profile_of_a_run_follows_its_entry_timeframe() -> None:
+    """§7.22: the M5 entry gets the narrowed space and the trade-count score, M15 keeps Э7'.
+
+    ``auto`` - the default of both flags - reads the entry timeframe, so the second hierarchy is
+    served by the same command line as the first one; a flag that names a profile wins over the
+    pick, and each of the two flags decides on its own.
+    """
+    parser = runner.build_parser()
+
+    ranges_name, score_name, ranges, scorer = runner._search_profile(parser.parse_args([]), "M5")
+    assert (ranges_name, score_name) == ("m5", "m5")
+    assert ranges is M5_PARAM_RANGES
+    assert scorer is not None
+
+    ranges_name, score_name, ranges, scorer = runner._search_profile(parser.parse_args([]), "M15")
+    assert (ranges_name, score_name) == ("default", "default")
+    assert ranges is PARAM_RANGES
+    # ``None`` is the default scorer of ``run_optimization``: the out-of-sample score of §7.11.
+    assert scorer is None
+
+    typed = parser.parse_args(["--ranges", "default", "--score", "m5"])
+    ranges_name, score_name, ranges, scorer = runner._search_profile(typed, "M5")
+    assert (ranges_name, score_name) == ("default", "m5")
+    assert ranges is PARAM_RANGES
+    assert scorer is not None
+
+
+def test_the_trade_count_scorer_carries_the_targets_of_the_command_line() -> None:
+    """The two counts are the caller's: they reach the score through a validated ``TradeTargetScore``."""
+    args = runner.build_parser().parse_args(["--target-trades", "40", "--min-trades", "5"])
+    scorer = runner._trade_target_scorer(args)
+
+    assert scorer({}, {"pf_mean": 3.0, "trades_total": 20.0}) == pytest.approx(3.0 * 20.0 / 40.0)
+    # A pair the dataclass cannot accept - a floor above the target - is refused before the study.
+    with pytest.raises(ValueError, match="target_trades"):
+        runner._trade_target_scorer(
+            runner.build_parser().parse_args(["--target-trades", "5", "--min-trades", "10"])
+        )

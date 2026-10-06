@@ -42,7 +42,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
-from smc_zero.config import OptunaConfig
+from smc_zero.config import OptunaConfig, TradeTargetScore
 
 
 def _metric(table: Mapping[str, float], key: str) -> float:
@@ -105,7 +105,6 @@ def score_from_aggregates(
     cfg: OptunaConfig | None = None,
 ) -> float:
     """Return the score of one trial from the two aggregated fold tables of Э6'.
-
     ``train_aggregated`` / ``test_aggregated`` are what
     :func:`smc_zero.backtester.walkforward.aggregate_fold_metrics` reports over the fit
     window and over the out-of-sample window of the same folds.  The score is read out of
@@ -147,3 +146,55 @@ def score_from_aggregates(
     drawdown = drawdown_factor(_metric(test_aggregated, "max_dd_mean"))
     decay = degradation_factor(train_profit, profit, config.penalty_power)
     return leading * profit * drawdown * decay
+
+
+def trades_scaled_score(
+    train_aggregated: Mapping[str, float],
+    test_aggregated: Mapping[str, float],
+    cfg: TradeTargetScore | None = None,
+) -> float:
+    """Return the trade-target score of the second hierarchy: ``pf * min(1, trades / target)``.
+
+    The default score of §7.11 maximises a *ratio* (Sharpe, then profit) and is blind to how many
+    trades produced it - a study of a five minute tape would then happily rank a parameter set
+    whose whole out-of-sample period carried four trades.  This score ranks the same walk-forward
+    by how *often* the edge showed up, which is what the second hierarchy needs (SPEC_SMC.md §7.22):
+
+        score = pf_mean(test) * min(1, trades_total(test) / target_trades)
+              = 0                                        if trades_total(test) < min_trades
+
+    The factors:
+
+    * ``pf_mean(test)`` - the profit factor of the out-of-sample folds, read through and never
+      recomputed.  The profit factor is the headline here and not the Sharpe: an edge that shows up
+      more often with the same win/loss size moves neither the win rate nor the average, but it
+      does move the product of gross profit and gross loss.
+    * ``min(1, trades_total / target_trades)`` - the trade-count factor: it *caps* at one, so a
+      parameter set is never rewarded for opening trades for their own sake past the target.  The
+      total is the sum over the folds (``trades_total`` of
+      :func:`~smc_zero.backtester.walkforward.aggregate_fold_metrics`), because the target is a
+      statement about the whole out-of-sample period and not about one 30 day fold.
+    * the ``min_trades`` floor returns a flat zero *before* the factors are multiplied, so a study
+      cannot buy rank with a profit factor computed on a handful of trades - the same shape of
+      guard as the ``profit_mean(test) <= 0`` of :func:`score_from_aggregates`, and for the same
+      reason: ranking noise is worse than ranking nothing.
+
+    ``train_aggregated`` is part of the signature every scorer of a study shares and is
+    deliberately **not read**: this score has no OOS decay gate - it is the honest "how much of
+    the period did you trade, and how well" reading, and asking it for the fit ratio would punish
+    a parameter set for an in-sample window this hierarchy is not about.  A scorer that does weigh
+    the past is :func:`score_from_aggregates` with its ``penalty_power``.
+
+    ``cfg`` is :class:`~smc_zero.config.TradeTargetScore`: ``target_trades`` (the count the factor
+    reaches one at) and ``min_trades`` (below which the score is a flat zero).  A table missing
+    ``pf_mean`` / ``trades_total`` - or carrying a non-finite number - raises ``ValueError``,
+    exactly as in :func:`score_from_aggregates`.
+    """
+    config = TradeTargetScore() if cfg is None else cfg
+    trades = _metric(test_aggregated, "trades_total")
+    if trades < config.min_trades:
+        return 0.0
+    profit_factor = _metric(test_aggregated, "pf_mean")
+    if profit_factor <= 0.0:
+        return 0.0
+    return profit_factor * min(trades / config.target_trades, 1.0)

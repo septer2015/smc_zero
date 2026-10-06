@@ -41,8 +41,21 @@ instead of failing with an import traceback.
 A ``--config-path`` file (§7.19) seeds the study instead of the project defaults: its ``strategy``
 block is the base configuration the trial parameters are applied to, its ``broker`` block is the
 account both windows are charged on and its ``backtest`` block is the run of the winner.  The file
-does not narrow the search space - a study over a subset of :data:`PARAM_RANGES` is a different
-call - so an optimized run re-decides every knop of the config it started from.
+does not narrow the search space - ``--ranges`` does (§7.22).
+
+Two profiles make the runner serve both hierarchies without a second script:
+
+* ``--ranges`` picks the space a trial moves: ``default`` is the whole Э7' space of §7.11,
+  ``m5`` the narrowed five-knob space of §7.22, and ``auto`` (the default) reads the *entry
+  timeframe* of the run - an M5 tape gets ``m5``, everything else keeps ``default``;
+* ``--score`` picks how a trial is ranked: ``default`` is the out-of-sample score of §7.11,
+  ``m5`` the trade-count score ``pf * min(1, trades / target)`` of §7.22 with the ``--target-trades``
+  / ``--min-trades`` numbers of :class:`~smc_zero.config.TradeTargetScore`, and ``auto`` follows
+  the same timeframe rule.
+
+If a ``--ranges`` profile names a knob the cache was built from, the run is refused before the study
+starts (the guard of :func:`~smc_zero.optimizer.cache_mismatches`), so a profile cannot silently
+score trials against a stale markup.
 """
 
 from __future__ import annotations
@@ -51,6 +64,7 @@ import argparse
 import json
 import sys
 from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import Any
 
 import pandas as pd
@@ -64,18 +78,34 @@ from smc_zero.backtester import (
     run_backtest,
     split_walkforward,
 )
-from smc_zero.config import OptunaConfig, WalkForwardConfig
+from smc_zero.config import (
+    DEFAULT_MIN_TRADES,
+    DEFAULT_TARGET_TRADES,
+    OptunaConfig,
+    TradeTargetScore,
+    WalkForwardConfig,
+)
 from smc_zero.optimizer import (
+    PARAM_PROFILES,
     FoldEvaluation,
     OptunaResult,
+    ParamRange,
+    Scorer,
     build_tape_marks,
     degradation_factor,
     run_optimization,
+    trades_scaled_score,
 )
 from smc_zero.strategy.intents import build_intents
 
 #: How many finished trials the console prints, best first.
 TOP_TRIALS = 10
+#: The search spaces a run may name (§7.22): ``auto`` follows the entry timeframe, ``default`` and
+#: ``m5`` name the two profiles of :data:`~smc_zero.optimizer.PARAM_PROFILES` explicitly.
+RANGE_PROFILES: tuple[str, ...] = ("auto", "default", "m5")
+#: The scorers a run may name: ``auto`` follows the entry timeframe as well, ``default`` is the
+#: out-of-sample score of §7.11 and ``m5`` the trade-count score of §7.22.
+SCORE_PROFILES: tuple[str, ...] = ("auto", "default", "m5")
 #: The score inputs of §7.11 п.69 that ``fold_metrics.csv`` repeats on its ``mean`` rows: the
 #: aggregate profit of each window and the ratio the decay gate weighs.
 SCORE_COLUMNS: tuple[str, ...] = ("train_profit_mean", "test_profit_mean", "degradation_ratio")
@@ -107,7 +137,68 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="length of a fold's out-of-sample window, in bars (default: WalkForwardConfig)",
     )
+    parser.add_argument(
+        "--ranges",
+        choices=RANGE_PROFILES,
+        default="auto",
+        help=(
+            "search space: 'auto' follows the entry timeframe (M5 -> m5, else default), "
+            "'default' is the Э7' space of §7.11, 'm5' the narrowed profile of §7.22"
+        ),
+    )
+    parser.add_argument(
+        "--score",
+        choices=SCORE_PROFILES,
+        default="auto",
+        help=(
+            "how a trial is ranked: 'auto' follows the entry timeframe, 'default' is the "
+            "out-of-sample score of §7.11, 'm5' the trade-count score of §7.22"
+        ),
+    )
+    parser.add_argument(
+        "--target-trades",
+        type=int,
+        default=DEFAULT_TARGET_TRADES,
+        help="trade count the m5 score saturates at (default: 25)",
+    )
+    parser.add_argument(
+        "--min-trades",
+        type=int,
+        default=DEFAULT_MIN_TRADES,
+        help="trade count below which the m5 score is a flat zero (default: 10)",
+    )
     return parser
+
+
+def _trade_target_scorer(args: argparse.Namespace) -> Scorer:
+    """Return the trade-count scorer of §7.22 with the targets of the command line.
+
+    The two counts are validated by :class:`~smc_zero.config.TradeTargetScore` before the study
+    starts, so a ``--target-trades 0`` is a ``ValueError`` and not a score that always saturates.
+    Binding them here keeps the study itself free of the numbers: :data:`Scorer` is a plain
+    function of the two fold tables, exactly like the out-of-sample score it replaces.
+    """
+    targets = TradeTargetScore(target_trades=args.target_trades, min_trades=args.min_trades)
+    return partial(trades_scaled_score, cfg=targets)
+
+
+def _search_profile(
+    args: argparse.Namespace, timeframe: str
+) -> tuple[str, str, Mapping[str, ParamRange], Scorer | None]:
+    """Return the profile of a run: the space it moves and how it ranks a trial (§7.22).
+
+    The answer is ``(ranges name, score name, ranges, scorer)``.  ``auto`` - the default of both
+    flags - reads the *entry timeframe*: an M5 tape is the second hierarchy of §7.20 and gets the
+    narrowed space and the trade-count score of §7.22, while every other timeframe keeps the whole
+    Э7' space and the out-of-sample score of §7.11.  A flag that names a profile explicitly wins
+    over that pick, so the two studies differ by their command line alone and an M15 run of the
+    first hierarchy behaves exactly as it did before.
+    """
+    auto = "m5" if timeframe.upper() == "M5" else "default"
+    ranges_name = auto if args.ranges == "auto" else args.ranges
+    score_name = auto if args.score == "auto" else args.score
+    scorer = None if score_name == "default" else _trade_target_scorer(args)
+    return ranges_name, score_name, PARAM_PROFILES[ranges_name], scorer
 
 
 def _walk_forward_config(args: argparse.Namespace, timeframe: str) -> WalkForwardConfig:
@@ -190,13 +281,40 @@ def _fold_frame(evaluation: FoldEvaluation) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _test_note(trial: Any) -> str:
+    """Return the out-of-sample reading of a finished trial, or ``''`` when it carries none.
+
+    A real trial of a study records both aggregate tables as user attributes (``set_user_attr`` in
+    the objective of §7.11), so the console can name what each rank was bought with: the trades the
+    out-of-sample folds carried, their profit factor and their win rate.  A stub trial carries no
+    attributes and the note stays empty - the table is a *reading* of the study, never a second
+    computation (rule 5).
+    """
+    attributes = getattr(trial, "user_attrs", None)
+    if not isinstance(attributes, Mapping):
+        return ""
+    test = attributes.get("test")
+    if not isinstance(test, Mapping) or "trades_total" not in test:
+        return ""
+    return (
+        f"  test: trades {float(test['trades_total']):.0f}, "
+        f"pf {float(test.get('pf_mean', 0.0)):.3f}, "
+        f"win {float(test.get('win_rate_mean', 0.0)):.1f}%"
+    )
+
+
 def _print_trials(outcome: OptunaResult, limit: int = TOP_TRIALS) -> None:
-    """Print the best ``limit`` finished trials of a study, best first."""
+    """Print the best ``limit`` finished trials of a study, best first.
+
+    Beside the score and the parameter set of a rank, the line carries the winner's out-of-sample
+    reading when the study recorded one (:func:`_test_note`), so a run of the trade-count profile
+    of §7.22 can be read without opening ``fold_metrics.csv``.
+    """
     finished = [trial for trial in outcome.study.trials if trial.value is not None]
     finished.sort(key=lambda trial: trial.value, reverse=True)
     print(f"trials: {len(outcome.study.trials)} run, {len(finished)} finished")
     for trial in finished[:limit]:
-        print(f"  #{trial.number:<4} score {trial.value:+.4f}  {trial.params}")
+        print(f"  #{trial.number:<4} score {trial.value:+.4f}{_test_note(trial)}  {trial.params}")
 
 def _report_payload(
     args: argparse.Namespace,
@@ -207,14 +325,20 @@ def _report_payload(
     walk_config: WalkForwardConfig,
     study_config: OptunaConfig,
     outcome: OptunaResult,
+    *,
+    ranges_name: str = "default",
+    score_name: str = "default",
 ) -> dict[str, Any]:
     """Return the payload of ``best_params.json``: the winner, its score and its fold aggregates.
 
     ``symbol`` and ``timeframe`` are the *effective* pair of the run - the arguments of the caller
     if it typed them, else the config's (Э10'.2) - so the audit line names the tape the study read;
     ``window`` is the effective window (:func:`scripts._common.resolve_window`), for the same reason.
+    ``ranges_name`` / ``score_name`` name the profile of §7.22 the study ran under, and the two
+    trade targets are recorded beside them whenever the score reads a target at all - a report that
+    named a winner without saying what ranked it would not be reproducible from its own file.
     """
-    return {
+    payload: dict[str, Any] = {
         "symbol": symbol.upper(),
         "timeframe": timeframe.upper(),
         "start": f"{window.start:%Y-%m-%d}",
@@ -231,12 +355,18 @@ def _report_payload(
         "test_period_bars": int(walk_config.test_period_bars),
         "best_trial_number": int(outcome.best_trial_number),
         "best_score": float(outcome.best_score),
+        "param_ranges": ranges_name,
+        "score_profile": score_name,
         "best_params": {
             name: _jsonable(value) for name, value in sorted(outcome.best_params.items())
         },
         "train": _aggregates(outcome.best_evaluation.train_aggregated),
         "test": _aggregates(outcome.best_evaluation.test_aggregated),
     }
+    if score_name == "m5":
+        payload["target_trades"] = int(args.target_trades)
+        payload["min_trades"] = int(args.min_trades)
+    return payload
 
 
 def run(args: argparse.Namespace) -> int:
@@ -256,6 +386,7 @@ def run(args: argparse.Namespace) -> int:
         )
         walk_config = _walk_forward_config(args, timeframe)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)
+        ranges_name, score_name, ranges, scorer = _search_profile(args, timeframe)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -269,9 +400,11 @@ def run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # The config of the run is the base of the study: a trial moves the knobs of ``PARAM_RANGES``
-    # on top of it, and every fold is charged the account of the same config (Э10'.2).  A separate
-    # working frame (§7.20) is marked up once into the cache, beside the trends and the level book.
+    # The config of the run is the base of the study: a trial moves the knobs of the chosen
+    # profile (``PARAM_RANGES`` or the narrowed M5 space of §7.22) on top of it, and every fold is
+    # charged the account of the same config (Э10'.2).  A separate working frame (§7.20) is marked
+    # up once into the cache, beside the trends and the level book.
+    print(f"profile: ranges {ranges_name}, score {score_name}, {len(tape)} bars")
     base = strategy
     marks = build_tape_marks(
         tape,
@@ -283,7 +416,15 @@ def run(args: argparse.Namespace) -> int:
     )
     try:
         outcome = run_optimization(
-            tape, study_config, walk_config, backtest, instrument, base=base, marks=marks
+            tape,
+            study_config,
+            walk_config,
+            backtest,
+            instrument,
+            base=base,
+            marks=marks,
+            ranges=ranges,
+            score=scorer,
         )
     except ImportError as error:
         print(
@@ -319,7 +460,16 @@ def run(args: argparse.Namespace) -> int:
     )
     summary = format_summary(result)
     payload = _report_payload(
-        args, symbol, timeframe, tape, window, walk_config, study_config, outcome
+        args,
+        symbol,
+        timeframe,
+        tape,
+        window,
+        walk_config,
+        study_config,
+        outcome,
+        ranges_name=ranges_name,
+        score_name=score_name,
     )
     export_trades(result, folder, stem="trades")
     (folder / "summary.txt").write_text(summary + "\n", encoding="utf-8")

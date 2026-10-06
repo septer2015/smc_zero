@@ -150,6 +150,12 @@ def aggregate_fold_metrics(fold_results: Sequence[Mapping[str, float]]) -> dict[
     say how uneven the folds were - a 20 day window that made +8 % in one fold and -3 % in the
     next is reported as a mean and that spread, never as the mean alone.
 
+    Beside the pairs, the aggregate carries ``trades_total``: how many trades the folds of the
+    walk-forward opened *together*.  The mean answers "how busy is a fold", the sum answers "how
+    big is the sample this walk-forward is read on" - and a score that rewards the number of
+    trades over the whole out-of-sample period (SPEC_SMC.md §7.22) reads the sum, because a mean
+    of four trades a fold says nothing about whether the study saw 36 trades or four.
+
     An empty list and a table missing one of the six fields are both hard errors: a
     walk-forward without folds has no out-of-sample evidence, and averaging the zeros of an
     unfilled table would invent it.
@@ -171,6 +177,7 @@ def aggregate_fold_metrics(fold_results: Sequence[Mapping[str, float]]) -> dict[
             raise ValueError(f"the {field!r} of a fold is not finite")
         aggregate[f"{field}_mean"] = round(float(values.mean()), 2)
         aggregate[f"{field}_std"] = round(float(values.std()), 2)
+    aggregate["trades_total"] = round(sum(float(table["trades"]) for table in fold_results), 2)
     return aggregate
 
 

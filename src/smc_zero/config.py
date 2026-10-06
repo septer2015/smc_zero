@@ -1243,3 +1243,48 @@ class OptunaConfig:
             )
         if self.penalty_power < 0:
             raise ValueError("penalty_power must be >= 0 (0 switches the decay gate off)")
+
+
+#: The shipped targets of the trade-count score of §7.22: the count the factor of
+#: :func:`smc_zero.optimizer.score.trades_scaled_score` saturates at, and the floor below which that
+#: score is a flat zero.  They are module constants and not only dataclass defaults because the two
+#: command lines of the M5 study name them as ``--target-trades`` / ``--min-trades``, and a help
+#: string that repeated the numbers would be a second copy of a trading decision (rule 5).
+DEFAULT_TARGET_TRADES = 25
+DEFAULT_MIN_TRADES = 10
+
+
+@dataclass(frozen=True, slots=True)
+class TradeTargetScore:
+    """The two numbers of the trade-target score of the second hierarchy (SPEC_SMC.md §7.22).
+
+    The score of :func:`smc_zero.optimizer.score.trades_scaled_score` ranks a parameter set by
+    the profit factor of its out-of-sample folds, scaled by how many trades those folds carried
+    relative to a target.  Both numbers are a *search decision* and not a code one, so they live
+    here and not in the score function:
+
+    * ``target_trades`` - how many trades the whole out-of-sample period should carry before the
+      count factor saturates at one.  The shipped 25 is the middle of the 25 - 40 trades the M5
+      study of §7.22 is aiming for on 1.4 years of five minute bars; the factor *caps* here, so a
+      parameter set is not rewarded for opening trades past the target;
+    * ``min_trades`` - the floor below which the score is a flat zero whatever the profit factor
+      says.  The shipped 10 is a fifth of the baseline run (12 trades) and the smallest sample a
+      profit factor of this hierarchy has been read on, so a study cannot win on noise.
+
+    Both are integers and both are validated: a target the floor exceeds is a contradiction (every
+    trial would score zero), and a floor of zero would let a walk-forward that never traded win by
+    a profit factor of ``0.0`` - which is why ``min_trades`` is ``>= 1``.
+    """
+
+    target_trades: int = DEFAULT_TARGET_TRADES
+    min_trades: int = DEFAULT_MIN_TRADES
+
+    def __post_init__(self) -> None:
+        if self.target_trades < 1:
+            raise ValueError("target_trades must be >= 1")
+        if self.min_trades < 1:
+            raise ValueError("min_trades must be >= 1")
+        if self.min_trades > self.target_trades:
+            raise ValueError(
+                f"min_trades must be <= target_trades, got {self.min_trades} > {self.target_trades}"
+            )

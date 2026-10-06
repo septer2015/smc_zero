@@ -28,7 +28,7 @@ plumbing are plain objects, and only an actual study needs optuna.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -49,7 +49,14 @@ from smc_zero.config import (
 )
 from smc_zero.data_loader import drop_unclosed
 from smc_zero.optimizer.marks import TapeMarks, build_tape_marks, cache_mismatches
-from smc_zero.optimizer.ranges import ParamValue, TrialLike, apply_params, suggest_params
+from smc_zero.optimizer.ranges import (
+    PARAM_RANGES,
+    ParamRange,
+    ParamValue,
+    TrialLike,
+    apply_params,
+    suggest_params,
+)
 from smc_zero.optimizer.score import score_from_aggregates
 from smc_zero.strategy.base import TradeIntent
 from smc_zero.strategy.intents import build_intents
@@ -81,8 +88,47 @@ Evaluator: TypeAlias = Callable[
     FoldEvaluation,
 ]
 
+#: How one trial is turned into a number: the two aggregated fold tables of Э6' in, a score out.
+#: ``score_from_aggregates`` (§7.11) is the default and reads the out-of-sample half with its
+#: drawdown and decay factors; ``trades_scaled_score`` (§7.22) is the trade-count score of the
+#: second hierarchy.  The seam exists so a study can be ranked by another honest reading of the
+#: same walk-forward without a second optimizer: nothing else about the trial plumbing changes.
+Scorer: TypeAlias = Callable[[Mapping[str, float], Mapping[str, float]], float]
+
 #: How a study is created; :func:`_create_study` is the optuna one.
 StudyFactory: TypeAlias = Callable[[OptunaConfig], Any]
+
+
+def _fold_structure(structure: pd.DataFrame, bars: pd.DataFrame) -> pd.DataFrame:
+    """Return the cached structure layer cut to ``bars`` and re-based on its own positions.
+
+    The layer of :func:`~smc_zero.indicators.structure.structure_layer` - and therefore the chain
+    that reads it - speaks in *positions of the frame the layer was built for*: ``disp_known_at``
+    is the entry bar at which the impulse of the working frame becomes knowable (the gate is
+    ``disp_known_at <= attempt``, read positionally in
+    :func:`smc_zero.strategy.intents.build_intents`).  A fold of the walk-forward is a positional
+    slice of the tape, so the raw ``structure.loc[<fold index>]`` rows carry positions of the
+    *whole* tape into a frame that starts at zero: every ``disp_known_at`` would then sit ahead of
+    every attempt of the fold and the gate would refuse each one.  That is not a theoretical edge -
+    it was measured on 1.4 years of M5 bars: the nine out-of-sample folds opened **zero** trades
+    each, while the whole-window run of the same parameters opened twelve, and the trade-count
+    score of §7.22 read a flat zero for every trial of the study.
+
+    The correction is the offset of the cut inside the layer: ``break_dir`` and ``disp_ok`` are
+    verdicts about a bar and stay as they are, ``disp_known_at`` is a coordinate and moves with the
+    frame.  A bar that became knowable *before* the fold keeps its "already known" meaning: its
+    re-based position is negative, and ``-3 <= attempt`` is as true as the original comparison was.
+
+    ``bars`` is the frame the chain is about to read (the fold's entry bars, unclosed tail
+    dropped); its labels index into ``structure`` or :meth:`pandas.Index.get_indexer` answers a
+    ``-1`` for the offset and the arithmetic of the caller breaks loudly instead of shifting by a
+    wrong amount.
+    """
+    cut = structure.loc[bars.index]
+    offset = int(structure.index.get_indexer(bars.index[:1])[0])
+    if offset <= 0:
+        return cut
+    return cut.assign(disp_known_at=cut["disp_known_at"] - offset)
 
 
 def _intents_fn(
@@ -103,13 +149,14 @@ def _intents_fn(
 
     ``structure`` is the cached layer of a separate working frame (§7.20).  It covers the whole
     tape while a fold is a window of it, so the layer is cut to the very bars the chain will read
-    (``drop_unclosed(test)`` - the same rows :func:`build_intents` keeps) before it is handed over;
-    the cache stays one frame per study instead of one per fold.
+    (``drop_unclosed(test)`` - the same rows :func:`build_intents` keeps) and re-based on the
+    fold's own positions (:func:`_fold_structure`) before it is handed over; the cache stays one
+    frame per study instead of one per fold.
     """
 
     def build(train: pd.DataFrame, test: pd.DataFrame) -> tuple[TradeIntent, ...]:
         """Arm the entry chain on the test window and return its accepted intents."""
-        window = None if structure is None else structure.loc[drop_unclosed(test).index]
+        window = None if structure is None else _fold_structure(structure, drop_unclosed(test))
         return build_intents(test, bias, levels, cfg, structure=window).intents
 
     return build
@@ -158,6 +205,22 @@ def evaluate_params(
     )
 
 
+def _out_of_sample_scorer(config: OptunaConfig) -> Scorer:
+    """Return the default scorer of a study: the §7.11 reading of the test window.
+
+    The score of :func:`~smc_zero.optimizer.score.score_from_aggregates` with the run's own
+    ``score_metric`` and ``penalty_power`` bound to it.  A :data:`Scorer` is a pure function of
+    the two aggregated fold tables, so the two decisions of the budget travel in the closure and
+    the seam in :func:`make_objective` stays a plain ``Callable``.
+    """
+
+    def score(train: Mapping[str, float], test: Mapping[str, float]) -> float:
+        """Return the out-of-sample score of one trial under this run's decisions."""
+        return score_from_aggregates(train, test, config)
+
+    return score
+
+
 def make_objective(
     df: pd.DataFrame,
     cfg_opt: OptunaConfig | None = None,
@@ -168,15 +231,24 @@ def make_objective(
     base: StrategyConfig | None = None,
     marks: TapeMarks | None = None,
     evaluate: Evaluator = evaluate_params,
+    ranges: Mapping[str, ParamRange] = PARAM_RANGES,
+    score: Scorer | None = None,
 ) -> Callable[[TrialLike], float]:
     """Return the objective of one optimization run, ready for ``study.optimize``.
 
-    Each call asks the trial for a value per range of
-    :data:`~smc_zero.optimizer.ranges.PARAM_RANGES` (:func:`suggest_params`), applies them
-    to ``base`` (:func:`apply_params`), evaluates the whole tape with that configuration
-    (:func:`evaluate_params` by default) and returns the OOS score of
-    :func:`~smc_zero.optimizer.score.score_from_aggregates`; both aggregates are also stored
-    on the trial as user attributes, so a finished study can be read without rerunning it.
+    Each call asks the trial for a value per range of ``ranges`` (:func:`suggest_params`),
+    applies them to ``base`` (:func:`apply_params`), evaluates the whole tape with that
+    configuration (:func:`evaluate_params` by default) and returns ``score`` of the two
+    aggregated fold tables; both aggregates are also stored on the trial as user attributes,
+    so a finished study can be read without rerunning it.
+
+    ``ranges`` is the search space of the study and defaults to the whole Э7' space of
+    :data:`~smc_zero.optimizer.ranges.PARAM_RANGES`; a *narrower* mapping (the profile of §7.22,
+    for instance) is a legitimate experiment, because only the paths it names are proposed -
+    the others keep the values of ``base``.  ``score`` is how the trial is ranked and defaults
+    to :func:`_out_of_sample_scorer`, i.e. the §7.11 score with this run's metric and gate;
+    another honest reading of the same walk-forward (the trade-count score of §7.22) plugs in
+    here without touching the trial plumbing.
 
     ``marks`` is the markup cache, built here with :func:`build_tape_marks` when not handed
     in - once for the whole study, never per trial.  ``base`` is the configuration a trial
@@ -192,6 +264,7 @@ def make_objective(
     backtest_cfg = BacktestConfig() if backtest is None else backtest
     spec = DEFAULT_INSTRUMENT if instrument is None else instrument
     cache = build_tape_marks(df, base_cfg) if marks is None else marks
+    scorer = _out_of_sample_scorer(config) if score is None else score
     stale = cache_mismatches(cache, base_cfg)
     if stale:
         raise ValueError(
@@ -202,14 +275,12 @@ def make_objective(
 
     def objective(trial: TrialLike) -> float:
         """Score one trial: suggest, apply, evaluate on both windows, weigh them."""
-        params = suggest_params(trial)
+        params = suggest_params(trial, ranges)
         cfg_strategy = apply_params(base_cfg, params)
         evaluation = evaluate(df, cache, cfg_strategy, walk_cfg, backtest_cfg, spec)
         trial.set_user_attr("train", evaluation.train_aggregated)
         trial.set_user_attr("test", evaluation.test_aggregated)
-        return score_from_aggregates(
-            evaluation.train_aggregated, evaluation.test_aggregated, config
-        )
+        return scorer(evaluation.train_aggregated, evaluation.test_aggregated)
 
     return objective
 
@@ -271,6 +342,8 @@ def run_optimization(
     base: StrategyConfig | None = None,
     marks: TapeMarks | None = None,
     evaluate: Evaluator = evaluate_params,
+    ranges: Mapping[str, ParamRange] = PARAM_RANGES,
+    score: Scorer | None = None,
     study_factory: StudyFactory = _create_study,
 ) -> OptunaResult:
     """Maximize the OOS score of the É6' walk-forward over ``df`` and return the winner.
@@ -281,6 +354,13 @@ def run_optimization(
     the best parameters and evaluate them over every fold again.  The re-evaluation is the
     honest part of the report: ``best_score`` is what the study recorded, while
     ``best_evaluation`` is what that configuration actually produces now.
+
+    ``ranges`` and ``score`` are the two seams of the study and are handed to
+    :func:`make_objective` unchanged: the first is the space the trials move (the whole Э7'
+    space by default, the narrowed M5 profile of §7.22 on demand) and the second how they are
+    ranked.  The winner is re-evaluated with the same ``evaluate`` and therefore with the same
+    ``ranges``/``score`` semantics: ``best_evaluation`` is a fresh reading of the winner's
+    configuration, not a table copied out of the study.
 
     A study in which *every* trial failed has no winner; optuna's own error is left to
     propagate rather than returning an empty result that looks like success.  Runs are
@@ -302,6 +382,8 @@ def run_optimization(
         base=base_cfg,
         marks=cache,
         evaluate=evaluate,
+        ranges=ranges,
+        score=score,
     )
     study = study_factory(config)
     study.optimize(objective, n_trials=config.n_trials, n_jobs=config.n_jobs)

@@ -29,17 +29,35 @@ The mutations the layer is one line away from, and the test each one must break:
   dropped → ``+1.8181`` instead of ``0``, ``abs()`` → ``-1.8181`` instead of ``0``; the same drop
   on the first real run scored ``+9.6154``); breaks
   :func:`test_a_losing_test_window_scores_zero_whatever_the_gate_and_its_metric`.
+* m7 "suggest the whole space whatever a ``ranges`` mapping was handed in"
+  (``suggest_params(trial)`` without the second argument) - the narrowed profile of §7.22 silently
+  searches eleven knobs again and the study is not the study its command line names; breaks
+  :func:`test_the_objective_honours_a_narrowed_search_space`.
+* m8 "drop the trade-count floor of §7.22" (``min_trades`` ignored) - a walk-forward of four trades
+  outranks one of forty by its profit factor alone, i.e. the study optimizes noise; breaks
+  :func:`test_the_trade_count_score_is_flat_below_its_floor`.
+* m9 "hand the chain the raw cut of the structure layer" (``_fold_structure`` reduced to
+  ``structure.loc[bars.index]``, or the builder forgetting to call it) - ``disp_known_at`` keeps
+  the positions of the whole tape inside a fold that starts at zero, so the gate
+  ``disp_known_at <= attempt`` refuses every setup of every fold but the first (measured on the
+  live M5 tape: nine folds, zero trades each, against twelve trades of the whole-window run); breaks
+  :func:`test_a_fold_layer_is_rebased_on_its_own_positions` and
+  :func:`test_the_fold_builder_rebases_the_layer_it_hands_to_the_chain`.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
+from typing import Any
 
 import pandas as pd
 import pytest
 
-from smc_zero.config import AGREEMENTS, OptunaConfig, StrategyConfig
+import smc_zero.optimizer.optimize as optimize_module
+from smc_zero.config import AGREEMENTS, OptunaConfig, StrategyConfig, TradeTargetScore
 from smc_zero.optimizer import (
+    M5_PARAM_RANGES,
     PARAM_RANGES,
     ChoiceRange,
     FloatRange,
@@ -55,7 +73,9 @@ from smc_zero.optimizer import (
     run_optimization,
     score_from_aggregates,
     suggest_params,
+    trades_scaled_score,
 )
+from smc_zero.optimizer.optimize import _fold_structure, _intents_fn
 
 #: The aggregate tables of the worked example, and the score they must produce by hand:
 #: ``2.0 * 50 / (1 + 10) = 9.0909...`` - the metric, the profit and the drawdown of the test
@@ -514,3 +534,186 @@ def test_a_run_refuses_a_stale_cache_before_creating_its_study() -> None:
         )
 
     assert created == []
+
+
+#: The two aggregate tables of the trade-count example of §7.22: a walk-forward whose test folds
+#: carried 20 trades at a profit factor of 2.0, under the shipped target of 25 and floor of 10.
+TRADES_TEST = {"pf_mean": 2.0, "trades_total": 20.0}
+
+
+def test_the_trade_count_score_scales_the_profit_factor_by_the_trade_share() -> None:
+    """Below the target the score is ``pf * trades / target``; at the target it is the pf itself."""
+    cfg = TradeTargetScore()
+
+    below = trades_scaled_score({}, TRADES_TEST, cfg)
+    at_target = trades_scaled_score({}, {"pf_mean": 2.0, "trades_total": 25.0}, cfg)
+    above = trades_scaled_score({}, {"pf_mean": 2.0, "trades_total": 60.0}, cfg)
+
+    assert below == pytest.approx(2.0 * 20.0 / 25.0)
+    assert at_target == pytest.approx(2.0)
+    # The factor caps at one: past the target more trades buy no rank (the honest half of the rule).
+    assert above == pytest.approx(2.0)
+
+
+def test_the_trade_count_score_is_flat_below_its_floor_and_on_a_flat_edge() -> None:
+    """Fewer trades than the floor scores zero whatever the profit factor says (m8)."""
+    cfg = TradeTargetScore()
+
+    assert cfg.min_trades == 10
+    assert trades_scaled_score({}, {"pf_mean": 9.0, "trades_total": 9.0}, cfg) == 0.0
+    # A test window whose folds never made a profit factor (no trade, or no win) scores zero as well.
+    assert trades_scaled_score({}, {"pf_mean": 0.0, "trades_total": 30.0}, cfg) == 0.0
+
+
+def test_the_trade_count_score_reads_the_test_half_and_needs_the_total() -> None:
+    """The train table is part of the shared signature and is not read; the sum is required."""
+    cfg = TradeTargetScore(target_trades=10, min_trades=1)
+
+    # A rich *train* window changes nothing: this score has no decay gate (unlike §7.11).
+    assert trades_scaled_score(
+        {"pf_mean": 99.0, "trades_total": 1.0}, {"pf_mean": 1.5, "trades_total": 10.0}, cfg
+    ) == pytest.approx(1.5)
+    # The mean of the folds is not the sample size of the period the score is read on.
+    with pytest.raises(ValueError, match="trades_total"):
+        trades_scaled_score({}, {"pf_mean": 2.0, "trades_mean": 4.0}, cfg)
+
+
+def test_the_objective_honours_a_narrowed_search_space() -> None:
+    """A narrowed space searches its own paths and leaves the rest of the config at ``base`` (m7)."""
+    base = StrategyConfig()
+    evaluator = _RecordingEvaluator()
+    objective = make_objective(
+        pd.DataFrame(), base=base, marks=_marks(), evaluate=evaluator, ranges=M5_PARAM_RANGES
+    )
+    trial = _StubTrial()
+
+    objective(trial)
+
+    assert trial.asked == list(M5_PARAM_RANGES)
+    seen = evaluator.configs[0]
+    # The three bar windows and the two gates of the M5 profile moved (the stub answers the low end).
+    assert seen.choch_wait_bars == M5_PARAM_RANGES["choch_wait_bars"].low
+    assert seen.fvg_lookback == M5_PARAM_RANGES["fvg_lookback"].low
+    assert seen.signal_max_age_bars == M5_PARAM_RANGES["signal_max_age_bars"].low
+    assert seen.min_sl_realistic_pip == M5_PARAM_RANGES["min_sl_realistic_pip"].low
+    assert seen.displacement.atr_mult_min == M5_PARAM_RANGES["displacement.atr_mult_min"].low
+    # The knobs the profile does not name are untouched: they carry the live config of §7.20.
+    assert seen.sl_buffer_pip == base.sl_buffer_pip
+    assert seen.max_fvg_age_bars == base.max_fvg_age_bars
+    assert seen.take_profit == base.take_profit
+    assert seen.bias.agreement == base.bias.agreement
+
+
+def test_a_custom_scorer_ranks_the_trial_instead_of_the_out_of_sample_one() -> None:
+    """The ``score`` seam replaces the reading of the walk-forward and nothing else."""
+    seen: list[tuple[object, object]] = []
+
+    def scorer(train: object, test: object) -> float:
+        """Record the two tables and answer a fixed number."""
+        seen.append((train, test))
+        return 4.25
+
+    evaluator = _RecordingEvaluator()
+    objective = make_objective(pd.DataFrame(), marks=_marks(), evaluate=evaluator, score=scorer)
+
+    score = objective(_StubTrial())
+
+    assert score == pytest.approx(4.25)
+    assert seen == [(TRAIN, TEST)]
+    assert len(evaluator.configs) == 1
+
+
+def test_the_m5_profile_names_real_fields_inside_the_gates_it_must_respect() -> None:
+    """Every path of the narrowed space exists, and its bounds do not cross a shipped ceiling."""
+    base = StrategyConfig()
+
+    for path, param_range in M5_PARAM_RANGES.items():
+        value = resolve_path(base, path)
+        assert isinstance(value, (int, float)) and not isinstance(value, bool), path
+        assert param_range.low < param_range.high, path
+
+    # The realistic SL band of §7.8 is a *pair*: a searched floor may not cross its ceiling.
+    assert M5_PARAM_RANGES["min_sl_realistic_pip"].high < base.max_sl_realistic_pip
+    # The narrowed space never moves an input of the markup cache (the same rule the Э7' space
+    # obeys): the level map, the sessions and the bias swings stay as the cache was built.
+    assert not any(
+        path.startswith(("levels.", "session.", "bias.")) for path in M5_PARAM_RANGES
+    )
+
+
+def test_a_fold_layer_is_rebased_on_its_own_positions() -> None:
+    """The layer of a slice is re-based: ``disp_known_at`` is a position, the verdicts are not (m9).
+
+    A fold is a positional slice of the tape, while the cached layer speaks in the positions of the
+    frame it was built for; the raw rows would leave every ``disp_known_at`` ahead of every attempt
+    of the fold, and the chain would refuse every setup of every fold but the first.
+    """
+    layer = pd.DataFrame(
+        {
+            "break_dir": pd.array([0, -1, -1, 1], dtype="int8"),
+            "disp_ok": pd.array([False, True, True, False]),
+            "disp_known_at": pd.array([3, 5, 6, 8], dtype="Int64"),
+        },
+        index=[7, 8, 9, 10],
+    )
+    bars = pd.DataFrame(index=[9, 10])
+
+    cut = _fold_structure(layer, bars)
+
+    assert cut.index.tolist() == [9, 10]
+    # the coordinates move with the frame: the slice starts at position 2 of the layer, so the
+    # ``disp_known_at`` values 6 / 8 of the layer are 4 / 6 of the fold
+    assert cut["disp_known_at"].tolist() == [4, 6]
+    # ... and the verdicts about a bar stay as they are
+    assert cut["break_dir"].tolist() == [-1, 1]
+    assert cut["disp_ok"].tolist() == [True, False]
+    # the first rows of the layer are the frame the fold starts in: no shift at all
+    pd.testing.assert_frame_equal(_fold_structure(layer, layer), layer)
+
+
+def test_the_fold_builder_rebases_the_layer_it_hands_to_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The builder cuts the cached layer and re-bases it before the chain reads it (m9).
+
+    The layer of a study covers the whole tape; a fold is a slice of it.  The builder must hand
+    the chain the *re-based* rows (``_fold_structure``) rather than the raw cut, otherwise
+    ``disp_known_at`` keeps the tape's positions inside a frame that starts at zero and every
+    setup of the fold is refused.
+    """
+    layer = pd.DataFrame(
+        {
+            "break_dir": pd.array([0, -1, -1, 1], dtype="int8"),
+            "disp_ok": pd.array([False, True, True, False]),
+            "disp_known_at": pd.array([3, 5, 6, 8], dtype="Int64"),
+        },
+        index=[7, 8, 9, 10],
+    )
+    handed: list[pd.DataFrame | None] = []
+
+    def stub_chain(
+        ltf: pd.DataFrame,
+        bias: pd.DataFrame,
+        levels: pd.DataFrame,
+        cfg: StrategyConfig | None = None,
+        *,
+        structure: pd.DataFrame | None = None,
+    ) -> Any:
+        """Record the layer the builder hands over and answer with it as the intents."""
+        handed.append(structure)
+        return SimpleNamespace(intents=())
+
+    monkeypatch.setattr(optimize_module, "build_intents", stub_chain)
+    build = _intents_fn(pd.DataFrame(), pd.DataFrame(), StrategyConfig(), layer)
+    bars = pd.DataFrame({"is_closed": [True, True]}, index=[9, 10])
+
+    build(pd.DataFrame(index=[9, 10]), bars)
+
+    assert handed[0] is not None
+    assert handed[0]["disp_known_at"].tolist() == [4, 6]
+    # ... and a tape with no separate working frame keeps the v1 path: nothing is handed over
+    build_v1 = _intents_fn(pd.DataFrame(), pd.DataFrame(), StrategyConfig(), None)
+
+    build_v1(bars, bars)
+
+    assert handed[1] is None

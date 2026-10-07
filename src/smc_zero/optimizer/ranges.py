@@ -18,7 +18,8 @@ A path is a dotted field name of :class:`~smc_zero.config.StrategyConfig`
 that reader to prove every range names a real field, so a typo fails loudly instead of
 silently optimizing nothing.
 
-A trial may vary the paths of :data:`PARAM_RANGES` and nothing else: the markup cache of
+A trial may vary the paths of the active search space (:data:`PARAM_RANGES`, or the
+narrowed profile of :data:`PARAM_PROFILES`) and nothing else: the markup cache of
 :mod:`smc_zero.optimizer.marks` is built once per run from the parts of the config the
 space does not reach, and :func:`smc_zero.optimizer.marks.cache_mismatches` refuses a
 config that would have made it stale.
@@ -174,7 +175,7 @@ PARAM_RANGES: dict[str, ParamRange] = {
 }
 
 
-#: The search space of the second hierarchy (H4 -> M15 -> M5, SPEC_SMC.md §7.22): the five knobs
+#: The search space of the second hierarchy (H4 -> M15 -> M5, SPEC_SMC.md §7.22): the four knobs
 #: that decide how many setups of a five minute tape survive to an entry.  The space is *narrowed*
 #: on purpose - the pip-sized gates of the M15 chain (sweep buffer, SL buffer, FVG size, gap age,
 #: take-profit ratios, ``bias.agreement``) are carried by the live config of §7.20 and are not
@@ -184,20 +185,26 @@ PARAM_RANGES: dict[str, ParamRange] = {
 #:   bar is three times shorter than an M15 one - the shipped 21 / 20 / 94 are the M15 readings of
 #:   the same minutes, so the ranges start above them and let the study pick the length that keeps
 #:   the sweep -> CHoCH -> FVG sequence alive on five minute bars;
-#: * ``min_sl_realistic_pip`` / ``displacement.atr_mult_min`` are the two gates that turned most M5
-#:   intents into ``sl_rejected_wide``: a five minute sweep sits closer to its level, so the
-#:   realistic SL band that M15 arithmetic asked for has to be lowered before the setup is tradeable.
+#: * ``min_sl_realistic_pip`` is the gate that turned most M5 intents into ``sl_rejected_wide``: a
+#:   five minute sweep sits closer to its level, so the realistic SL band that M15 arithmetic asked
+#:   for has to be lowered before the setup is tradeable.
+#:
+#: ``displacement.atr_mult_min`` is deliberately **not** searched here (SPEC_SMC.md §7.22 п.122):
+#: the impulse gate feeds :func:`~smc_zero.indicators.structure.structure_layer`, so it is an input
+#: of the markup cache, and that cache is built once per run from the base configuration.  A trial
+#: that moved the path would then be scored against a structure its own value never produced, and
+#: the report of the "winner" would not be reproducible by a plain backtest.  Until the tape of
+#: Э13.6 is long enough to justify another reading of the caching (§7.22 п.122), the knob keeps the
+#: live value of §7.20.
 #:
 #: The bounds bracket the values the shipped M5 config carries where it has a counterpart
-#: (``fvg_lookback=21``, ``displacement.atr_mult_min=0.745``) and *deliberately* start above the
-#: M15 readings of the bar windows, which is the point of the narrowing: those two are the knobs a
-#: study of the second hierarchy exists to move.  A trial may vary these paths and nothing else -
-#: the markup cache of :mod:`smc_zero.optimizer.marks` is built from the frozen remainder.
+#: (``fvg_lookback=21``) and *deliberately* start above the M15 readings of the bar windows, which
+#: is the point of the narrowing.  A trial may vary these paths and nothing else - the markup cache
+#: of :mod:`smc_zero.optimizer.marks` is built from the frozen remainder.
 M5_PARAM_RANGES: dict[str, ParamRange] = {
     "fvg_lookback": IntRange(20, 80),
     "choch_wait_bars": IntRange(30, 120),
     "min_sl_realistic_pip": FloatRange(10.0, 25.0),
-    "displacement.atr_mult_min": FloatRange(0.5, 1.0),
     "signal_max_age_bars": IntRange(150, 400),
 }
 

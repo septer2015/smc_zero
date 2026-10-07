@@ -55,6 +55,11 @@ The mutations the layer is one line away from, and the test each one must break:
 * m12 "read a pool of two or three folds" (the ``min_valid_folds`` gate dropped) - the score is
   read on a sample the stage itself calls statistically empty (nine folds of 1.4 years, §7.22
   п.120); breaks :func:`test_the_m5_score_requires_minimum_valid_folds`.
+* m13 "put ``displacement.atr_mult_min`` back into the M5 profile" (the entry the stage dropped in
+  §7.22 п.122 restored to ``M5_PARAM_RANGES``) - ``structure_layer`` reads ``config.displacement``,
+  so the path is an input of the markup cache, while a study builds that cache once from the base
+  configuration: the trial would be scored against a structure its own value never produced; breaks
+  :func:`test_the_m5_profile_names_real_fields_inside_the_gates_it_must_respect`.
 """
 
 from __future__ import annotations
@@ -696,12 +701,14 @@ def test_the_objective_honours_a_narrowed_search_space() -> None:
 
     assert trial.asked == list(M5_PARAM_RANGES)
     seen = evaluator.configs[0]
-    # The three bar windows and the two gates of the M5 profile moved (the stub answers the low end).
+    # The three bar windows and the SL gate of the M5 profile moved (the stub answers the low end).
     assert seen.choch_wait_bars == M5_PARAM_RANGES["choch_wait_bars"].low
     assert seen.fvg_lookback == M5_PARAM_RANGES["fvg_lookback"].low
     assert seen.signal_max_age_bars == M5_PARAM_RANGES["signal_max_age_bars"].low
     assert seen.min_sl_realistic_pip == M5_PARAM_RANGES["min_sl_realistic_pip"].low
-    assert seen.displacement.atr_mult_min == M5_PARAM_RANGES["displacement.atr_mult_min"].low
+    # The impulse gate is not a knob of the profile any more (§7.22 п.122): it is an input of the
+    # markup cache, so the trial keeps whatever the base configuration carries.
+    assert seen.displacement == base.displacement
     # The knobs the profile does not name are untouched: they carry the live config of §7.20.
     assert seen.sl_buffer_pip == base.sl_buffer_pip
     assert seen.max_fvg_age_bars == base.max_fvg_age_bars
@@ -739,10 +746,22 @@ def test_the_m5_profile_names_real_fields_inside_the_gates_it_must_respect() -> 
 
     # The realistic SL band of §7.8 is a *pair*: a searched floor may not cross its ceiling.
     assert M5_PARAM_RANGES["min_sl_realistic_pip"].high < base.max_sl_realistic_pip
+    # The profile is four knobs, and the impulse gate is not one of them any more (§7.22 п.122):
+    # ``structure_layer`` reads ``config.displacement``, so the path is an *input* of the markup
+    # cache, while the cache of a study is built once from the base configuration.  A trial that
+    # moved the knob would be scored against a structure its own value never produced (m13).
+    assert set(M5_PARAM_RANGES) == {
+        "fvg_lookback",
+        "choch_wait_bars",
+        "min_sl_realistic_pip",
+        "signal_max_age_bars",
+    }
     # The narrowed space never moves an input of the markup cache (the same rule the Э7' space
-    # obeys): the level map, the sessions and the bias swings stay as the cache was built.
+    # obeys): the level map, the sessions, the bias swings and the impulse gate stay as the cache
+    # was built.
     assert not any(
-        path.startswith(("levels.", "session.", "bias.")) for path in M5_PARAM_RANGES
+        path.startswith(("levels.", "session.", "bias.", "displacement."))
+        for path in M5_PARAM_RANGES
     )
 
 

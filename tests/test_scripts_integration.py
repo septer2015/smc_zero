@@ -146,13 +146,14 @@ def test_the_optimization_script_runs_end_to_end_on_a_synthetic_tape(tmp_path: P
 
 
 def test_the_entry_points_of_the_project_point_at_the_runners() -> None:
-    """``pyproject.toml`` registers both console scripts, and both targets are callable."""
+    """``pyproject.toml`` registers the console scripts of the project, all of them callable."""
     with (REPO / "pyproject.toml").open("rb") as handle:
         targets = tomllib.load(handle)["project"]["scripts"]
 
     assert targets == {
         "smc-backtest": "scripts.run_backtest:main",
         "smc-optimize": "scripts.run_optimization:main",
+        "smc-check-tape": "scripts.check_tape:main",
     }
     for target in targets.values():
         module, _, attribute = target.partition(":")

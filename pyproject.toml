@@ -32,6 +32,8 @@ optimize = ["optuna>=4.9,<5"]
 # entry points would be registered and unimportable after an editable install.
 smc-backtest = "scripts.run_backtest:main"
 smc-optimize = "scripts.run_optimization:main"
+# Э13.2: the tape health check of a hand-made MT5 export - duplicates, grid, coverage.
+smc-check-tape = "scripts.check_tape:main"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]

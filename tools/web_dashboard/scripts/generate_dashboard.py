@@ -22,6 +22,12 @@ One command is enough (no server, the internet is needed only to load Plotly fro
     python tools/web_dashboard/scripts/generate_dashboard.py --report-dir ./reports/<report> \\
         --output ./tools/web_dashboard/public/dashboard.html
 
+The default output is a run artifact, so it goes to the ignored project ``./tmp``:
+``tmp/dashboard.html`` for a report and ``tmp/dashboard_demo.html`` for the demo.  A relative
+``--output`` is resolved from the repository root (the folder holding ``pyproject.toml``), never
+from the current directory, so a run started anywhere still writes inside the project.  The tool's
+``public/`` folder stays a valid place for the finished page through an explicit ``--output``.
+
 Plotly is an optional core dependency (extra ``dashboard``), so the import is guarded by a clear
 message instead of a raw traceback.
 """
@@ -50,8 +56,42 @@ except ImportError as error:  # pragma: no cover - runs only without the optiona
 
 
 # --- Style and path constants -----------------------------------------------------------
-#: Where the finished HTML lands by default (next to the tool itself).
-DEFAULT_OUTPUT = Path("tools/web_dashboard/public/dashboard.html")
+#: Marker of the repository root: the packaging file of the project.
+REPO_MARKER = "pyproject.toml"
+
+
+def find_repo_root(start: Path | None = None) -> Path:
+    """Return the repository root: the closest parent of the tool holding ``pyproject.toml``.
+
+    A relative output path is resolved from this root, so the page always lands inside the
+    project ``./tmp``, no matter which directory the command was started from.  When the marker
+    is absent (the tool copied out of the repository), the folder above ``tools/web_dashboard``
+    is taken; the last resort is the folder holding this script.
+    """
+    origin = (start or Path(__file__)).resolve()
+    if origin.is_file():
+        origin = origin.parent
+    for candidate in (origin, *origin.parents):
+        if (candidate / REPO_MARKER).is_file():
+            return candidate
+    for candidate in (origin, *origin.parents):
+        if (candidate / "tools" / "web_dashboard").is_dir():
+            return candidate
+    return origin
+
+
+def resolve_output(path: str | Path) -> Path:
+    """Resolve an output path: an absolute one as it is, a relative one from the repository root."""
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else REPO_ROOT / candidate
+
+
+#: The repository root: relative output paths are counted from here, never from the current dir.
+REPO_ROOT = find_repo_root()
+#: Where the page of a real report lands by default: the ignored project ``./tmp``.
+DEFAULT_OUTPUT = Path("tmp/dashboard.html")
+#: Where the demo page lands by default: its own name, so the demo does not overwrite the report.
+DEMO_OUTPUT = Path("tmp/dashboard_demo.html")
 #: Plotly version the page pulls.  From the CDN, so megabytes of JS are not baked into the HTML.
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 #: How many recent trades the table shows.
@@ -180,8 +220,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default=str(DEFAULT_OUTPUT),
-        help=f"путь итогового HTML (по умолчанию {DEFAULT_OUTPUT})",
+        default=None,
+        help=(
+            "путь итогового HTML; относительный путь считается от корня репозитория, "
+            f"по умолчанию {DEFAULT_OUTPUT} (в демо-режиме {DEMO_OUTPUT})"
+        ),
     )
     parser.add_argument("--title", default=None, help="заголовок страницы и вкладки")
     parser.add_argument(
@@ -1114,13 +1157,20 @@ def render_html(
 
 
 def write_dashboard(html_text: str, output: Path) -> Path:
-    """Write the HTML, creating the missing directories (including the tool's ``public/``)."""
+    """Write the HTML, creating the missing directories (including the project ``./tmp``)."""
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html_text, encoding="utf-8")
     return output
 
 
 # --- Entry point ----------------------------------------------------------------------------
+def default_output(args: argparse.Namespace) -> Path:
+    """Return the output path: an explicit ``--output`` wins, otherwise the project ``./tmp``."""
+    if args.output:
+        return resolve_output(args.output)
+    return REPO_ROOT / (DEMO_OUTPUT if args.demo else DEFAULT_OUTPUT)
+
+
 def _resolve_sources(args: argparse.Namespace) -> tuple[Report, pd.DataFrame | None]:
     """Pick the main report and the optional OHLC tape from the command line arguments."""
     tape = load_tape(Path(args.tape)) if args.tape else None
@@ -1164,7 +1214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     blocks.extend(compare_blocks)
     title = args.title or f"SMC backtest dashboard — {primary.symbol} {primary.timeframe}"
     html_text = render_html(title, cards, blocks, notes, inline_plotly=args.inline_plotly)
-    output = write_dashboard(html_text, Path(args.output))
+    output = write_dashboard(html_text, default_output(args))
     print(f"dashboard: {output}")
     return 0
 

@@ -22,11 +22,11 @@
   nohup env PYTHONPATH=src .venv/bin/python -m scripts.run_optimization \
     --symbol EURUSD --start 2022-08-15 --end 2026-09-22 \
     --n-trials 100 --jobs 2 --seed 42 --report-dir ./reports/full_run \
-    > /tmp/opt_run.log 2>&1 &
+    > ./tmp/opt_run.log 2>&1 &
 - После запуска ОБЯЗАТЕЛЬНО вывести:
   * PID процесса
-  * Команду счётчика прогресса: grep -c 'Trial.*finished' /tmp/opt_run.log
-  * Команду просмотра лога: tail -5 /tmp/opt_run.log
+  * Команду счётчика прогресса: grep -c 'Trial.*finished' ./tmp/opt_run.log
+  * Команду просмотра лога: tail -5 ./tmp/opt_run.log
   * Команду статуса: ps -p <PID> -o pid,etime,%cpu,%mem --no-headers
   * Команду остановки: kill <PID>
 - Никогда не запускать длительные процессы без nohup. Нарушение этого правила привело к 12-часовому зависанию прогона в этом проекте.

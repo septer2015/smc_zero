@@ -248,13 +248,20 @@ python tools/web_dashboard/scripts/generate_dashboard.py --demo
 # реальный отчёт: папка с trades.csv (summary.txt желателен, но не обязателен)
 python tools/web_dashboard/scripts/generate_dashboard.py \
   --report-dir ./reports/backtest_EURUSD_M15_2025-05-20_2026-09-22
+
+# явный путь вывода: итоговая страница вместо временного ./tmp
+python tools/web_dashboard/scripts/generate_dashboard.py \
+  --report-dir ./reports/<отчёт> --output ./tools/web_dashboard/public/dashboard.html
 ```
 
-По умолчанию страница ложится в `tools/web_dashboard/public/dashboard.html`. Флаг `--output`
-меняет путь, `--tape PATH` добавляет свечной график по CSV с колонками
-`datetime, open, high, low, close`, `--compare DIR_A DIR_B` включает сравнительную секцию
-(таблица KPI, общие кривые и радар), а `--inline-plotly` вшивает Plotly в файл вместо загрузки с
-CDN: страница работает офлайн, но весит несколько мегабайт.
+По умолчанию страница ложится во временный каталог проекта `./tmp`: `tmp/dashboard_demo.html` в
+демо-режиме и `tmp/dashboard.html` для реального отчёта. Относительный `--output` считается от
+корня репозитория, а не от текущего каталога, поэтому запуск из любой папки пишет внутрь проекта.
+Абсолютный путь берётся как есть; `tools/web_dashboard/public/dashboard.html` остаётся удобным
+местом для итоговой страницы — но только через явный `--output`. Флаг `--tape PATH` добавляет
+свечной график по CSV с колонками `datetime, open, high, low, close`, `--compare DIR_A DIR_B`
+включает сравнительную секцию (таблица KPI, общие кривые и радар), а `--inline-plotly` вшивает
+Plotly в файл вместо загрузки с CDN: страница работает офлайн, но весит несколько мегабайт.
 
 Plotly это optional-зависимость (набор `dashboard`), поэтому сервер не нужен — готовый HTML
 открывается в браузере напрямую. Подробности — в `tools/web_dashboard/README.md`.
@@ -275,14 +282,19 @@ pytest
 nohup env PYTHONPATH=src .venv/bin/python -m scripts.run_optimization \
   --symbol EURUSD --start 2022-08-15 --end 2026-09-22 \
   --n-trials 100 --jobs 2 --seed 42 --report-dir ./reports/full_run \
-  > /tmp/opt_run.log 2>&1 &
+  > ./tmp/opt_run.log 2>&1 &
 ```
 
-Мониторинг: `tail -f /tmp/opt_run.log` и `grep -c 'Trial.*finished' /tmp/opt_run.log`.
+Мониторинг: `tail -f ./tmp/opt_run.log` и `grep -c 'Trial.*finished' ./tmp/opt_run.log`.
 Остановка: `kill <PID>`. Номер процесса печатает команда запуска; если он потерян, процесс
 находит команда `ps aux | grep run_optimization`.
 
 Это правило обязательно для всех будущих запусков.
+
+Все временные артефакты проекта — логи прогонов, демо-дашборды, диагностические выводы — лежат в
+`./tmp/` и игнорируются git. Системный `/tmp` для этого не годится: он очищается при перезагрузке
+и смешивает файлы проекта с чужими процессами. Постоянные результаты по-прежнему идут в
+`./reports/`, данные — в `./data/`.
 
 ## Что уже сделано
 
@@ -406,10 +418,11 @@ SMC_REPORT_FOLDER=./reports/daily_20261002/backtest_EURUSD_M15_2022-10-02_2026-1
 ```
 
 Запуск по расписанию (будни, 22:00 MSK) оформляется строкой cron. Пути в строке ниже приведены
-для этой машины; на другом окружении подставьте свои. Лог складывается в `/tmp/cron_smc.log`:
+для этой машины; на другом окружении подставьте свои. Лог складывается в `./tmp/cron_smc.log`
+проекта — в cron каталог запуска домашний, поэтому путь записан абсолютным:
 
 ```
-0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /tmp/cron_smc.log 2>&1
+0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /home/com/work2/python/cfd/project/smc_zero/tmp/cron_smc.log 2>&1
 ```
 
 Перед запуском убедитесь, что в папке экспорта лежат свежие `EURUSD_M15.csv` и, если они нужны

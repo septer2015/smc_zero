@@ -83,10 +83,11 @@ SMC_REPORT_FOLDER=./reports/daily_20261002/backtest_EURUSD_M15_2022-10-02_2026-1
 ```
 
 Запуск по расписанию (будни, 22:00 MSK). База экспорта указана в самой строке cron, лог
-складывается в `/tmp/cron_smc.log`:
+складывается в `./tmp/cron_smc.log` проекта — в cron каталог запуска домашний, поэтому путь
+записан абсолютным:
 
 ```
-0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /tmp/cron_smc.log 2>&1
+0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /home/com/work2/python/cfd/project/smc_zero/tmp/cron_smc.log 2>&1
 ```
 
 Перед запуском проверьте, что в папке экспорта лежат свежие `EURUSD_M15.csv` (и `EURUSD_H1.csv`,

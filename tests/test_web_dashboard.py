@@ -121,6 +121,47 @@ def test_demo_writes_a_standalone_page_with_plotly_from_cdn(tmp_path: Path) -> N
     assert inline.stat().st_size > output.stat().st_size
 
 
+def test_default_output_resolves_inside_project_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default --output lands in the project ./tmp, never in the current directory.
+
+    The root is found by the ``pyproject.toml`` marker, so a run started anywhere keeps writing the
+    page into the ignored ``./tmp`` of the project.  The folder of the run is not read: the test
+    only checks the resolution, so no real artifact has to be present there.
+    """
+    # The real root of the tool is the repository, and both defaults point into its ./tmp.
+    assert (dashboard.REPO_ROOT / dashboard.REPO_MARKER).is_file()
+    assert dashboard.DEFAULT_OUTPUT == Path("tmp/dashboard.html")
+    assert dashboard.DEMO_OUTPUT == Path("tmp/dashboard_demo.html")
+    assert dashboard.resolve_output(dashboard.DEFAULT_OUTPUT).parent == dashboard.REPO_ROOT / "tmp"
+    # An absolute path stays untouched: the other cases pass exactly that through --output.
+    absolute = Path("/somewhere/absolute.html")
+    assert dashboard.resolve_output(absolute) == absolute
+
+    # From a foreign directory the root is replaced by a sandbox, so the test writes nothing into
+    # the real tree: the demo page must appear in the sandbox ./tmp, not in the current directory.
+    sandbox = tmp_path / "sandbox_repo"
+    sandbox.mkdir()
+    monkeypatch.setattr(dashboard, "REPO_ROOT", sandbox)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert dashboard.main(["--demo"]) == 0
+    assert (sandbox / "tmp" / "dashboard_demo.html").is_file()
+    assert not (elsewhere / "tmp").exists()
+
+    # The real mode has its own default next to the demo one: tmp/dashboard.html.
+    folder = _write_report(sandbox / "backtest_EURUSD_M15_2025-06-02_2025-06-05", _trades())
+    assert dashboard.main(["--report-dir", str(folder)]) == 0
+    assert (sandbox / "tmp" / "dashboard.html").is_file()
+
+    # An explicit relative --output is still counted from the repository root, not from the cwd.
+    assert dashboard.main(["--demo", "--output", "tmp/custom.html"]) == 0
+    assert (sandbox / "tmp" / "custom.html").is_file()
+
+
 def test_real_report_takes_kpis_from_the_table_and_the_summary(tmp_path: Path) -> None:
     """The KPIs come from the columns, Sharpe and the window from summary.txt, the curves sum up."""
     folder = _write_report(tmp_path / "backtest_EURUSD_M15_2025-06-02_2025-06-05", _trades())

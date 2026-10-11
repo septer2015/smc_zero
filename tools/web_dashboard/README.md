@@ -34,7 +34,7 @@ python tools/web_dashboard/scripts/generate_dashboard.py \
 # свечной график по своей ленте и нестандартный путь вывода
 python tools/web_dashboard/scripts/generate_dashboard.py \
   --report-dir ./reports/<отчёт> --tape ./data/EURUSD_M15.csv \
-  --output ./tools/web_dashboard/public/dashboard.html
+  --output ./tmp/dashboard_with_tape.html
 
 # сравнение двух отчётов: таблица KPI, общие кривые и радар
 python tools/web_dashboard/scripts/generate_dashboard.py \
@@ -48,7 +48,7 @@ python tools/web_dashboard/scripts/generate_dashboard.py \
 | --- | --- |
 | `--demo` | синтетические сделки и свечи; несовместим с `--report-dir` |
 | `--report-dir DIR` | папка отчёта с `trades.csv`; допустим и корень с единственной подпапкой |
-| `--output PATH` | путь итогового HTML; по умолчанию `tools/web_dashboard/public/dashboard.html` |
+| `--output PATH` | путь итогового HTML; относительный путь считается от корня репозитория |
 | `--title TEXT` | заголовок страницы и вкладки |
 | `--tape PATH` | CSV с OHLC-лентой (`datetime`, `open`, `high`, `low`, `close`) для свечей |
 | `--compare A B` | сравнительная секция для двух папок отчётов |
@@ -56,6 +56,29 @@ python tools/web_dashboard/scripts/generate_dashboard.py \
 
 Нужен хотя бы один источник: `--demo`, `--report-dir` или `--compare`. При одном `--compare`
 основной отчёт берётся из первой папки.
+
+## Куда попадает страница
+
+Страница это временный артефакт, поэтому по умолчанию она ложится в `./tmp/` проекта:
+
+| Режим | Путь по умолчанию |
+| --- | --- |
+| `--demo` | `tmp/dashboard_demo.html` |
+| `--report-dir`, `--compare` | `tmp/dashboard.html` |
+
+Относительный `--output` считается от **корня репозитория** — папки с `pyproject.toml`, а не от
+текущего каталога. Поэтому запуск из любой папки пишет внутрь проекта, а не создаёт `./tmp` рядом
+с собой. Абсолютный путь берётся как есть (на этом стоят тесты). Каталог вывода создаётся
+автоматически. `tools/web_dashboard/public/dashboard.html` остаётся удобным местом для итоговой
+страницы — но только через явный `--output`.
+
+## Временные артефакты
+
+Всё непостоянное по проекту складывается в `./tmp/`: логи прогонов, демо-страницы, черновики
+сообщений коммитов, диагностические выводы. Каталог игнорируется git (в нём лежит только
+`.gitkeep`), поэтому мусор не попадает в коммиты. Системный `/tmp` для этого не годится: он
+очищается при перезагрузке и смешивает файлы проекта с чужими процессами. Постоянные результаты
+идут в `./reports/`, данные — в `./data/`.
 
 ## Входные данные
 
@@ -103,8 +126,9 @@ pytest tests/test_web_dashboard.py
 ```
 
 Шесть проверок: демо-режим и CDN, KPI из таблицы и summary, отсутствие `summary.txt`, пустой
-`trades.csv`, режим сравнения и понятные ошибки на кривом входе. Если Plotly не установлена,
-файл пропускается через `pytest.importorskip("plotly")`.
+`trades.csv`, режим сравнения и понятные ошибки на кривом входе. Седьмая проверка — резолв
+дефолтного вывода: путь ведёт в `./tmp` корня репозитория и не зависит от текущего каталога.
+Если Plotly не установлена, файл пропускается через `pytest.importorskip("plotly")`.
 
 ## Ограничения
 

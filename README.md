@@ -75,6 +75,7 @@ hierarchy: H4_M15_M5
 pip install -e .                  # только слой
 pip install -e ".[dev]"           # слой, линтер и тесты
 pip install -e ".[dev,optimize]"  # плюс оптимизатор walk-forward
+pip install -e ".[dashboard]"     # плюс standalone-дашборд на Plotly
 ```
 
 ## Быстрый старт
@@ -230,6 +231,33 @@ env SMC_DATA_DIR=/path/to/mt5 \
 > числа выше — базовая линия для будущих опытов, а не подтверждение прибыльности.
 
 Отчёты обоих запусков лежат в `./reports/` (каталоги `backtest_*`).
+
+## Веб-дашборд
+
+`tools/web_dashboard` собирает один самодостаточный HTML-файл с интерактивными графиками по
+уже готовому отчёту. Инструмент ничего не пересчитывает в стратегии: он читает `trades.csv` и
+(если есть) `summary.txt` из папки отчёта и рисует производные кривые — equity, просадку,
+помесячную прибыль, длительности, RR и свечи с разметкой входов.
+
+```bash
+pip install -e ".[dashboard]"
+
+# демо без данных: синтетические сделки и свечи
+python tools/web_dashboard/scripts/generate_dashboard.py --demo
+
+# реальный отчёт: папка с trades.csv (summary.txt желателен, но не обязателен)
+python tools/web_dashboard/scripts/generate_dashboard.py \
+  --report-dir ./reports/backtest_EURUSD_M15_2025-05-20_2026-09-22
+```
+
+По умолчанию страница ложится в `tools/web_dashboard/public/dashboard.html`. Флаг `--output`
+меняет путь, `--tape PATH` добавляет свечной график по CSV с колонками
+`datetime, open, high, low, close`, `--compare DIR_A DIR_B` включает сравнительную секцию
+(таблица KPI, общие кривые и радар), а `--inline-plotly` вшивает Plotly в файл вместо загрузки с
+CDN: страница работает офлайн, но весит несколько мегабайт.
+
+Plotly это optional-зависимость (набор `dashboard`), поэтому сервер не нужен — готовый HTML
+открывается в браузере напрямую. Подробности — в `tools/web_dashboard/README.md`.
 
 ## Проверки
 

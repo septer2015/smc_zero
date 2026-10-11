@@ -25,6 +25,9 @@ dev = ["pytest", "ruff", "black", "mypy"]
 # The optimizer layer (Э7') is importable without optuna: only a real study needs the library.
 # Pinned below 5.x: optuna 5 turns TPESampler's constant_liar/multivariate TPE on by default.
 optimize = ["optuna>=4.9,<5"]
+# Э14: the standalone dashboard renders reports into HTML and needs Plotly installed.
+# The core and its tests do without it, so the dependency lives in a separate extra.
+dashboard = ["plotly>=5.24.0"]
 
 [project.scripts]
 # Э8': the two console faces of the project. ``scripts`` is a top-level package beside ``src``,

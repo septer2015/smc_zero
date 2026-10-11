@@ -9,3 +9,5 @@ reports/
 reference/
 .git-remote.env
 *.egg-info/
+# Э14: the built dashboard pages are not committed - the HTML weighs megabytes, one command rebuilds it.
+tools/web_dashboard/public/*.html

@@ -115,6 +115,42 @@ def test_the_summary_prints_the_metrics_and_the_cost_assumptions() -> None:
     assert "slippage 1.00 pip per market leg, commission 1.75 per lot" in configured
 
 
+def _line(text: str, marker: str) -> str:
+    """Return the one summary line that carries ``marker``."""
+    matches = [line for line in text.splitlines() if marker in line]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
+def test_the_risk_rows_name_the_deposit_as_the_base() -> None:
+    """Risk is a share of the C7 deposit, and every risk row says so (Э15.1).
+
+    The pinned defect is the tenfold reading: ``risk_pct`` divides by ``RiskConfig.deposit``
+    (1000), not by the equity curve (``BacktestConfig.initial_capital``, 10000), so a report that
+    presented the number as a share of the account would print 0.30 % where the metric holds
+    3.00 %.  The layer spends no arithmetic here either - the printed figure is the metric itself.
+    """
+    result = _result()
+    risk = result.config.risk
+    text = format_summary(result)
+    median = result.metrics["median_risk_pct"]
+    assert median == pytest.approx(3.0)  # 30 pips on the 0.1 lot against the 1000 deposit
+
+    median_line = _line(text, "median risk")
+    assert median_line.startswith("  median risk of deposit")
+    assert median_line.endswith(f"{median:.2f} %")
+
+    basis_line = _line(text, "risk basis")
+    assert f"risk_pct is measured on deposit {risk.deposit:.2f}" in basis_line
+    assert f"not on capital {result.config.initial_capital:.2f}" in basis_line
+
+    flags_line = _line(text, "risk flags")
+    assert (
+        f"1 trade(s) above the {risk.warning_risk_pct:.2f} % warning "
+        f"of deposit {risk.deposit:.2f}"
+    ) in flags_line
+
+
 def test_the_summary_flags_the_profit_factor_cap() -> None:
     """A factor sitting at ``pf_cap`` is a cap and is labelled as one."""
     result = _result()

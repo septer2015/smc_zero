@@ -39,7 +39,7 @@ _SUMMARY_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("expected", "expected per trade", "{:+.2f}"),
     ("final_balance", "final balance", "{:.2f}"),
     ("return_pct", "return", "{:+.2f} %"),
-    ("median_risk_pct", "median risk per trade", "{:.2f} %"),
+    ("median_risk_pct", "median risk of deposit", "{:.2f} %"),
     ("spread_cost", "spread cost", "{:.2f}"),
     ("swap_cost", "swap result", "{:+.2f}"),
     ("avg_limit_dur", "avg limit age", "{:.1f} min"),
@@ -73,6 +73,12 @@ def format_summary(result: BacktestResult, *, title: str | None = None) -> str:
     * ``pf`` sits at ``BacktestConfig.pf_cap`` - the log has no losing trade, so the factor is a
       cap rather than a measurement;
     * the ``risk_warning`` count - trades whose C7 risk is above ``warning_risk_pct``.
+
+    The risk rows carry their denominator.  ``median risk of deposit`` and ``risk flags`` are
+    shares of ``RiskConfig.deposit`` (C7, §7.8 п.37), *not* of ``BacktestConfig.initial_capital``,
+    so a ``risk basis`` row names both numbers and a reader cannot take the percentage for a share
+    of the equity curve (the account reading is ``risk_pct * deposit / capital``, ten times smaller
+    on the shipped profile - Э15.1).
     """
     config = result.config
     instrument = result.instrument
@@ -96,8 +102,15 @@ def format_summary(result: BacktestResult, *, title: str | None = None) -> str:
         f"leverage {broker.leverage:g}, margin denominator {risk.deposit:.2f} (C7), "
         f"warning above {risk.warning_risk_pct:.2f} %"
     )
+    lines.append(
+        f"  {'risk basis':<24} risk_pct is measured on deposit {risk.deposit:.2f}, "
+        f"not on capital {config.initial_capital:.2f}"
+    )
     flagged = int(result.trades["risk_warning"].sum()) if not result.trades.empty else 0
-    lines.append(f"  {'risk flags':<24} {flagged} trade(s) above the warning threshold")
+    lines.append(
+        f"  {'risk flags':<24} {flagged} trade(s) above the "
+        f"{risk.warning_risk_pct:.2f} % warning of deposit {risk.deposit:.2f}"
+    )
     ledger = len(result.rejections)
     lines.append(f"  {'ledger':<24} {ledger} intent(s) that became no trade")
     if not risk.has_costs:

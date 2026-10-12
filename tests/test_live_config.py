@@ -16,11 +16,13 @@ leg and no commission:
   defaults nor under the winner's numbers - so that window pins the command line (flag accepted,
   exit code 0, both report files written) and the equivalence of the config with the hand-built
   numbers is measured on the longer window below;
-* two weeks (``2022-08-15 .. 2022-08-29``, 996 bars) carry a setup under the winner's numbers only:
-  the defaults finish at ``0 trades / +0.00`` and the winner at ``1 trade / -25.25``, so the two
-  runs are distinguishable and the comparison is not vacuous.  The single trade pays 1.40 less than
-  it did while the row carried the 7.00 of Э10', and that is the whole of the difference: 0.1 lot
-  over two market legs at 7.00 per lot is 1.40.
+* three weeks (``2022-08-15 .. 2022-09-05``, 1469 bars) carry a setup under both sides and separate
+  them: measured on 2026-10-12 under the broker-server clock of Э17.B, the defaults finish at
+  ``1 trade / -51.70`` and the winner at ``1 trade / +36.05``, so a config the runner forgot to
+  apply cannot pass this test by accident.  The window used to be two weeks: the Э17 audit showed
+  that the shipped tape carries broker server time rather than UTC, the normalisation moved the few
+  bars that armed the setup, and both numbers moved with the clock (the two sides of the comparison
+  are pinned to one clock - see :func:`_hand_built_profit`).
 
 The mutations this file is one line away from, and the test each one must break (all four measured
 on 2026-10-01, each red on the test named here and only there):
@@ -82,8 +84,9 @@ LIVE_CONFIG = REPO / "configs" / "live_eurusd_m15.yaml"
 M5_CONFIG = REPO / "configs" / "live_eurusd_m5.yaml"
 #: The first command of the guide: five days of the shipped tape.
 FIVE_DAYS = ("2022-08-15", "2022-08-20")
-#: The window that separates the defaults from the winner's numbers (see the module docstring).
-TWO_WEEKS = ("2022-08-15", "2022-08-29")
+#: The window that separates the defaults from the winner's numbers under the broker-server clock
+#: of Э17.B (see the module docstring).
+THREE_WEEKS = ("2022-08-15", "2022-09-05")
 #: The synthetic tape of Э8': a Monday 00:00 and the 400 closed M15 bars after it.
 SYNTHETIC_START = "2026-06-08"
 SYNTHETIC_END = "2026-06-15"
@@ -161,8 +164,19 @@ def _hand_built_profit(start: str, end: str) -> float:
 
     The engine is called here and not through a runner: this is the "manual input" side of the
     comparison, built from :func:`_hand_built_strategy` and its neighbours and from nothing else.
+
+    The clock is named explicitly, because the shipped tape of ``./data`` carries **broker server**
+    time rather than UTC (Э17.B, SPEC_SMC.md §7.26) and the face of a live run declares it through
+    the ``source_clock`` key of the config.  Both sides of this comparison therefore read the same
+    clock; leaving this call at the UTC default would compare a normalised run with a shifted one.
     """
-    tape = common.load_windowed_tape("EURUSD", "M15", common.read_day(start), common.read_day(end))
+    tape = common.load_windowed_tape(
+        "EURUSD",
+        "M15",
+        common.read_day(start),
+        common.read_day(end),
+        source_clock="broker_server",
+    )
     strategy = _hand_built_strategy()
     marks = build_tape_marks(tape, strategy)
     chain = build_intents(tape, marks.bias_frame(strategy.bias.agreement), marks.levels, strategy)
@@ -568,14 +582,14 @@ def test_the_backtest_face_runs_a_live_config_on_five_days(
 def test_the_live_config_of_the_winner_pays_what_the_hand_built_numbers_pay(
     tmp_path: Path, repository_data: None
 ) -> None:
-    """Two weeks of the shipped tape: the run of the file and the run of the numbers agree.
+    """Three weeks of the shipped tape: the run of the file and the run of the numbers agree.
 
-    The window is the one that separates the two sides (module docstring): the winner's numbers arm
-    a setup the defaults never see, so a config the runner forgot to apply cannot pass this test by
-    accident - the run would report the reading of the defaults and not the one of the file.
+    The window is the one that separates the two sides (module docstring): the winner's numbers
+    settle above the defaults there, so a config the runner forgot to apply cannot pass this test
+    by accident - the run would report the reading of the defaults and not the one of the file.
     """
     report_dir = tmp_path / "reports"
-    start, end = TWO_WEEKS
+    start, end = THREE_WEEKS
 
     live_code = backtest_face.main(
         [
@@ -598,8 +612,19 @@ def test_the_live_config_of_the_winner_pays_what_the_hand_built_numbers_pay(
     hand = _hand_built_profit(start, end)
     assert live == pytest.approx(hand, abs=0.01)
 
+    # The defaults are read on the very clock of the run above: the difference has to come from the
+    # numbers of the file and not from a clock the caller forgot to declare (Э17.B).
     defaults_code = backtest_face.main(
-        ["--start", start, "--end", end, "--report-dir", str(report_dir / "defaults")]
+        [
+            "--start",
+            start,
+            "--end",
+            end,
+            "--source-clock",
+            "broker_server",
+            "--report-dir",
+            str(report_dir / "defaults"),
+        ]
     )
 
     assert defaults_code == 0

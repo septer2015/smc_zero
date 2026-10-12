@@ -21,6 +21,12 @@
 # falls back to on its own, SPEC_SMC.md §7.20 п.104).  A fresh "Bars" download therefore feeds the
 # check with no conversion in between.
 #
+# The clock of that tape is the one of the broker *server*, not UTC (Э17.B, SPEC_SMC.md §7.26): the
+# live config declares ``source_clock: broker_server``, and the loader moves every stamp onto UTC
+# before the run reads a bar - so the session windows, the D1/H1 bias and the signals printed below
+# speak in real time.  A tape that already holds UTC needs ``SMC_SOURCE_CLOCK=utc``, and
+# ``smc-check-tape --source-clock`` tells the two apart before the run (docs/LIVE_TRADING_GUIDE.md).
+#
 # Cron (the executable bit is part of the repository, ``core.fileMode=true``).  The base is written
 # out here as well, so the line keeps its meaning if that default ever moves:
 #
@@ -32,6 +38,8 @@
 #   SMC_DATA_DIR       base of the MT5 export a run reads (default: ``$HOME/_data/mt5``)
 #   SMC_WORKDIR        folder the backtest is started from (default: ``SMC_REPO``)
 #   SMC_CONFIG         live YAML of the run (default: ``SMC_REPO/configs/live_eurusd_m15.yaml``)
+#   SMC_SOURCE_CLOCK   clock of the raw tape, ``utc`` or ``broker_server`` (default: the
+#                      ``source_clock`` key of SMC_CONFIG, i.e. ``broker_server``; Э17.B)
 #   SMC_REPORT_ROOT    report root; the dated folder is made inside it (default: ``SMC_REPO/reports``)
 #   SMC_START/SMC_END  window days, YYYY-MM-DD (default: four years ago .. today, UTC)
 #   SMC_SINCE_UTC      "YYYY-MM-DD HH:MM:SS" UTC threshold of a new trade
@@ -72,6 +80,21 @@ SMC_DATA_DIR=${SMC_DATA_DIR:-${HOME:-/home/com}/_data/mt5}
 export SMC_DATA_DIR
 # The base a run reads: ``mt5`` is the export above - the flag of Э11'.1 (SPEC_SMC.md §7.20 п.104).
 DATA_SOURCE=mt5
+# The clock of the raw tape (Э17.B, SPEC_SMC.md §7.26).  The live config names it
+# (``source_clock: broker_server``: both the export and ``./data`` carry broker server time), so
+# the run of the night normalises without a flag.  ``SMC_SOURCE_CLOCK`` exists for a dry run
+# against a tape that already holds UTC; when it is set it wins over the file and is passed on.
+SOURCE_CLOCK=${SMC_SOURCE_CLOCK:-}
+# The clock the config names, for the header only: a top-level scalar, read without a YAML parser
+# so the log of the night says which clock the run used (rule 4: the sources of a run are named).
+CONFIG_CLOCK=$(sed -n 's/^source_clock:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "${SMC_CONFIG}" 2>/dev/null | head -1)
+CLOCK_ARGS=()
+if [ -n "${SOURCE_CLOCK}" ]; then
+  CLOCK_ARGS=(--source-clock "${SOURCE_CLOCK}")
+elif [ -z "${CONFIG_CLOCK}" ]; then
+  # Without the key the runner falls back to its own default; name it here in the same words.
+  CONFIG_CLOCK=utc
+fi
 
 TODAY=$(date -u '+%Y%m%d')
 DAY_LABEL=$(date -u '+%Y-%m-%d')
@@ -110,6 +133,11 @@ echo "  config   ${SMC_CONFIG}"
 echo "  window   ${START} .. ${END}"
 echo "  reports  ${SMC_REPORT_ROOT}"
 echo "  source   ${DATA_SOURCE} under ${SMC_DATA_DIR}"
+if [ -n "${SOURCE_CLOCK}" ]; then
+  echo "  clock    ${SOURCE_CLOCK} (SMC_SOURCE_CLOCK, перекрывает конфиг)"
+else
+  echo "  clock    ${CONFIG_CLOCK} (source_clock конфига)"
+fi
 echo "  since    ${SINCE} UTC (yesterday 22:00 MSK)"
 echo "  journal  docs/TRADING_JOURNAL.md"
 
@@ -133,6 +161,7 @@ else
   nohup env PYTHONPATH="${SMC_REPO}/src:${SMC_REPO}" "${PY}" -m scripts.run_backtest \
     --config-path "${SMC_CONFIG}" \
     --data-source "${DATA_SOURCE}" \
+    "${CLOCK_ARGS[@]}" \
     --start "${START}" \
     --end "${END}" \
     --report-dir "${DATED}" \

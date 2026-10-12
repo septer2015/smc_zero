@@ -38,7 +38,12 @@ test named here and only there; m1-m5 measured on 2026-10-01, m6 and m7 on 2026-
 * m8 "write the log into the system ``/tmp`` again (drop the repository root of the default)" - the
   artifact of the project leaves the project and dies with the next reboot, and a cron run writes it
   beside whatever folder it started in; breaks
-  :func:`test_the_log_of_a_run_goes_to_the_tmp_folder_of_the_project` (measured on 2026-10-12).
+  :func:`test_the_log_of_a_run_goes_to_the_tmp_folder_of_the_project` (measured on 2026-10-12);
+* m9 "read the tape without its clock" (drop the ``source_clock`` key of the live config, or ignore
+  the ``--source-clock`` it produces) - the run of the night would read a server tape as UTC and
+  shift every session window by two or three hours (Э17.B); breaks
+  :func:`test_the_live_config_declares_the_clock_of_the_raw_tape` and
+  :func:`test_the_clock_of_the_night_comes_from_the_config`.
 """
 
 from __future__ import annotations
@@ -53,8 +58,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
+import scripts._common as common
+import scripts.run_backtest as runner
 from smc_zero.backtester.engine import TRADE_COLUMNS
+from smc_zero.config import SOURCE_CLOCK_BROKER_SERVER
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "daily_signal_check.sh"
@@ -304,3 +313,43 @@ def test_the_log_of_a_run_goes_to_the_tmp_folder_of_the_project(tmp_path: Path) 
     assert chosen.returncode == 0, chosen.stderr
     assert chosen_log.is_file(), chosen.stdout + chosen.stderr
     assert f"  log      {chosen_log}" in chosen.stdout
+
+
+def test_the_live_config_declares_the_clock_of_the_raw_tape() -> None:
+    """Режим A читает ленту брокерского сервера: конфиг объявляет это, а не угадывает (Э17.B).
+
+    Проверка идёт по самому файлу конфига: раннер узнаёт о поясе оттуда, и потеря ключа в
+    поставляемом YAML сдвинула бы окна сессий на два-три часа незаметно для прогона.
+    """
+    cfg = common.load_config(LIVE_CONFIG)
+    args = runner.build_parser().parse_args(["--config-path", str(LIVE_CONFIG)])
+
+    assert cfg[common.SOURCE_CLOCK_KEY] == SOURCE_CLOCK_BROKER_SERVER
+    assert common.resolve_source_clock(args) == SOURCE_CLOCK_BROKER_SERVER
+
+    # типизированный флаг перекрывает файл, а неизвестный пояс отвергается (правило 5)
+    override = runner.build_parser().parse_args(
+        ["--config-path", str(LIVE_CONFIG), "--source-clock", "utc"]
+    )
+    assert common.resolve_source_clock(override) == "utc"
+    with pytest.raises(ValueError, match="source_clock"):
+        common.resolve_source_clock(args, {"source_clock": "msk"})
+
+
+def test_the_clock_of_the_night_comes_from_the_config(tmp_path: Path) -> None:
+    """Штатный запуск печатает пояс из конфига, а ``SMC_SOURCE_CLOCK`` его перекрывает (Э17.B)."""
+    folder = tmp_path / "backtest_EURUSD_M15_2026-06-01_2026-06-15"
+    _write_trades(folder, [(f"{NIGHT}+00:00", "long")])
+
+    live = _check(SMC_REPORT_FOLDER=str(folder), SMC_SINCE_UTC=NIGHT)
+
+    assert live.returncode == 0, live.stderr
+    assert "  clock    broker_server (source_clock конфига)" in live.stdout
+
+    overridden = _check(
+        SMC_REPORT_FOLDER=str(folder), SMC_SINCE_UTC=NIGHT, SMC_SOURCE_CLOCK="utc"
+    )
+
+    assert overridden.returncode == 0, overridden.stderr
+    assert "  clock    utc (SMC_SOURCE_CLOCK, перекрывает конфиг)" in overridden.stdout
+

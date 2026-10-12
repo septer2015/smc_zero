@@ -49,6 +49,12 @@ the config may have moved that knob.
 ``--data-source`` picks the base of the tape (Э11'.1): ``project`` reads ``./data`` as before, while
 ``mt5`` reads a raw MetaTrader 5 export under ``SMC_DATA_DIR`` (``~/_data/mt5`` by default), so a
 fresh broker export feeds the same chain without a manual conversion.
+
+``--source-clock`` declares the clock of that raw file (Э17.B, SPEC_SMC.md §7.26): ``utc`` (the
+default) or ``broker_server`` - the server time both bases turned out to carry - which the loader
+moves onto UTC before the window is cut and long before the entry chain reads a bar.  The live
+config of §7.19 names it through its own ``source_clock`` key, so the daily run of
+``scripts/daily_signal_check.sh`` normalises without typing a flag.
 """
 
 from __future__ import annotations
@@ -94,15 +100,26 @@ def run(args: argparse.Namespace) -> int:
     try:
         symbol, timeframe, strategy, backtest = _common.live_inputs(args)
         window = _common.resolve_window(args)
+        clock = _common.resolve_source_clock(args)
         tape = _common.load_windowed_tape(
-            symbol, timeframe, window.start, window.end, source=args.data_source
+            symbol,
+            timeframe,
+            window.start,
+            window.end,
+            source=args.data_source,
+            source_clock=clock,
         )
         instrument = _common.instrument_for(symbol)
         structure_timeframe, structure_frame = _common.working_frame(
-            symbol, backtest.timeframes, window.start, window.end, source=args.data_source
+            symbol,
+            backtest.timeframes,
+            window.start,
+            window.end,
+            source=args.data_source,
+            source_clock=clock,
         )
         htf_frames = _common.markup_frames(
-            symbol, backtest.timeframes, window, source=args.data_source
+            symbol, backtest.timeframes, window, source=args.data_source, source_clock=clock
         )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

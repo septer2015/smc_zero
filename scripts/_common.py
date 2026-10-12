@@ -23,6 +23,14 @@ strategy, the broker profile and the run of a real account.  :func:`live_inputs`
 that reads it, so neither face can apply a different half of the file, and the priority is fixed
 there once - what the caller typed wins over what the file says, and the project defaults fill what
 neither of them names.
+
+The third is the clock of a raw tape (Э17.B, §7.26).  A file holds its stamps in one clock, and the
+Э17 audit found that both bases - ``./data`` and the MT5 export - hold the clock of the broker
+server rather than UTC.  ``--source-clock`` and the ``source_clock`` key of a live config declare
+it (:func:`resolve_source_clock`), :func:`_load_tape` carries the declaration into
+:func:`~smc_zero.data_loader.load_ohlcv`, and the loader moves the stamps onto UTC there.  Nothing
+above the loader sees a shifted stamp, and a caller that declares nothing keeps the UTC-naive
+behaviour of every run before Э17.
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ import argparse
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -40,12 +49,16 @@ import yaml
 from smc_zero.config import (
     ALFAFOREX_SPECS,
     DEFAULT_HIERARCHY,
+    DEFAULT_SOURCE_CLOCK,
     HIERARCHY_PRESETS,
+    SOURCE_CLOCKS,
     BacktestConfig,
     BrokerSpec,
     InstrumentSpec,
     RiskConfig,
     RunConfig,
+    SourceClock,
+    SourceClockConfig,
     StrategyConfig,
     TimeframeConfig,
     preset_of,
@@ -100,6 +113,11 @@ RUN_KEYS: tuple[str, ...] = (
 #: The optional key of a live config that names the entry hierarchy (SPEC_SMC.md §7.20).  It is not
 #: in :data:`CONFIG_KEYS`: a file without it keeps the D1 -> H1 -> M15 preset of Э8'.
 HIERARCHY_KEY = "hierarchy"
+#: The optional key of a live config that names the clock of its *raw* tape (Э17.B, §7.26).  It is
+#: not in :data:`CONFIG_KEYS` either: a file without it keeps the UTC-naive convention the pipeline
+#: has always assumed, and a file that names :data:`~smc_zero.config.SOURCE_CLOCK_BROKER_SERVER`
+#: declares what the Э17 audit found in both bases - the live config of Э10'.2 does.
+SOURCE_CLOCK_KEY = "source_clock"
 
 
 def mt5_data_dir() -> Path:
@@ -148,6 +166,33 @@ def slice_window(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd
     return window.reset_index(drop=True)
 
 
+def _load_tape(
+    path: Path,
+    *,
+    source: str = PROJECT_SOURCE,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
+) -> pd.DataFrame:
+    """Load one tape through the reader of ``source`` with the clock its raw stamps carry.
+
+    ``source`` picks the reader (Э11'.1): :func:`~smc_zero.data_loader.load_csv` for the project
+    layout of ``./data``, :func:`~smc_zero.data_loader.load_ohlcv` for a raw MetaTrader 5 export.
+    ``source_clock`` is the Э17.B declaration of that raw file: the default reads the stamps as
+    UTC-naive open times and ``"broker_server"`` has the loader move them onto UTC
+    (:func:`~smc_zero.data_loader.normalise_source_clock`).
+
+    The default clock is passed on *without* the keyword, so a run that declares nothing keeps the
+    call of every runner before Э17 bit for bit - a stubbed ``load_csv`` of the test suite keeps
+    its own signature.  Only a non-default clock reaches the loader as ``source_clock=``.
+    """
+    if source == PROJECT_SOURCE:
+        reader: Any = load_csv
+    else:
+        reader = partial(load_ohlcv, format=AUTO_FORMAT)
+    if source_clock == DEFAULT_SOURCE_CLOCK:
+        return reader(path)
+    return reader(path, source_clock=source_clock)
+
+
 def load_windowed_tape(
     symbol: str,
     timeframe: str,
@@ -155,6 +200,7 @@ def load_windowed_tape(
     end: pd.Timestamp,
     *,
     source: str = PROJECT_SOURCE,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
 ) -> pd.DataFrame:
     """Load ``<base>/<SYMBOL>_<TF>.csv`` and cut the requested window out of it.
 
@@ -164,6 +210,10 @@ def load_windowed_tape(
     the contract: :class:`FileNotFoundError` when the tape is absent and :class:`ValueError` when no
     bar of it lies in the window, so a runner reports one line on stderr and returns a code instead
     of simulating an empty tape (which would report a flat curve as if it were a result).
+
+    ``source_clock`` travels into :func:`_load_tape` and is applied *before* the window is cut: a
+    window is a stretch of real time (``[start, end + 1 day)`` of UTC), and cutting it out of
+    stamps that are still in server time would drop the last two or three hours of every day.
     """
     path = tape_path(symbol, timeframe, source=source)
     if not path.is_file():
@@ -173,7 +223,7 @@ def load_windowed_tape(
             else f"point {SMC_DATA_DIR_ENV} at the export folder (now {path.parent})"
         )
         raise FileNotFoundError(f"no tape at {path}: {hint}")
-    tape = load_csv(path) if source == PROJECT_SOURCE else load_ohlcv(path, format=AUTO_FORMAT)
+    tape = _load_tape(path, source=source, source_clock=source_clock)
     window = slice_window(tape, start, end)
     if window.empty:
         raise ValueError(f"no bar of {path} is opened in {start:%Y-%m-%d} .. {end:%Y-%m-%d}")
@@ -187,6 +237,7 @@ def working_frame(
     end: pd.Timestamp,
     *,
     source: str = PROJECT_SOURCE,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
 ) -> tuple[str | None, pd.DataFrame | None]:
     """Return the working timeframe of a run and its tape, or ``(None, None)``.
 
@@ -199,11 +250,19 @@ def working_frame(
 
     Raises like :func:`load_windowed_tape`: a working tape that is absent or holds no bar of the
     window stops the runner instead of running the entry alone under a structure that is not there.
+    ``source_clock`` is the Э17.B clock of that raw file and travels with the call.
     """
     preset = preset_of(timeframes)
     if preset.structure is None:
         return None, None
-    return preset.structure, load_windowed_tape(symbol, preset.structure, start, end, source=source)
+    return preset.structure, load_windowed_tape(
+        symbol,
+        preset.structure,
+        start,
+        end,
+        source=source,
+        source_clock=source_clock,
+    )
 
 
 def markup_frames(
@@ -212,6 +271,7 @@ def markup_frames(
     window: RunWindow,
     *,
     source: str = PROJECT_SOURCE,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
 ) -> dict[str, pd.DataFrame]:
     """Return the HTF frames of a separated bias hierarchy, loaded from their own files (В2-B).
 
@@ -226,6 +286,10 @@ def markup_frames(
     earliest start that tape supports - a run may not be handed a shorter warm-up than it asked for.
     A tape that is not there raises the :class:`FileNotFoundError` of :func:`tape_path`'s loader,
     which names the file and the folder to fetch it into.
+
+    ``source_clock`` is the Э17.B clock of those raw files: the loader moves the stamps onto UTC
+    before the warm-up is measured, so a tape in server time does not look three hours older than
+    it is and the window of the run is counted in real time.
     """
     preset = preset_of(timeframes)
     if preset.structure is None:
@@ -240,7 +304,7 @@ def markup_frames(
                 else f"point {SMC_DATA_DIR_ENV} at the export folder (now {path.parent})"
             )
             raise FileNotFoundError(f"no tape at {path}: {hint}")
-        tape = load_csv(path) if source == PROJECT_SOURCE else load_ohlcv(path, format=AUTO_FORMAT)
+        tape = _load_tape(path, source=source, source_clock=source_clock)
         first = tape[TIMESTAMP_COLUMN].min()
         earliest = first + pd.Timedelta(days=window.warmup_days)
         if window.start < earliest:
@@ -431,6 +495,39 @@ def resolve_hierarchy(argument: str | None, cfg: Mapping[str, Any] | None) -> st
     return name
 
 
+def resolve_source_clock(
+    args: argparse.Namespace,
+    cfg: Mapping[str, Any] | None = None,
+) -> SourceClock:
+    """Return the clock of the *raw* tape a run reads (Э17.B): typed, file, else ``"utc"``.
+
+    The order is the order of the layer (:func:`resolve_selector`): ``--source-clock`` as the caller
+    typed it, else the ``source_clock`` key of a live config, else
+    :data:`~smc_zero.config.DEFAULT_SOURCE_CLOCK` - the UTC-naive convention every run before Э17
+    assumed, which keeps a command line without a declaration working unchanged.
+
+    ``args.source_clock`` defaults to ``None`` and not to ``"utc"`` on purpose: a default outranks
+    the file without the caller ever typing it, and the live config of the winner declares
+    ``"broker_server"`` (the Э17 audit found both bases in server time).
+
+    ``cfg`` is the already read config of the caller (``None`` to read the one ``args`` names).  A
+    value outside :data:`~smc_zero.config.SOURCE_CLOCKS` is refused with the list of the known ones,
+    so a typo can never fall back to UTC and hide a shift of every bar (rule 5).
+    """
+    if cfg is None and getattr(args, "config_path", None):
+        cfg = load_config(args.config_path)
+    clock = getattr(args, "source_clock", None) or (
+        None if cfg is None else cfg.get(SOURCE_CLOCK_KEY)
+    )
+    if clock is None:
+        return SourceClockConfig().clock
+    try:
+        return SourceClockConfig(clock=str(clock)).clock
+    except ValueError as error:
+        known = ", ".join(SOURCE_CLOCKS)
+        raise ValueError(f"{SOURCE_CLOCK_KEY}: {error}; known clocks are {known}") from error
+
+
 def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, BacktestConfig]:
     """Return the symbol, the timeframe and the two configs of a run: the file first, the arguments.
 
@@ -611,15 +708,31 @@ def add_window_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_data_source_argument(parser: argparse.ArgumentParser) -> None:
-    """Add ``--data-source``: the base a run reads its tape from (Э11'.1).
+    """Add ``--data-source`` and ``--source-clock``: the base a run reads and its clock (Э17.B).
 
     ``project`` is the ``./data`` folder the layer shipped with; ``mt5`` is a raw MetaTrader 5
     export under ``SMC_DATA_DIR`` (``~/_data/mt5`` by default).  The default keeps every existing
     command line working unchanged.
+
+    The clock belongs beside the base, because it is a property of the very files of that base and
+    not of the pipeline: ``--source-clock`` declares what their raw stamps carry.  Its default is
+    ``None`` and not ``"utc"`` on purpose (:func:`resolve_source_clock`): the ``source_clock`` key
+    of a live config has to be able to outrank a default nobody typed, and ``None`` still resolves
+    to the UTC-naive convention of every run before Э17.
     """
     parser.add_argument(
         "--data-source",
         choices=DATA_SOURCES,
         default=PROJECT_SOURCE,
         help="tape base: 'project' = ./data (default), 'mt5' = the export under SMC_DATA_DIR",
+    )
+    parser.add_argument(
+        "--source-clock",
+        choices=SOURCE_CLOCKS,
+        default=None,
+        help=(
+            "clock of the raw tape file: 'utc' (default) or 'broker_server' "
+            "(GMT+3/GMT+2 by the US DST calendar; what the MT5 export and ./data carry); "
+            "a live config may name it through 'source_clock'"
+        ),
     )

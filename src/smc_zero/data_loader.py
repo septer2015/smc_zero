@@ -11,9 +11,15 @@ Findings that drive this module:
   interval (D1 at ``00:00:00``, M15 on the ``:00/:15/:30/:45`` grid, H1 on full
   hours), hence ``close_time = timestamp + period`` is built explicitly by
   :func:`attach_close_time`.
-* the stamps are UTC-naive in the files, so they are *localized* to UTC - never
-  shifted with ``tz_convert``; only relative alignment matters for the
-  HTF -> LTF stitching.
+* the stamps are UTC-naive in the files and the pipeline contract is UTC-naive, so
+  they are *localized* to UTC - never shifted with ``tz_convert``.  What the file
+  itself *carries* is a separate question, and Э17 answered it: both bases turned out
+  to hold the clock of the **broker server** (GMT+3 in the US summer season, GMT+2
+  outside it) rather than UTC, so the ``source_clock`` parameter of
+  :func:`load_ohlcv` moves the raw stamps onto UTC before anything downstream reads
+  them.  The absolute clock matters - the session windows, the D1 bias, the unclosed
+  tail and the merge of two tapes all read it - which is why it is a declared input
+  and not an assumption (SPEC_SMC.md §7.26).
 * the last bar of every timeframe may still have been forming when the export
   was taken, hence :func:`mark_closed` and :func:`drop_unclosed`.
 * pandas 3 infers coarse resolutions from strings (``datetime64[us, UTC]``), so
@@ -30,16 +36,36 @@ is the single entry point over both and :func:`merge_ohlcv` extends a tape with
 a second source.  The project layout keeps the older :func:`load_csv` contract
 untouched, MT5 stamps are read with an explicit format list because D1 is a bare
 date and intraday bars are full stamps.
+
+The timezone of a raw file is declared and never guessed (Э17.B, §7.26)::
+
+    load_ohlcv(path, source_clock="broker_server")
+
+``source_clock`` describes the **file**, not the pipeline: ``"utc"`` (the default)
+reads its stamps as UTC-naive open times, while ``"broker_server"`` says they are the
+clock of the broker server and :func:`normalise_source_clock` moves every stamp onto UTC
+before the grid validation, the unclosed tail rule, the merge and every indicator.  A
+fragment older than :data:`BROKER_SERVER_EPOCH` is reported to the caller: the history
+before 2022 may be a mosaic of older conventions, and a shift would hide that instead of
+declaring it.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
 
-from smc_zero.config import Timeframe
+from smc_zero.config import (
+    DEFAULT_SOURCE_CLOCK,
+    SOURCE_CLOCK_UTC,
+    SOURCE_CLOCKS,
+    SourceClock,
+    Timeframe,
+)
+from smc_zero.utils.time import broker_server_offset_hours
 
 OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
 PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
@@ -47,6 +73,13 @@ TIMESTAMP_COLUMN = "timestamp"
 CLOSE_TIME_COLUMN = "close_time"
 IS_CLOSED_COLUMN = "is_closed"
 SOURCE_TIME_COLUMN = "datetime"
+
+#: The first day the *broker server* clock is supported from (Э17.B, SPEC_SMC.md §7.26).  The
+#: project window of §7.10 opens on 2022-08-15 and the warm-up reaches a little before it, so a
+#: tape should not hold a server stamp older than this.  A fragment of H1/H4/D1 that does is
+#: history of an unknown convention - the export and the server clock may have moved since - and
+#: it is reported to the caller instead of being shifted in silence (rule 1: no guessing).
+BROKER_SERVER_EPOCH = pd.Timestamp("2022-08-01", tz="UTC")
 
 #: The two on-disk layouts and the value that lets the columns decide (Э11'.1).
 PROJECT_FORMAT = "project"
@@ -169,6 +202,97 @@ def _normalise(frame: pd.DataFrame, *, source: str) -> pd.DataFrame:
     return normalised
 
 
+def _broker_server_offsets(stamps: pd.Series) -> pd.Series:
+    """Return the server offset (hours) of every *server date* of ``stamps``.
+
+    The offset is looked up once per distinct server day and mapped back onto the bars, because
+    the rule of :func:`~smc_zero.utils.time.broker_server_offset_hours` is a property of a date
+    and four years hold fewer than 1600 of them.  ``stamps`` are the *raw* naive stamps of the
+    file, so the day the season is read on is the day the broker's own clock showed.  A ``NaT``
+    day stays out of the table and answers ``NaN``, which the caller reads as "no shift".
+    """
+    days = stamps.dt.normalize()
+    table = {day: broker_server_offset_hours(day) for day in days.dropna().drop_duplicates()}
+    return days.map(table)
+
+
+def utc_stamps(
+    stamps: pd.Series,
+    *,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
+) -> pd.Series:
+    """Return the *raw* stamps of a file as true UTC under ``source_clock`` (Э17.B).
+
+    The one place where the clock of a raw file is read.  ``stamps`` hold the values of the file,
+    read as if they were UTC; ``"utc"`` returns them untouched and ``"broker_server"`` loses the
+    offset of the broker server on every bar - 3 hours in the US summer season and 2 outside it,
+    looked up on the raw *server* date the stamp itself shows.
+
+    :func:`normalise_source_clock` applies this to a whole frame and ``smc-check-tape`` applies it
+    to the tail of a file, so the report of the check can never disagree with what an engine reads.
+    """
+    if source_clock not in SOURCE_CLOCKS:
+        known = ", ".join(SOURCE_CLOCKS)
+        raise ValueError(f"utc_stamps: unsupported source_clock {source_clock!r}; expected {known}")
+    values = _to_utc(stamps)
+    if source_clock == SOURCE_CLOCK_UTC:
+        return values
+    raw_stamps = values.dt.tz_convert("UTC").dt.tz_localize(None)
+    return values - pd.to_timedelta(_broker_server_offsets(raw_stamps).fillna(0.0), unit="h")
+
+
+def normalise_source_clock(
+    frame: pd.DataFrame,
+    *,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
+    source: str = "<frame>",
+) -> pd.DataFrame:
+    """Return ``frame`` with the stamps of its raw file moved onto true UTC (Э17.B).
+
+    ``frame`` is the canonical frame of :func:`load_ohlcv`: a ``timestamp`` column holding the
+    stamps *of the file*, read as if they were UTC, plus an optional ``close_time``.  The helper
+    runs before the grid validation, the unclosed tail rule, the merge and every indicator, so
+    the whole pipeline reads one clock.
+
+    ``source_clock`` describes the file and not the frame.  ``"utc"`` (the default) means the
+    stamps are already UTC-naive open times and the frame is returned untouched.
+    ``"broker_server"`` subtracts the offset of the broker server - 3 hours while the US
+    daylight-saving season is in force and 2 outside it
+    (:func:`~smc_zero.utils.time.broker_server_offset_hours`) - from every stamp.  A D1 file,
+    whose stamps are the bare midnight of the server day, therefore lands on 21:00/22:00 UTC of
+    the day before: the instant that bar really opened.
+
+    The input frame is never mutated; the shifted stamps go into a copy, and columns, dtypes and
+    the row order are preserved.  An empty frame and a ``NaT`` stamp stay what they are.  A
+    fragment older than :data:`BROKER_SERVER_EPOCH` is reported as a :class:`UserWarning` naming
+    the file: shifting history of an unknown convention must not happen in silence.
+    """
+    if source_clock not in SOURCE_CLOCKS:
+        known = ", ".join(SOURCE_CLOCKS)
+        raise ValueError(f"{source}: unsupported source_clock {source_clock!r}; expected {known}")
+    if source_clock == SOURCE_CLOCK_UTC or frame.empty:
+        return frame
+    if TIMESTAMP_COLUMN not in frame.columns:
+        raise ValueError(f"{source}: normalise_source_clock expects a 'timestamp' column")
+
+    raw = _to_utc(frame[TIMESTAMP_COLUMN])
+    shift = raw - utc_stamps(raw, source_clock=source_clock)
+    out = frame.copy()
+    out[TIMESTAMP_COLUMN] = raw - shift
+    if CLOSE_TIME_COLUMN in out.columns:
+        out[CLOSE_TIME_COLUMN] = _to_utc(out[CLOSE_TIME_COLUMN]) - shift
+
+    first = out[TIMESTAMP_COLUMN].min()
+    if pd.notna(first) and first < BROKER_SERVER_EPOCH:
+        warnings.warn(
+            f"{source}: первый бар {first:%Y-%m-%d %H:%M} UTC раньше {BROKER_SERVER_EPOCH:%Y-%m-%d}: "
+            "до 2022 года конвенция пояса ленты не подтверждена, пояс применён ко всем строкам "
+            "- проверьте исторический фрагмент",
+            stacklevel=2,
+        )
+    return out
+
+
 def validate_ohlcv(
     frame: pd.DataFrame,
     *,
@@ -263,6 +387,7 @@ def load_ohlcv(
     format: str = AUTO_FORMAT,
     drop_unclosed: bool = True,
     dedup: bool | None = None,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
 ) -> pd.DataFrame:
     """Load a CSV of either supported layout into the canonical project schema.
 
@@ -275,6 +400,13 @@ def load_ohlcv(
     range it was asked for again.  The project layout keeps the older contract of
     :func:`load_csv`, where a duplicate timestamp stays a ``ValueError``.  Pass
     ``dedup`` explicitly to override either default.
+
+    ``source_clock`` is the clock of the **file** (Э17.B): ``"utc"`` (the default)
+    reads its stamps as UTC-naive open times, ``"broker_server"`` declares the clock
+    of the broker server and has :func:`normalise_source_clock` move every stamp onto
+    true UTC.  The shift happens before the grid validation, the unclosed tail rule
+    and the duplicate handling, so a tape whose last bar is still forming is judged on
+    the bar's real instant and never on a stamp three hours ahead of it.
 
     Returns a DataFrame with UTC-aware ``timestamp``, ``open``/``high``/``low``/
     ``close`` (float64), ``volume`` (int64) and ``is_closed`` (bool), sorted by
@@ -297,6 +429,7 @@ def load_ohlcv(
         layout_dedup = False
 
     frame = _normalise(frame, source=str(file))
+    frame = normalise_source_clock(frame, source_clock=source_clock, source=str(file))
     frame = frame.sort_values(TIMESTAMP_COLUMN, kind="stable").reset_index(drop=True)
     if layout_dedup if dedup is None else dedup:
         frame = frame.drop_duplicates(subset=[TIMESTAMP_COLUMN], keep="last").reset_index(drop=True)
@@ -307,7 +440,12 @@ def load_ohlcv(
     return frame
 
 
-def load_csv(path: str | Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
+def load_csv(
+    path: str | Path,
+    *,
+    drop_unclosed: bool = True,
+    source_clock: SourceClock = DEFAULT_SOURCE_CLOCK,
+) -> pd.DataFrame:
     """Load a single timeframe CSV into the canonical project schema.
 
     Parameters
@@ -316,6 +454,9 @@ def load_csv(path: str | Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
         File following the ``datetime,open,high,low,close,volume`` schema.
     drop_unclosed:
         When ``True`` (default) the presumed still-forming last bar is removed.
+    source_clock:
+        The clock of the *file* (Э17.B): ``"utc"`` (default) or ``"broker_server"``, whose
+        stamps are moved onto true UTC before anything else reads them.
 
     Returns
     -------
@@ -328,7 +469,12 @@ def load_csv(path: str | Path, *, drop_unclosed: bool = True) -> pd.DataFrame:
     ``ValueError`` are exactly the ones the loader has always had, so every
     existing caller keeps its behaviour (Э11'.1).
     """
-    return load_ohlcv(path, format=PROJECT_FORMAT, drop_unclosed=drop_unclosed)
+    return load_ohlcv(
+        path,
+        format=PROJECT_FORMAT,
+        drop_unclosed=drop_unclosed,
+        source_clock=source_clock,
+    )
 
 
 def merge_ohlcv(tapes: Iterable[pd.DataFrame], *, source: str = "<merge>") -> pd.DataFrame:
@@ -343,6 +489,12 @@ def merge_ohlcv(tapes: Iterable[pd.DataFrame], *, source: str = "<merge>") -> pd
 
     This is the extension path of Э11'.1: four years of project data plus a
     longer MT5 export become one tape without a single manual conversion.
+
+    Nothing here shifts a stamp.  By the time a tape reaches this function its stamps are UTC
+    (Э17.B, :func:`normalise_source_clock`), so two files of the same clock merge without a
+    second shift.  Mixing a tape read as ``"broker_server"`` with one read as ``"utc"`` stays
+    the caller's error and is deliberately not guessed at: a frame carries values and no
+    provenance, and a guess would move real bars (rule 1).
     """
     frames = list(tapes)
     if not frames:

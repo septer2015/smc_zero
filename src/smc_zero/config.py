@@ -83,6 +83,40 @@ EntryType: TypeAlias = Literal["fvg", "sweep50", "fvg_or_sweep50"]
 # two pairs whose C6 profile is actually known.
 Symbol: TypeAlias = Literal["EURUSD", "GBPUSD"]
 
+# The clock a *raw* tape file carries (Э17.B, SPEC_SMC.md §7.26).  ``"utc"`` is the
+# convention the pipeline has always assumed: the stamps of the file are UTC-naive open
+# times.  ``"broker_server"`` declares what the Э17 audit actually found in both bases:
+# the stamps are the clock of the broker server - GMT+3 while the US daylight-saving
+# season is in force and GMT+2 outside it - and the loader has to move them onto UTC
+# before anything downstream reads them.  The name describes the **file**, never the
+# state of the pipeline: whatever a source declares, ``load_ohlcv`` hands out UTC stamps.
+SourceClock: TypeAlias = Literal["utc", "broker_server"]
+#: The two clock names as values of their own, for the branches that tell them apart.
+SOURCE_CLOCK_UTC: SourceClock = "utc"
+SOURCE_CLOCK_BROKER_SERVER: SourceClock = "broker_server"
+#: The two source clocks as a value, for runtime validation and for the CLI choices.
+SOURCE_CLOCKS: tuple[SourceClock, ...] = (SOURCE_CLOCK_UTC, SOURCE_CLOCK_BROKER_SERVER)
+#: What a source declares when nobody names a clock: the historical pipeline convention.
+DEFAULT_SOURCE_CLOCK: SourceClock = SOURCE_CLOCK_UTC
+
+
+@dataclass(frozen=True, slots=True)
+class SourceClockConfig:
+    """The clock of a raw tape file (Э17.B): ``"utc"`` or ``"broker_server"``.
+
+    A source clock is *validated where a run is built*: a live config or a command line
+    that names a clock this layer does not know is refused, with the list of the known
+    ones in the message (rule 5).  A typo may therefore never fall back to UTC and hide
+    the two-hour shift of every bar behind an unknown word.
+    """
+
+    clock: SourceClock = DEFAULT_SOURCE_CLOCK
+
+    def __post_init__(self) -> None:
+        if self.clock not in SOURCE_CLOCKS:
+            known = ", ".join(SOURCE_CLOCKS)
+            raise ValueError(f"source_clock: expected one of {known}, got {self.clock!r}")
+
 
 @dataclass(frozen=True, slots=True)
 class TimeframeConfig:

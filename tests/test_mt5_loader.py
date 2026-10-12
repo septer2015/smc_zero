@@ -261,3 +261,26 @@ def test_load_windowed_tape_names_the_mt5_base_when_the_tape_is_absent(
 
     with pytest.raises(FileNotFoundError, match=_common.SMC_DATA_DIR_ENV):
         _common.load_windowed_tape("EURUSD", "M15", day, day, source=_common.MT5_SOURCE)
+
+
+def test_a_daily_mt5_date_is_the_midnight_of_the_server_day(tmp_path: Path) -> None:
+    """The bare D1 date of a server export means midnight *there*: 21:00/22:00 UTC before.
+
+    MetaTrader 5 writes a daily bar as a date without a time, so the stamp is the midnight of the
+    broker server day; declaring ``source_clock="broker_server"`` turns it into the instant the
+    bar really opened in UTC (Э17.B) - October 2026 is in the US summer season, hence the three
+    hours and the previous evening.
+    """
+    rows = [("2026-10-09", 1.1, 10), ("2026-10-12", 1.2, 11), ("2026-10-13", 1.3, 12)]
+
+    shifted = load_ohlcv(
+        _write_mt5(tmp_path / "EURUSD_D1.csv", rows, timeframe="D1"),
+        drop_unclosed=False,
+        source_clock="broker_server",
+    )
+
+    assert shifted[TIMESTAMP_COLUMN].tolist() == [
+        pd.Timestamp("2026-10-08 21:00", tz="UTC"),
+        pd.Timestamp("2026-10-11 21:00", tz="UTC"),
+        pd.Timestamp("2026-10-12 21:00", tz="UTC"),
+    ]

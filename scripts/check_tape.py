@@ -18,11 +18,35 @@
 ``--max-gap-bars`` баров сетки) и три самых тонких дня.  ``--json`` печатает то же машинно.
 
 Вердикт ``FAIL`` ставят только дефекты, о которых молчать нельзя: дубли, нарушенный порядок,
-метки вне сетки, покрытие ниже ``--min-coverage`` и пустое окно.  Длинный разрыв сам по себе не
-дефект (новогодние праздники брокера дают 80 часов), поэтому о нём сообщают, а не кричат.
-Незакрытый хвост - тоже информация: раннер его отбросит сам (конвенция §7.10 п.62).
+метки вне сетки, покрытие ниже ``--min-coverage``, пустое окно и несогласованный пояс времени
+(``TZ_MISMATCH``, ниже).  Длинный разрыв сам по себе не дефект (новогодние праздники брокера дают
+80 часов), поэтому о нём сообщают, а не кричат.  Незакрытый хвост - тоже информация: раннер его
+отбросит сам (конвенция §7.10 п.62).
 
-Коды выхода: ``0`` - OK, ``1`` - FAIL, ``2`` - файл не читается или аргумент неверен.
+Пояс времени (Э17.B, SPEC_SMC.md §7.26).  Аудит Э17 показал, что и ``./data``, и выгрузка
+MetaTrader 5 несут время **брокерского сервера** (GMT+3 летом, GMT+2 зимой, переключение по
+американскому календарю), а не UTC.  Поэтому вход принимает ``--source-clock``, и проверка
+валидирует **сырой** файл против заявленного пояса, а не «всегда против UTC».
+
+Сырой хвост файла сравнивается с текущим моментом, посчитанным в заявленном поясе, и - отдельно - с
+текущим моментом другого пояса:
+
+* хвост совпал с заявленным поясом (в пределах допуска) - пояс подтверждён;
+* хвост опережает «сейчас» заявленного пояса больше допуска или совпал с **другим** поясом -
+  ``TZ_MISMATCH``: файл не в том поясе, который заявлен.  Это дефект (код выхода 1), потому что
+  сдвиг на два-три часа переставляет killzone, сессии, D1/H1-bias и незакрытый хвост;
+* хвост не объясняется ни одним поясом (устаревшая выгрузка, выходные, праздник брокера) - пояс не
+  подтверждён и не опровергнут: строка в отчёте, без ``FAIL``.
+
+Допуск - до двух периодов сетки таймфрейма, но не больше часа (для D1 - сутки): незакрытый или
+чуть подросший хвост свежего экспорта сам по себе не ошибка пояса.  Различить смену пояса можно
+только там, где смещение сервера (2-3 ч) заметно больше допуска; на H4 (период 4 ч) это уже не так,
+и ограничение записано в SPEC.  Отчёт печатает сырой хвост, ожидаемый момент и то, что прочтёт
+движок после нормализации, - чтобы владелец видел разницу между «файл в broker_server» и «файл в
+UTC», а не догадывался о ней.
+
+Коды выхода: ``0`` - OK, ``1`` - FAIL (дефект ленты или ``TZ_MISMATCH``), ``2`` - файл не читается
+или аргумент неверен.
 """
 
 from __future__ import annotations
@@ -38,7 +62,13 @@ import numpy as np
 import pandas as pd
 
 from scripts import _common
+from smc_zero.config import (
+    DEFAULT_SOURCE_CLOCK,
+    SOURCE_CLOCK_BROKER_SERVER,
+    SOURCE_CLOCK_UTC,
+)
 from smc_zero.data_loader import (
+    BROKER_SERVER_EPOCH,
     IS_CLOSED_COLUMN,
     MT5_FORMAT,
     MT5_TIME_COLUMN,
@@ -48,7 +78,25 @@ from smc_zero.data_loader import (
     detect_format,
     load_ohlcv,
     period_for,
+    utc_stamps,
 )
+from smc_zero.utils.time import (
+    BROKER_SERVER_WINTER_OFFSET_HOURS,
+    broker_server_offset_hours,
+)
+
+#: Вердикт пояса времени: хвост подтверждает заявленный пояс.
+TZ_OK = "OK"
+#: Вердикт пояса времени: сырой файл несёт другой пояс, чем заявлено (Э17.B).
+TZ_MISMATCH = "TZ_MISMATCH"
+#: Вердикт пояса времени: хвост не объясняется ни одним поясом (старая выгрузка или пауза рынка).
+TZ_UNCHECKED = "UNCHECKED"
+
+#: Верхняя граница допуска проверки пояса: смещение брокерского сервера (2-3 ч) обязано быть
+#: заметно больше допуска, иначе смену пояса не отличить от свежести хвоста.
+TZ_TOLERANCE_CAP = pd.Timedelta(hours=1)
+#: Допуск проверки пояса для D1: там «период» равен суткам, и сравниваются даты, а не часы.
+TZ_DAILY_TOLERANCE = pd.Timedelta(days=1)
 
 
 @dataclass(frozen=True)
@@ -61,6 +109,11 @@ class TapeThresholds:
     каждый шаг).  Пауза между сессиями сюда не попадает: разрыв через полночь или выходные -
     свойство рынка, а не дефект экспорта; ``thin_day_ratio`` - доля обычного дня, ниже которой
     день попадает в отчёт; ``worst_gaps`` и ``worst_days`` - сколько примеров печатать.
+
+    Пороги пояса (Э17.B): ``tz_tolerance_periods`` - допуск в периодах сетки таймфрейма, которым
+    отличается незакрытый или чуть подросший хвост свежего экспорта; ``tz_tolerance_cap`` -
+    верхняя граница этого допуска (:data:`TZ_TOLERANCE_CAP`); ``tz_daily_tolerance`` - допуск
+    для D1, где «период» равен суткам и сравниваются даты.
     """
 
     min_coverage: float = 0.90
@@ -68,9 +121,153 @@ class TapeThresholds:
     thin_day_ratio: float = 0.5
     worst_gaps: int = 5
     worst_days: int = 3
+    tz_tolerance_periods: int = 2
+    tz_tolerance_cap: pd.Timedelta = TZ_TOLERANCE_CAP
+    tz_daily_tolerance: pd.Timedelta = TZ_DAILY_TOLERANCE
 
 
 DEFAULT_THRESHOLDS = TapeThresholds()
+
+
+def _hours(delta: pd.Timedelta) -> float:
+    """Return ``delta`` in hours - the unit the report of the clock speaks in."""
+    return delta.total_seconds() / 3600.0
+
+
+def _tz_tolerance(timeframe: str, thresholds: TapeThresholds) -> pd.Timedelta:
+    """Return the tolerance of the clock check for ``timeframe``.
+
+    Up to ``tz_tolerance_periods`` bars of the grid, but never more than ``tz_tolerance_cap``: the
+    tolerance has to stay well below the offset of the broker server (2-3 hours), otherwise a tape
+    in the wrong clock hides inside it.  A daily tape is a different question - its bars step a
+    whole day - and answers ``tz_daily_tolerance``.
+    """
+    if timeframe.upper() == "D1":
+        return thresholds.tz_daily_tolerance
+    return min(thresholds.tz_tolerance_periods * period_for(timeframe), thresholds.tz_tolerance_cap)
+
+
+def _server_now(now_utc: pd.Timestamp) -> pd.Timestamp:
+    """Return the broker *server* instant of ``now_utc`` (UTC plus 2 or 3 hours by US DST).
+
+    The season is read on the server date, exactly as the loader reads it on a raw stamp: the first
+    guess adds the smallest offset there is and the answer corrects it once, so this check and
+    :func:`~smc_zero.data_loader.utc_stamps` cannot disagree about which side of a switch a moment
+    sits on.  The two switching Sundays are weekend days, so no bar sits in the hour they move.
+    """
+    naive = now_utc.tz_convert("UTC").tz_localize(None)
+    guess = naive + pd.Timedelta(hours=BROKER_SERVER_WINTER_OFFSET_HOURS)
+    return now_utc + pd.Timedelta(hours=broker_server_offset_hours(guess.date()))
+
+
+@dataclass(frozen=True)
+class TailClockVerdict:
+    """Что сырой хвост ленты говорит о своём поясе (Э17.B).
+
+    ``expected`` - тот момент, которым «сейчас» видит заявленный пояс, ``actual`` - последний
+    **сырой** штамп файла, ``delta = actual - expected`` (положительная разница значит, что штампы
+    идут впереди «сейчас», то есть в другом поясе).  ``other_delta`` - та же разница против другого
+    пояса: если она укладывается в допуск, а своя нет, файл несёт не тот пояс, который заявлен.
+    """
+
+    source_clock: str
+    verdict: str
+    expected: pd.Timestamp
+    actual: pd.Timestamp
+    delta: pd.Timedelta
+    other_delta: pd.Timedelta
+    tolerance: pd.Timedelta
+    note: str
+
+    @property
+    def other_clock(self) -> str:
+        """Пояс, который не заявлен: с ним сверяется хвост для второй точки зрения."""
+        if self.source_clock == SOURCE_CLOCK_UTC:
+            return SOURCE_CLOCK_BROKER_SERVER
+        return SOURCE_CLOCK_UTC
+
+    def problem(self) -> str | None:
+        """Return the ``TZ_MISMATCH`` line as Russian text, or ``None`` when the clock is fine."""
+        if self.verdict != TZ_MISMATCH:
+            return None
+        return (
+            f"{TZ_MISMATCH}: последний бар {self.actual:%Y-%m-%d %H:%M} не соответствует заявленному "
+            f"поясу {self.source_clock}: ожидаем около {self.expected:%Y-%m-%d %H:%M}, "
+            f"получили {self.actual:%Y-%m-%d %H:%M}, расхождение {_hours(self.delta):+.2f} ч"
+        )
+
+    def lines(self) -> tuple[str, ...]:
+        """Return the report lines of the verdict: что заявлено и что показал сырой хвост."""
+        headline = (
+            f"пояс       : заявлен {self.source_clock} (допуск {_hours(self.tolerance):.2f} ч),"
+            f" ожидали около {self.expected:%Y-%m-%d %H:%M},"
+            f" хвост {self.actual:%Y-%m-%d %H:%M},"
+            f" расхождение {_hours(self.delta):+.2f} ч -> {self.verdict}"
+        )
+        if self.verdict == TZ_OK:
+            return (headline,)
+        return (
+            headline,
+            f"  а в поясе {self.other_clock} расхождение было бы {_hours(self.other_delta):+.2f} ч",
+            f"  {self.note}",
+        )
+
+
+def clock_verdict(
+    last: pd.Timestamp,
+    *,
+    source_clock: str,
+    timeframe: str,
+    now: pd.Timestamp,
+    thresholds: TapeThresholds = DEFAULT_THRESHOLDS,
+) -> TailClockVerdict:
+    """Return the verdict of the raw tail ``last`` against the clock ``source_clock`` (Э17.B).
+
+    ``last`` is the last stamp the file itself wrote (read as if it were UTC) and ``now`` the
+    current instant in UTC.  The tail is measured against «сейчас» of the declared clock and,
+    separately, against «сейчас» of the other one - see the module docstring for the three
+    answers that produces, and :func:`_tz_tolerance` for the tolerance of a timeframe.
+    """
+    tolerance = _tz_tolerance(timeframe, thresholds)
+    server_now = _server_now(now)
+    if source_clock == SOURCE_CLOCK_UTC:
+        expected, other, other_clock = now, server_now, SOURCE_CLOCK_BROKER_SERVER
+    else:
+        expected, other, other_clock = server_now, now, SOURCE_CLOCK_UTC
+    delta = last - expected
+    other_delta = last - other
+    if delta > tolerance:
+        verdict = TZ_MISMATCH
+        note = (
+            f"сырой хвост опережает «сейчас» пояса {source_clock} на {_hours(delta):.2f} ч,"
+            " а штампы файла так далеко вперёд уйти не могут"
+        )
+    elif abs(other_delta) <= tolerance and abs(delta) > tolerance:
+        verdict = TZ_MISMATCH
+        note = (
+            f"сырой хвост совпадает с поясом {other_clock}, а заявлен {source_clock}:"
+            " файл несёт не тот пояс"
+        )
+    elif abs(delta) <= tolerance:
+        verdict = TZ_OK
+        note = "хвост совпадает с заявленным поясом"
+    else:
+        verdict = TZ_UNCHECKED
+        note = (
+            "хвост не объясняется ни заявленным поясом, ни другим: это похоже на устаревшую"
+            " выгрузку или на паузу рынка (выходные, праздник брокера), поэтому пояс не"
+            " подтверждён и не опровергнут"
+        )
+    return TailClockVerdict(
+        source_clock=source_clock,
+        verdict=verdict,
+        expected=expected,
+        actual=last,
+        delta=delta,
+        other_delta=other_delta,
+        tolerance=tolerance,
+        note=note,
+    )
 
 
 @dataclass(frozen=True)
@@ -101,6 +298,11 @@ class TapeReport:
     intraday_gaps: int
     gaps: tuple[tuple[pd.Timestamp, float], ...]
     thin_days: tuple[tuple[pd.Timestamp, int], ...]
+    #: Заявленный пояс сырого файла и вердикт по нему (Э17.B): ``None`` - пояс не проверялся.
+    source_clock: str = DEFAULT_SOURCE_CLOCK
+    clock: TailClockVerdict | None = None
+    #: Последний сырой штамп, приведённый к UTC заявленным поясом: то, что прочтёт движок.
+    last_utc: pd.Timestamp | None = None
 
     def failures_against(self, thresholds: TapeThresholds) -> tuple[str, ...]:
         """Return the defects that make the tape unfit for a run, each named in Russian."""
@@ -117,19 +319,21 @@ class TapeReport:
             problems.append(
                 f"покрытие {self.coverage:.3f} ниже порога {thresholds.min_coverage:.2f}"
             )
+        if self.clock is not None and (mismatch := self.clock.problem()) is not None:
+            problems.append(mismatch)
         return tuple(problems)
 
     def lines(self, thresholds: TapeThresholds) -> tuple[str, ...]:
         """Return the human-readable report: one fact per line, then the verdict."""
         if not self.rows:
             head = (
-                f"лента      : {self.path} (layout={self.layout})",
+                f"лента      : {self.path} (layout={self.layout}, пояс={self.source_clock})",
                 f"окно       : пусто после нарезки ({self.timeframe})",
             )
         else:
             head = (
-                f"лента      : {self.path} (layout={self.layout})",
-                f"окно       : {self.first:%Y-%m-%d %H:%M} .. {self.last:%Y-%m-%d %H:%M} UTC",
+                f"лента      : {self.path} (layout={self.layout}, пояс={self.source_clock})",
+                f"окно       : {self.first:%Y-%m-%d %H:%M} .. {self.last:%Y-%m-%d %H:%M} (сырые штампы)",
                 (
                     f"бары       : {self.rows} (дни {self.days}, торговые {self.trading_days},"
                     f" ожидалось {self.expected_bars}, покрытие {self.coverage:.3f})"
@@ -153,15 +357,35 @@ class TapeReport:
             f"  пропуск {hours:6.2f} ч перед баром {stamp:%Y-%m-%d %H:%M} UTC"
             for stamp, hours in self.gaps
         ]
-        details += [
-            f"  тонкий день {day:%Y-%m-%d}: {count} бар"
-            for day, count in self.thin_days
-        ]
+        details += [f"  тонкий день {day:%Y-%m-%d}: {count} бар" for day, count in self.thin_days]
+        return (*head, *self._clock_lines(), *details, *self._verdict_lines(thresholds))
+
+    def _clock_lines(self) -> tuple[str, ...]:
+        """Return the report lines of the clock (Э17.B): заявленный пояс и что прочтёт движок.
+
+        Пустой кортеж, когда пояс не проверялся (``clock is None``) - так отчёт остаётся прежним
+        для вызывающего, который проверку пояса не просил.
+        """
+        if self.clock is None:
+            return ()
+        lines = list(self.clock.lines())
+        if self.last_utc is not None:
+            lines.append(
+                f"  после нормализации движок читает хвост {self.last_utc:%Y-%m-%d %H:%M} UTC"
+            )
+        if self.first is not None and self.first < BROKER_SERVER_EPOCH:
+            lines.append(
+                f"  хвост истории: первый бар {self.first:%Y-%m-%d} раньше"
+                f" {BROKER_SERVER_EPOCH:%Y-%m-%d}, конвенция пояса до 2022 года не подтверждена"
+            )
+        return tuple(lines)
+
+    def _verdict_lines(self, thresholds: TapeThresholds) -> tuple[str, ...]:
+        """Return the verdict lines: ``FAIL`` with its reasons, or a plain ``OK``."""
         problems = self.failures_against(thresholds)
-        verdict = ["вердикт    : FAIL"] + [f"  - {problem}" for problem in problems]
         if not problems:
-            verdict = ["вердикт    : OK"]
-        return (*head, *details, *verdict)
+            return ("вердикт    : OK",)
+        return ("вердикт    : FAIL", *(f"  - {problem}" for problem in problems))
 
     def as_dict(self, thresholds: TapeThresholds) -> dict[str, object]:
         """Return the same report as data, for the ``--json`` face."""
@@ -183,6 +407,11 @@ class TapeReport:
             "intraday_gaps": self.intraday_gaps,
             "gaps": [[stamp.isoformat(), round(hours, 4)] for stamp, hours in self.gaps],
             "thin_days": [[day.isoformat(), count] for day, count in self.thin_days],
+            "source_clock": self.source_clock,
+            "tz_verdict": None if self.clock is None else self.clock.verdict,
+            "tz_note": None if self.clock is None else self.clock.note,
+            "tz_expected": None if self.clock is None else self.clock.expected.isoformat(),
+            "last_utc": None if self.last_utc is None else self.last_utc.isoformat(),
             "failures": list(self.failures_against(thresholds)),
             "verdict": "FAIL" if self.failures_against(thresholds) else "OK",
         }
@@ -226,6 +455,11 @@ def _trading_days(start: pd.Timestamp, end: pd.Timestamp) -> int:
     return int((calendar.weekday < 5).sum())
 
 
+def _now_utc() -> pd.Timestamp:
+    """Return the current instant in UTC - the default «сейчас» of the clock check (Э17.B)."""
+    return pd.Timestamp.now(tz="UTC")
+
+
 def inspect_tape(
     path: Path,
     *,
@@ -233,6 +467,8 @@ def inspect_tape(
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     thresholds: TapeThresholds = DEFAULT_THRESHOLDS,
+    source_clock: str = DEFAULT_SOURCE_CLOCK,
+    now: pd.Timestamp | None = None,
 ) -> TapeReport:
     """Measure the bars ``path`` carries over ``[start, end]`` and name every defect found.
 
@@ -240,7 +476,13 @@ def inspect_tape(
     and ``end`` is inside it.  ``None`` bounds mean the edges of the file itself, so a plain call
     inspects the whole tape.  The bars are read exactly as a run reads them
     (:func:`~smc_zero.data_loader.load_ohlcv`), except that the still-forming tail is kept: whether
-    the export stops on a forming bar is one of the facts being reported.
+    the export stops on a forming bar is one of the facts being reported.  ``start`` / ``end`` are
+    bounds of the **raw** stamps: this check reads the file as the file is, and the clock of its
+    stamps is a fact it measures (``source_clock``) rather than a shift it silently applies.
+
+    ``source_clock`` is the clock the raw file is *declared* to carry and ``now`` the instant the
+    tail is judged against (``None`` = now, UTC); the verdict itself comes from
+    :func:`clock_verdict` and is reported as a defect when the tail contradicts the declaration.
     """
     layout, labels = _raw_marks(path)
     duplicates = int(labels.duplicated().sum())
@@ -248,11 +490,19 @@ def inspect_tape(
 
     frame = load_ohlcv(path, format=layout, drop_unclosed=False)
     if frame.empty:
-        return _empty_report(path, layout, timeframe, duplicates, ordered)
+        return _empty_report(path, layout, timeframe, duplicates, ordered, source_clock)
+    verdict = clock_verdict(
+        frame[TIMESTAMP_COLUMN].iloc[-1],
+        source_clock=source_clock,
+        timeframe=timeframe,
+        now=_now_utc() if now is None else now,
+        thresholds=thresholds,
+    )
+    last_utc = utc_stamps(pd.Series([verdict.actual]), source_clock=source_clock).iloc[0]
     window_start, window_end = _window_span(frame, start, end)
     window = _common.slice_window(frame, window_start, window_end)
     if window.empty:
-        return _empty_report(path, layout, timeframe, duplicates, ordered)
+        return _empty_report(path, layout, timeframe, duplicates, ordered, source_clock)
     trading_days = _trading_days(window_start, window_end)
 
     stamps = window[TIMESTAMP_COLUMN]
@@ -301,13 +551,25 @@ def inspect_tape(
         intraday_gaps=int(intraday.size),
         gaps=gaps,
         thin_days=thin_days,
+        source_clock=source_clock,
+        clock=verdict,
+        last_utc=last_utc,
     )
 
 
 def _empty_report(
-    path: Path, layout: str, timeframe: str, duplicates: int, ordered: bool
+    path: Path,
+    layout: str,
+    timeframe: str,
+    duplicates: int,
+    ordered: bool,
+    source_clock: str = DEFAULT_SOURCE_CLOCK,
 ) -> TapeReport:
-    """Return the report of a tape that holds no bar at all: one failure, no geometry."""
+    """Return the report of a tape that holds no bar at all: one failure, no geometry.
+
+    The clock is named but not judged: a file without a bar has no tail to compare with «сейчас»,
+    and the empty window already fails on its own.
+    """
     return TapeReport(
         path=path,
         layout=layout,
@@ -326,6 +588,7 @@ def _empty_report(
         intraday_gaps=0,
         gaps=(),
         thin_days=(),
+        source_clock=source_clock,
     )
 
 
@@ -338,12 +601,30 @@ def print_report(report: TapeReport, thresholds: TapeThresholds, *, as_json: boo
         print(line)
 
 
+def _read_moment(value: str) -> pd.Timestamp:
+    """Read a date or a full stamp as a UTC instant (the ``argparse`` ``type=`` of ``--now``).
+
+    ``YYYY-MM-DD`` and ``YYYY-MM-DD HH:MM:SS`` are both accepted; a stamp without a zone is read
+    as UTC, because every moment this project speaks about is UTC (Э17.B).
+    """
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a moment, use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'"
+        ) from error
+    if stamp.tzinfo is None:
+        return stamp.tz_localize("UTC")
+    return stamp.tz_convert("UTC")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the argument parser of ``smc-check-tape``."""
     parser = argparse.ArgumentParser(
         prog="smc-check-tape",
         description=(
-            "Проверить ленту <SYMBOL>_<TIMEFRAME>.csv: дубли, порядок, сетку, покрытие, разрывы."
+            "Проверить ленту <SYMBOL>_<TIMEFRAME>.csv: дубли, порядок, сетку, покрытие, разрывы, "
+            "пояс времени."
         ),
     )
     parser.add_argument("--symbol", default="EURUSD", help="символ ленты, по умолчанию EURUSD")
@@ -376,6 +657,16 @@ def build_parser() -> argparse.ArgumentParser:
         f"(по умолчанию {DEFAULT_THRESHOLDS.max_gap_bars}); выходные и ночной перерыв "
         "пропуском не считаются",
     )
+    parser.add_argument(
+        "--now",
+        type=_read_moment,
+        default=None,
+        help=(
+            "момент проверки пояса, YYYY-MM-DD или 'YYYY-MM-DD HH:MM:SS' в UTC "
+            "(по умолчанию - текущее время); пин нужен для воспроизводимой проверки "
+            "на закрытом рынке"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="машинный отчёт вместо читаемого")
     return parser
 
@@ -385,12 +676,15 @@ def run(args: argparse.Namespace) -> int:
     thresholds = TapeThresholds(min_coverage=args.min_coverage, max_gap_bars=args.max_gap_bars)
     path = _common.tape_path(args.symbol, args.timeframe, source=args.data_source)
     try:
+        clock = _common.resolve_source_clock(args)
         report = inspect_tape(
             path,
             timeframe=args.timeframe,
             start=args.start,
             end=args.end,
             thresholds=thresholds,
+            source_clock=clock,
+            now=args.now,
         )
     except (OSError, ValueError) as error:
         print(f"ошибка: {error}", file=sys.stderr)

@@ -3,6 +3,11 @@
 The synthetic frames never touch ``./data``: they are fully deterministic, so the
 open_time convention, the unclosed-tail protection and the HTF -> LTF stitching
 can be asserted exactly (including the look-ahead test).
+
+The Э17.B block at the end pins the clock of a *raw* file: a tape of the broker
+server loses its two or three hours of server offset before the grid, the
+unclosed tail rule and the merge read a bar, while the UTC clock leaves a tape
+exactly as it is.
 """
 
 from __future__ import annotations
@@ -25,8 +30,11 @@ from smc_zero.data_loader import (
     drop_unclosed,
     load_csv,
     mark_closed,
+    merge_ohlcv,
+    normalise_source_clock,
     period_for,
     resample_to_timeframe,
+    utc_stamps,
 )
 
 LTF_PERIOD = pd.Timedelta(minutes=15)
@@ -394,3 +402,233 @@ def test_the_bar_scale_of_a_timeframe_counts_one_day() -> None:
     assert bars_per_day("D1") == 1
     with pytest.raises(ValueError, match="unsupported timeframe"):
         bars_per_day("M1")
+
+
+# ---------------------------------------------------------------------------------------------
+# Э17.B: the clock of a raw tape - the broker server (GMT+3/GMT+2 by US DST) against UTC
+# ---------------------------------------------------------------------------------------------
+
+#: Two raw stamps of the same broker clock, one inside the US summer season and one outside it:
+#: the server runs GMT+3 in October 2026 and GMT+2 after the first Sunday of November (the audit
+#: of Э17 measured exactly that on both bases - ``./data`` and the MetaTrader 5 export).
+SERVER_SUMMER = "2026-10-09 12:00"
+SERVER_WINTER = "2026-12-09 12:00"
+
+
+def _server_frame(stamps: list[str]) -> pd.DataFrame:
+    """Return an OHLCV frame stamped with the raw *server* stamps of ``stamps``, read as UTC.
+
+    A raw file holds its stamps without a zone, so the loader sees these values as they are
+    written here; declaring ``source_clock="broker_server"`` is what tells it that they mean
+    server time.  The level of a bar steps by one pip so that two frames are never confused.
+    """
+    levels = 1.1 + np.arange(len(stamps), dtype="float64") * 0.0001
+    return pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: pd.DatetimeIndex([pd.Timestamp(stamp) for stamp in stamps], tz="UTC"),
+            "open": levels,
+            "high": levels + 0.0002,
+            "low": levels - 0.0002,
+            "close": levels + 0.0001,
+            "volume": np.arange(100, 100 + len(stamps), dtype="int64"),
+        }
+    )
+
+
+def test_a_summer_server_tape_loses_three_hours(tmp_path: Path) -> None:
+    """A tape of the broker server in its summer season is shifted by -3 h, and nothing else."""
+    source = _frame(SERVER_SUMMER, periods=4, freq="15min")
+    path = _write_csv(tmp_path / "EURUSD_M15.csv", source)
+
+    raw = load_csv(path, drop_unclosed=False)
+    shifted = load_csv(path, drop_unclosed=False, source_clock="broker_server")
+
+    assert raw[TIMESTAMP_COLUMN].iloc[0] == pd.Timestamp("2026-10-09 12:00", tz="UTC")
+    assert (
+        shifted[TIMESTAMP_COLUMN].tolist()
+        == (raw[TIMESTAMP_COLUMN] - pd.Timedelta(hours=3)).tolist()
+    )
+    assert list(shifted.columns) == list(raw.columns)
+    assert str(shifted[TIMESTAMP_COLUMN].dtype) == "datetime64[ns, UTC]"
+    assert shifted["close"].tolist() == raw["close"].tolist()
+
+
+def test_a_winter_server_tape_loses_two_hours(tmp_path: Path) -> None:
+    """Outside the US summer season the same server clock is GMT+2, never a fixed MSK."""
+    source = _frame(SERVER_WINTER, periods=3, freq="15min")
+    path = _write_csv(tmp_path / "EURUSD_M15.csv", source)
+
+    shifted = load_csv(path, drop_unclosed=False, source_clock="broker_server")
+
+    assert (
+        shifted[TIMESTAMP_COLUMN].tolist()
+        == (source[TIMESTAMP_COLUMN] - pd.Timedelta(hours=2)).tolist()
+    )
+    assert shifted[TIMESTAMP_COLUMN].iloc[0] == pd.Timestamp("2026-12-09 10:00", tz="UTC")
+
+
+def test_the_offset_switches_inside_a_tape_at_the_us_dates(tmp_path: Path) -> None:
+    """One tape holds both offsets: the US winter bars lose 2 h, the later ones 3 h.
+
+    The switch is the American one (the second Sunday of March 2026 is the 8th), so the bars of
+    the Friday before it are still GMT+2 and the Monday after it is GMT+3.  A rule tied to MSK
+    would move both legs by the same three hours, and one tied to the European calendar would
+    move the wrong Friday.
+    """
+    path = _write_csv(
+        tmp_path / "EURUSD_M15.csv",
+        _server_frame(
+            ["2026-03-06 12:00", "2026-03-06 12:15", "2026-03-09 12:00", "2026-03-09 12:15"]
+        ),
+    )
+
+    shifted = load_csv(path, drop_unclosed=False, source_clock="broker_server")
+
+    assert shifted[TIMESTAMP_COLUMN].tolist() == [
+        pd.Timestamp("2026-03-06 10:00", tz="UTC"),
+        pd.Timestamp("2026-03-06 10:15", tz="UTC"),
+        pd.Timestamp("2026-03-09 09:00", tz="UTC"),
+        pd.Timestamp("2026-03-09 09:15", tz="UTC"),
+    ]
+
+
+def test_the_utc_clock_leaves_a_tape_exactly_as_it_is(tmp_path: Path) -> None:
+    """``utc`` is the default and the no-op: neither spelling moves a UTC stamp."""
+    source = _frame("2026-10-09 12:00", periods=3, freq="15min")
+    path = _write_csv(tmp_path / "EURUSD_M15.csv", source)
+
+    default = load_csv(path, drop_unclosed=False)
+    explicit = load_csv(path, drop_unclosed=False, source_clock="utc")
+
+    pd.testing.assert_frame_equal(default, explicit)
+    assert default[TIMESTAMP_COLUMN].tolist() == source[TIMESTAMP_COLUMN].tolist()
+
+
+def test_the_normalisation_copies_and_sets_close_time_with_its_bar() -> None:
+    """The helper never writes into its input, and a ``close_time`` travels with its bar."""
+    frame = attach_close_time(_frame(SERVER_SUMMER, periods=2, freq="15min"), "M15")
+    before = frame.copy()
+
+    shifted = normalise_source_clock(frame, source_clock="broker_server")
+
+    pd.testing.assert_frame_equal(frame, before)
+    assert shifted is not frame
+    assert shifted[TIMESTAMP_COLUMN].tolist() == [
+        pd.Timestamp("2026-10-09 09:00", tz="UTC"),
+        pd.Timestamp("2026-10-09 09:15", tz="UTC"),
+    ]
+    assert shifted[CLOSE_TIME_COLUMN].tolist() == [
+        pd.Timestamp("2026-10-09 09:15", tz="UTC"),
+        pd.Timestamp("2026-10-09 09:30", tz="UTC"),
+    ]
+    assert (shifted[CLOSE_TIME_COLUMN] - shifted[TIMESTAMP_COLUMN]).tolist() == [LTF_PERIOD] * 2
+
+
+def test_a_server_tail_is_judged_on_the_real_instant_not_on_the_raw_stamp(tmp_path: Path) -> None:
+    """The still-forming bar of a server tape is the *last* one, not the last three hours of bars.
+
+    The raw stamps lie in the future of ``now`` (15:30 server is 12:30 UTC while the clock reads
+    12:40 UTC), so a run that judged the tail before the shift would call two more bars forming
+    and would trade a bar that has only just opened.  The shift happens before the unclosed tail
+    rule, which is what this test pins: the earlier two bars are closed and the last one is not.
+    """
+    path = _write_csv(
+        tmp_path / "EURUSD_M15.csv",
+        _server_frame(["2026-10-12 15:00", "2026-10-12 15:15", "2026-10-12 15:30"]),
+    )
+    now = pd.Timestamp("2026-10-12 12:40", tz="UTC")
+
+    raw = load_csv(path, drop_unclosed=False)
+    shifted = load_csv(path, drop_unclosed=False, source_clock="broker_server")
+    closed = load_csv(path, source_clock="broker_server")
+
+    assert int((raw[TIMESTAMP_COLUMN] > now).sum()) == 3
+    assert int((shifted[TIMESTAMP_COLUMN] > now).sum()) == 0
+    assertive = attach_close_time(shifted, "M15")
+    assert mark_closed(assertive, now=now)[IS_CLOSED_COLUMN].tolist() == [True, True, False]
+    assert len(closed) == 2
+    assert closed[TIMESTAMP_COLUMN].max() == pd.Timestamp("2026-10-12 12:15", tz="UTC")
+
+
+def test_a_daily_server_stamp_lands_on_the_previous_utc_evening(tmp_path: Path) -> None:
+    """The bare midnight of a daily server bar is 21:00/22:00 UTC of the day before."""
+    path = _write_csv(
+        tmp_path / "EURUSD_D1.csv",
+        _server_frame(["2026-10-12 00:00", "2026-12-14 00:00"]),
+    )
+
+    shifted = load_csv(path, drop_unclosed=False, source_clock="broker_server")
+
+    assert shifted[TIMESTAMP_COLUMN].tolist() == [
+        pd.Timestamp("2026-10-11 21:00", tz="UTC"),
+        pd.Timestamp("2026-12-13 22:00", tz="UTC"),
+    ]
+
+
+def test_two_server_tapes_merge_without_a_second_shift(tmp_path: Path) -> None:
+    """Two files of the same clock meet on the UTC grid: the shift happens once, at the load."""
+    older = load_csv(
+        _write_csv(tmp_path / "old.csv", _frame(SERVER_SUMMER, periods=4, freq="15min")),
+        drop_unclosed=False,
+        source_clock="broker_server",
+    )
+    fresh = load_csv(
+        _write_csv(tmp_path / "fresh.csv", _frame("2026-10-09 12:30", periods=4, freq="15min")),
+        drop_unclosed=False,
+        source_clock="broker_server",
+    )
+
+    merged = merge_ohlcv([older, fresh], source="seam")
+
+    assert merged[TIMESTAMP_COLUMN].tolist() == [
+        pd.Timestamp("2026-10-09 09:00", tz="UTC"),
+        pd.Timestamp("2026-10-09 09:15", tz="UTC"),
+        pd.Timestamp("2026-10-09 09:30", tz="UTC"),
+        pd.Timestamp("2026-10-09 09:45", tz="UTC"),
+        pd.Timestamp("2026-10-09 10:00", tz="UTC"),
+        pd.Timestamp("2026-10-09 10:15", tz="UTC"),
+    ]
+
+
+def test_an_empty_frame_and_a_nat_stamp_survive_the_shift() -> None:
+    """Nothing to shift is not an error: an empty frame stays empty and ``NaT`` stays ``NaT``."""
+    levels = pd.Series([1.1, 1.2], dtype="float64")
+    empty = pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: pd.Series(dtype="datetime64[ns, UTC]"),
+            **{column: pd.Series(dtype="float64") for column in OHLCV_COLUMNS},
+        }
+    )
+    with_nat = pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: pd.DatetimeIndex(
+                [pd.Timestamp("2026-10-09 12:00", tz="UTC"), pd.NaT]
+            ),
+            **{column: levels for column in OHLCV_COLUMNS},
+        }
+    )
+
+    assert normalise_source_clock(empty, source_clock="broker_server").empty
+    shifted = normalise_source_clock(with_nat, source_clock="broker_server")
+    assert shifted[TIMESTAMP_COLUMN].iloc[0] == pd.Timestamp("2026-10-09 09:00", tz="UTC")
+    assert pd.isna(shifted[TIMESTAMP_COLUMN].iloc[1])
+
+
+def test_a_server_fragment_before_2022_is_reported_not_shifted_in_silence(tmp_path: Path) -> None:
+    """History older than the supported window has an unknown convention: it is a warning."""
+    path = _write_csv(tmp_path / "EURUSD_H1.csv", _frame("2019-05-06 10:00", 2, "1h"))
+
+    with pytest.warns(UserWarning, match="до 2022 года конвенция пояса"):
+        load_csv(path, drop_unclosed=False, source_clock="broker_server")
+
+
+def test_an_unknown_source_clock_is_refused(tmp_path: Path) -> None:
+    """``msk`` is not a clock of this project: the server moves, Moscow does not (rule 5)."""
+    path = _write_csv(tmp_path / "EURUSD_M15.csv", _frame(SERVER_SUMMER, 2, "15min"))
+
+    with pytest.raises(ValueError, match="source_clock"):
+        load_csv(path, source_clock="msk")
+    with pytest.raises(ValueError, match="source_clock"):
+        normalise_source_clock(_frame(SERVER_SUMMER, 2, "15min"), source_clock="msk")
+    with pytest.raises(ValueError, match="source_clock"):
+        utc_stamps(_frame(SERVER_SUMMER, 2, "15min")[TIMESTAMP_COLUMN], source_clock="msk")

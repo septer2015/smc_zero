@@ -12,7 +12,13 @@
   каждой ленте, и отчёт перестал бы отличать дефект от рынка; краснит
   :func:`test_a_weekend_pause_is_not_a_hole`;
 * m3 "мерить покрытие по всем дням окна, а не по торговым" - календарная суббота без баров
-  уронила бы покрытие чистой ленты; краснит :func:`test_a_clean_tape_is_reported_ok`.
+  уронила бы покрытие чистой ленты; краснит :func:`test_a_clean_tape_is_reported_ok`;
+* m4 "сверять сырой хвост всегда с UTC, каким бы ни был ``--source-clock``" - лента брокерского
+  сервера получила бы ложный ``TZ_MISMATCH``, и рабочий экспорт перестал бы проходить проверку;
+  краснит :func:`test_a_fresh_server_tail_confirms_the_declared_clock`;
+* m5 "сравнивать нормализованный хвост с самим собой" (проверять пояс после сдвига по заявленному
+  смещению) - любой файл подтверждал бы любой пояс, и смена пояса на диске осталась бы незамеченной;
+  краснит :func:`test_a_utc_tape_declared_as_server_time_is_a_defect`.
 """
 
 from __future__ import annotations
@@ -90,6 +96,10 @@ def _args(path: Path, **overrides: object) -> Namespace:
     ]
     if overrides.get("json"):
         argv.append("--json")
+    if overrides.get("source_clock"):
+        argv += ["--source-clock", str(overrides["source_clock"])]
+    if overrides.get("now"):
+        argv += ["--now", str(overrides["now"])]
     return checker.build_parser().parse_args(argv)
 
 
@@ -280,4 +290,196 @@ def test_the_grid_check_uses_the_period_of_the_timeframe(tmp_path: Path) -> None
     assert hourly.off_grid == BARS_PER_DAY // 2 - 24
     assert hourly.expected_bars == 24
     assert hourly.coverage == pytest.approx(BARS_PER_DAY / 2 / 24)
+
+
+# ---------------------------------------------------------------------------------------------
+# Э17.B: пояс времени сырого файла
+# ---------------------------------------------------------------------------------------------
+
+#: Пятница в американском летнем сезоне: сервер брокера идёт на GMT+3, значит 23:55 на нём -
+#: это 20:55 UTC (аудит Э17 подтвердил именно такое смещение на обеих базах).
+SERVER_FRIDAY = "2026-10-09 00:00"
+#: Момент проверки свежего экспорта этой пятницы: на серверных часах 23:58, то есть хвост рядом.
+SERVER_NOW = "2026-10-09 20:58:00"
+#: Тот же момент в UTC: сырые штампы ленты совпадают с ним, если файл действительно в UTC.
+UTC_NOW = "2026-10-09 23:58:00"
+
+
+def _moment(value: str) -> pd.Timestamp:
+    """Вернуть ``value`` как момент UTC, к которому пришпилена проверка пояса."""
+    return pd.Timestamp(value, tz="UTC")
+
+
+def test_a_fresh_server_tail_confirms_the_declared_clock(tmp_path: Path) -> None:
+    """Сырой хвост ленты брокерского сервера стоит рядом с «сейчас» этого пояса: вердикт OK.
+
+    Без Э17.B проверка сверяла бы этот хвост с UTC, то есть видела бы штампы на три часа в
+    будущем, и рабочий экспорт никогда не проходил бы гейт (мутация m4).
+    """
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    report = checker.inspect_tape(
+        path,
+        timeframe="M5",
+        thresholds=THRESHOLDS,
+        source_clock="broker_server",
+        now=_moment(SERVER_NOW),
+    )
+
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_OK
+    assert report.failures_against(THRESHOLDS) == ()
+    # то, что прочтёт движок: последний сырой штамп минус смещение сервера
+    assert report.last_utc == pd.Timestamp("2026-10-09 20:55", tz="UTC")
+    assert "пояс=broker_server" in report.lines(THRESHOLDS)[0]
+
+
+def test_a_fresh_utc_tail_confirms_the_utc_clock(tmp_path: Path) -> None:
+    """Та же лента под UTC подтверждается моментом UTC, и нормализация её не трогает."""
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    report = checker.inspect_tape(
+        path,
+        timeframe="M5",
+        thresholds=THRESHOLDS,
+        source_clock="utc",
+        now=_moment(UTC_NOW),
+    )
+
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_OK
+    assert report.last_utc == pd.Timestamp("2026-10-09 23:55", tz="UTC")
+    assert report.failures_against(THRESHOLDS) == ()
+
+
+
+def test_a_server_tape_declared_as_utc_is_a_defect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Хвост на три часа впереди «сейчас» пояса utc - это TZ_MISMATCH и код выхода 1."""
+    monkeypatch.setattr(common, "DATA_DIR", tmp_path)
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    report = checker.inspect_tape(
+        path,
+        timeframe="M5",
+        thresholds=THRESHOLDS,
+        source_clock="utc",
+        now=_moment(SERVER_NOW),
+    )
+
+    problems = report.failures_against(THRESHOLDS)
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_MISMATCH
+    assert any("TZ_MISMATCH" in problem for problem in problems)
+    assert any("не соответствует заявленному поясу" in problem for problem in problems)
+    assert "вердикт    : FAIL" in report.lines(THRESHOLDS)
+
+    # голос консоли: тот же файл проходит с верным поясом и падает с неверным
+    assert checker.run(_args(path, source_clock="broker_server", now=SERVER_NOW)) == 0
+    assert checker.run(_args(path, source_clock="utc", now=SERVER_NOW)) == 1
+
+
+def test_a_utc_tape_declared_as_server_time_is_a_defect(tmp_path: Path) -> None:
+    """Файл в UTC под заявленным broker_server: хвост совпадает с другим поясом - дефект.
+
+    Это обратная сторона Э17.B: смена пояса на диске должна ловиться в обе стороны, иначе
+    владелец узнал бы о переключении экспорта в UTC только по сдвинутым сигналам (мутация m5).
+    """
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    report = checker.inspect_tape(
+        path,
+        timeframe="M5",
+        thresholds=THRESHOLDS,
+        source_clock="broker_server",
+        now=_moment(UTC_NOW),
+    )
+
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_MISMATCH
+    assert any("TZ_MISMATCH" in problem for problem in report.failures_against(THRESHOLDS))
+
+
+
+def test_a_weekend_gap_does_not_blame_the_clock(tmp_path: Path) -> None:
+    """Пятничный хвост в воскресенье - пауза рынка, а не смена пояса: пояс не подтверждён, FAIL нет."""
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    report = checker.inspect_tape(
+        path,
+        timeframe="M5",
+        thresholds=THRESHOLDS,
+        source_clock="broker_server",
+        now=_moment("2026-10-11 12:00:00"),
+    )
+
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_UNCHECKED
+    assert report.failures_against(THRESHOLDS) == ()
+    assert report.lines(THRESHOLDS)[-1] == "вердикт    : OK"
+
+
+def test_a_daily_server_date_does_not_raise_a_false_alarm(tmp_path: Path) -> None:
+    """Голая дата D1 сверяется с серверными сутками: допуск в сутки ложной ошибки не даёт."""
+    path = _write(tmp_path / "EURUSD_D1.csv", _tape(days=6, start="2026-10-07 00:00", freq="1D"))
+
+    report = checker.inspect_tape(
+        path,
+        timeframe="D1",
+        thresholds=THRESHOLDS,
+        source_clock="broker_server",
+        now=_moment("2026-10-12 12:00:00"),
+    )
+
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_OK
+    assert report.failures_against(THRESHOLDS) == ()
+    assert report.last_utc == pd.Timestamp("2026-10-11 21:00", tz="UTC")
+
+
+def test_the_json_face_carries_the_clock_verdict(tmp_path: Path) -> None:
+    """``--json`` печатает тот же вердикт пояса, что и читаемый отчёт."""
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+    report = checker.inspect_tape(
+        path,
+        timeframe="M5",
+        thresholds=THRESHOLDS,
+        source_clock="utc",
+        now=_moment(SERVER_NOW),
+    )
+
+    payload = json.loads(json.dumps(report.as_dict(THRESHOLDS), ensure_ascii=False))
+
+    assert payload["source_clock"] == "utc"
+    assert payload["tz_verdict"] == "TZ_MISMATCH"
+    assert payload["last_utc"] == "2026-10-09T23:55:00+00:00"
+    assert payload["verdict"] == "FAIL"
+
+
+def test_the_clock_of_the_check_defaults_to_utc(tmp_path: Path) -> None:
+    """Без флага проверка считает файл UTC-лентой: вход до Э17.B работает как прежде."""
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    report = checker.inspect_tape(
+        path, timeframe="M5", thresholds=THRESHOLDS, now=_moment(UTC_NOW)
+    )
+
+    assert report.source_clock == "utc"
+    assert report.clock is not None
+    assert report.clock.verdict == checker.TZ_OK
+    assert "пояс=utc" in report.lines(THRESHOLDS)[0]
+
+
+def test_the_now_argument_pins_the_clock_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--now`` делает проверку пояса воспроизводимой на закрытом рынке; мусор отвергается."""
+    monkeypatch.setattr(common, "DATA_DIR", tmp_path)
+    path = _write(tmp_path / "EURUSD_M5.csv", _tape(days=1, start=SERVER_FRIDAY))
+
+    assert checker.run(_args(path, now=UTC_NOW)) == 0
+    assert checker.run(_args(path, now=SERVER_NOW)) == 1
+    with pytest.raises(SystemExit):
+        checker.main(["--now", "не-момент"])
 

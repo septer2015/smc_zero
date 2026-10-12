@@ -381,15 +381,26 @@ def run(args: argparse.Namespace) -> int:
     try:
         symbol, timeframe, strategy, backtest = _common.live_inputs(args)
         window = _common.resolve_window(args)
+        clock = _common.resolve_source_clock(args)
         tape = _common.load_windowed_tape(
-            symbol, timeframe, window.start, window.end, source=args.data_source
+            symbol,
+            timeframe,
+            window.start,
+            window.end,
+            source=args.data_source,
+            source_clock=clock,
         )
         instrument = _common.instrument_for(symbol)
         structure_timeframe, structure_frame = _common.working_frame(
-            symbol, backtest.timeframes, window.start, window.end, source=args.data_source
+            symbol,
+            backtest.timeframes,
+            window.start,
+            window.end,
+            source=args.data_source,
+            source_clock=clock,
         )
         htf_frames = _common.markup_frames(
-            symbol, backtest.timeframes, window, source=args.data_source
+            symbol, backtest.timeframes, window, source=args.data_source, source_clock=clock
         )
         walk_config = _walk_forward_config(args, timeframe)
         study_config = OptunaConfig(n_trials=args.n_trials, n_jobs=args.jobs, seed=args.seed)

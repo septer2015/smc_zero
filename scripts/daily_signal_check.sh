@@ -6,7 +6,7 @@
 #
 #   1. starts ``smc-backtest`` under ``nohup`` over the last four years up to today with the numbers
 #      of the live config (§7.19), writing its report into ``<reports>/daily_<YYYYMMDD>`` and its
-#      console output into ``/tmp/daily_backtest_<YYYYMMDD>.log``;
+#      console output into ``<repo>/tmp/daily_backtest_<YYYYMMDD>.log`` (Э14.1);
 #   2. waits for that process and stops with its exit code (0 = the run wrote a report);
 #   3. prints the trade header and the trades opened since yesterday 22:00 MSK (``open_time >=``;
 #      Moscow is UTC+3 all year, see :mod:`smc_zero.utils.time`), so the signals of the day are the
@@ -24,7 +24,7 @@
 # Cron (the executable bit is part of the repository, ``core.fileMode=true``).  The base is written
 # out here as well, so the line keeps its meaning if that default ever moves:
 #
-#   0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /tmp/cron_smc.log 2>&1
+#   0 22 * * 1-5 SMC_DATA_DIR=/home/com/_data/mt5 /home/com/work2/python/cfd/project/smc_zero/scripts/daily_signal_check.sh >> /home/com/work2/python/cfd/project/smc_zero/tmp/cron_smc.log 2>&1
 #
 # Overrides - all optional, for a dry run or a test; the defaults are the live ones:
 #
@@ -36,7 +36,8 @@
 #   SMC_START/SMC_END  window days, YYYY-MM-DD (default: four years ago .. today, UTC)
 #   SMC_SINCE_UTC      "YYYY-MM-DD HH:MM:SS" UTC threshold of a new trade
 #                      (default: 19:00 yesterday, which is 22:00 MSK yesterday)
-#   SMC_LOG            log file of the backtest (default: ``/tmp/daily_backtest_<YYYYMMDD>.log``)
+#   SMC_LOG            log file of the backtest (default: ``<repo>/tmp/daily_backtest_<YYYYMMDD>.log``;
+#                      the folder of the path is created on demand - Э14.1)
 #   SMC_PYTHON         interpreter (default: ``SMC_REPO/.venv/bin/python``, else ``python3``)
 #   SMC_WAIT_TIMEOUT   seconds to wait for the backtest (default: 10800; 0 waits forever)
 #   SMC_REPORT_FOLDER  do not run a backtest, only re-print the signals of this report folder
@@ -74,7 +75,11 @@ DATA_SOURCE=mt5
 
 TODAY=$(date -u '+%Y%m%d')
 DAY_LABEL=$(date -u '+%Y-%m-%d')
-SMC_LOG=${SMC_LOG:-/tmp/daily_backtest_${TODAY}.log}
+# The log lives in ``./tmp`` of the project, never in the system ``/tmp`` (Э14.1): that folder
+# survives a reboot and keeps the artifacts of one project apart from those of other processes.
+# The path is built from the repository root and not from the working directory, because a cron
+# run starts in the home folder.  An explicit ``SMC_LOG`` still wins over the default.
+SMC_LOG=${SMC_LOG:-${SMC_REPO}/tmp/daily_backtest_${TODAY}.log}
 START=${SMC_START:-$(date -u -d '4 years ago' '+%Y-%m-%d')}
 END=${SMC_END:-${DAY_LABEL}}
 WAIT_TIMEOUT=${SMC_WAIT_TIMEOUT:-10800}
@@ -115,6 +120,11 @@ if [ -n "${RERUN_FOLDER}" ]; then
 else
   echo "  python   ${PY}"
   echo "  log      ${SMC_LOG}"
+  # The folder of the log is made here, so a fresh clone and a cron run need nothing prepared.
+  mkdir -p -- "$(dirname -- "${SMC_LOG}")" || {
+    echo "error: cannot make the log folder $(dirname -- "${SMC_LOG}")" >&2
+    exit 2
+  }
   cd "${SMC_WORKDIR}" || {
     echo "error: no work directory ${SMC_WORKDIR}" >&2
     exit 2

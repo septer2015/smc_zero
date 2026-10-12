@@ -2,7 +2,8 @@
 
 The script is started as a *process* by ``bash``, because its contract is with the shell: the
 environment overrides it honours, the base of the tape it reads (Э11'.2), the report folder it
-names, the exit code it forwards and the trades it prints.  Two tapes are used.  The 400 bar
+names, the folder its log lands in (Э14.1, measured by Э15.5), the exit code it forwards and the
+trades it prints.  Two tapes are used.  The 400 bar
 synthetic walk of Э8' runs a real backtest over a temporary MT5 export folder (``SMC_DATA_DIR``),
 while the work directory holds no ``./data`` at all: a run that drops ``--data-source mt5`` stops on
 a missing tape.  A hand written ``trades.csv`` pins the filter itself, so the ``open_time >=``
@@ -33,7 +34,11 @@ test named here and only there; m1-m5 measured on 2026-10-01, m6 and m7 on 2026-
   breaks every test that runs the script without a base, that is
   :func:`test_the_export_base_defaults_to_the_mt5_folder_of_the_home`,
   :func:`test_the_check_prints_the_trades_from_the_night_threshold_on` and
-  :func:`test_the_threshold_of_the_night_defaults_to_22_00_msk`.
+  :func:`test_the_threshold_of_the_night_defaults_to_22_00_msk`;
+* m8 "write the log into the system ``/tmp`` again (drop the repository root of the default)" - the
+  artifact of the project leaves the project and dies with the next reboot, and a cron run writes it
+  beside whatever folder it started in; breaks
+  :func:`test_the_log_of_a_run_goes_to_the_tmp_folder_of_the_project` (measured on 2026-10-12).
 """
 
 from __future__ import annotations
@@ -109,17 +114,23 @@ def _write_trades(folder: Path, rows: list[tuple[str, str]]) -> Path:
     return path
 
 
-def _check(*, drop: tuple[str, ...] = (), **overrides: str) -> subprocess.CompletedProcess[str]:
+def _check(
+    *, cwd: Path | None = None, drop: tuple[str, ...] = (), **overrides: str
+) -> subprocess.CompletedProcess[str]:
     """Run the script as a shell sees it: ``bash <script>`` with the override environment.
 
-    ``drop`` removes variables the calling shell may carry (``SMC_DATA_DIR`` above all), so a test
-    that measures a default cannot quietly read the export folder of the developer's machine.
+    ``cwd`` starts the script from somewhere else than the repository, the way a cron run starts in
+    the home folder.  ``drop`` removes variables the calling shell may carry (``SMC_DATA_DIR`` above
+    all), so a test that measures a default cannot quietly read the export folder of the developer's
+    machine; the overrides of the test are applied after it, so an explicit value of a dropped name
+    still wins over the default of the script.
     """
-    env = {**os.environ, "SMC_PYTHON": sys.executable, **overrides}
+    env = {**os.environ, "SMC_PYTHON": sys.executable}
     for name in drop:
         env.pop(name, None)
+    env.update(overrides)
     return subprocess.run(
-        ["bash", str(SCRIPT)], env=env, capture_output=True, text=True, check=False
+        ["bash", str(SCRIPT)], env=env, cwd=cwd, capture_output=True, text=True, check=False
     )
 
 
@@ -252,3 +263,44 @@ def test_the_script_is_executable_for_the_cron_line() -> None:
     """The cron line calls the file directly, so the executable bit and the shebang are the API."""
     assert SCRIPT.stat().st_mode & stat.S_IXUSR
     assert SCRIPT.read_text(encoding="utf-8").splitlines()[0] == "#!/usr/bin/env bash"
+
+
+def test_the_log_of_a_run_goes_to_the_tmp_folder_of_the_project(tmp_path: Path) -> None:
+    """The Э14.1 convention reaches the script: the log lands in ``<repo>/tmp``, not in ``/tmp``.
+
+    The run is started from another folder than the repository - that is what cron does - so the
+    default path has to be built from the repository root of the script and never from the working
+    directory.  The folder of the path is created on demand, and an explicit ``SMC_LOG`` wins.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    export = tmp_path / "export"
+    _write_tape(export)
+    runs = {
+        "SMC_REPO": str(repo),
+        "SMC_WORKDIR": str(repo),
+        "SMC_CONFIG": str(LIVE_CONFIG),
+        "SMC_DATA_DIR": str(export),
+        "SMC_REPORT_ROOT": str(repo / "reports"),
+        "SMC_START": START,
+        "SMC_END": END,
+        "SMC_WAIT_TIMEOUT": "120",
+    }
+
+    call = _check(cwd=tmp_path, drop=("SMC_LOG",), **runs)
+
+    assert call.returncode == 0, call.stderr
+    log = repo / "tmp" / f"daily_backtest_{_today()}.log"
+    assert log.is_file()
+    assert f"  log      {log}" in call.stdout
+    assert "SMC backtest" in log.read_text(encoding="utf-8")
+    # Nothing lands beside the folder the caller started in: the default is not a working-directory
+    # path, which is exactly the defect of the system ``/tmp`` default (m8).
+    assert not (tmp_path / "tmp").exists()
+
+    chosen_log = tmp_path / "explicit.log"
+    chosen = _check(cwd=tmp_path, drop=("SMC_LOG",), SMC_LOG=str(chosen_log), **runs)
+
+    assert chosen.returncode == 0, chosen.stderr
+    assert chosen_log.is_file(), chosen.stdout + chosen.stderr
+    assert f"  log      {chosen_log}" in chosen.stdout

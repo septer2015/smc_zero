@@ -177,6 +177,10 @@ def test_the_daily_check_reads_the_mt5_export_and_prints_the_header(tmp_path: Pa
         SMC_START=START,
         SMC_END=END,
         SMC_LOG=str(log),
+        # The parallel paper run stays on (that is the shipped default of the script) and is
+        # confined to the test folder: without the override it would write its two snapshots into
+        # ``<repo>/tmp/paper`` of the real checkout and overwrite the snapshot of the night.
+        SMC_PAPER_DIR=str(tmp_path / "paper"),
         SMC_WAIT_TIMEOUT="120",
     )
 
@@ -201,6 +205,11 @@ def test_the_daily_check_reads_the_mt5_export_and_prints_the_header(tmp_path: Pa
     assert f"kill {pid.split()[-1]}" in call.stdout
     assert f"tail -5 {log}" in call.stdout
     assert "SMC backtest" in log.read_text(encoding="utf-8")
+    # Обе роли ночи отработали, и обе упёрлись в переопределённую папку снимков, а не в ``tmp``
+    # проекта: сухой прогон боевого конфига идёт рядом с кандидатом по умолчанию (Э17.z++).
+    paper = tmp_path / "paper"
+    assert (paper / f"base_{_today()}.json").is_file()
+    assert (paper / f"candidate_{_today()}.json").is_file()
 
 
 def test_the_check_prints_the_trades_from_the_night_threshold_on(tmp_path: Path) -> None:

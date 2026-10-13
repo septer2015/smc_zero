@@ -130,10 +130,15 @@ def in_killzone(ts_utc: pd.Timestamp | datetime, cfg: SessionConfig | None = Non
     to a date-level rule and documented in :mod:`smc_zero.utils.time`.
 
     ``cfg.use_kz=False`` disables the gate for the whole run (no bar is in a
-    killzone); ``cfg.prelondon`` adds the fixed pre-London window.  The scalar
+    killzone); ``cfg.prelondon`` adds the fixed pre-London window;
+    ``cfg.research_ignore_sessions`` (Э17.z, research only) answers ``True`` for
+    *every* stamp - the gate is measured by turning it off, and the switch is
+    checked first because it also outranks ``use_kz``.  The scalar
     counterpart of :func:`killzone_mask`, sharing :func:`_killzone_windows` with it.
     """
     config = SessionConfig() if cfg is None else cfg
+    if config.research_ignore_sessions:
+        return True
     if not config.use_kz:
         return False
     stamp = pd.Timestamp(ts_utc).tz_convert("UTC")
@@ -152,12 +157,16 @@ def killzone_mask(stamps: pd.Series, cfg: SessionConfig | None = None) -> pd.Ser
     uses, so the two can not disagree.
 
     ``cfg.use_kz=False`` yields an all-``False`` mask (the gate is off, no bar is
-    tradable), ``cfg.prelondon`` adds the fixed pre-London window.  This is the
+    tradable), ``cfg.prelondon`` adds the fixed pre-London window and
+    ``cfg.research_ignore_sessions`` (Э17.z, research only) yields an all-``True``
+    one - the same first check the scalar gate makes.  This is the
     *inner* gate of the Э4' entry chain: :func:`alfa_trading_mask` already removed
     the weekend, this one keeps only the sessions the strategy trades.
     """
     config = SessionConfig() if cfg is None else cfg
     index = (stamps if isinstance(stamps, pd.Series) else pd.Series(stamps)).index
+    if config.research_ignore_sessions:
+        return pd.Series(True, index=index, dtype=bool)
     if not config.use_kz:
         return pd.Series(False, index=index, dtype=bool)
     msk = pd.to_datetime(stamps, utc=True) + pd.Timedelta(hours=MSK_UTC_OFFSET_HOURS)

@@ -22,7 +22,9 @@ The second shared thing is the live config (§7.19): the ``--config-path`` YAML 
 strategy, the broker profile and the run of a real account.  :func:`live_inputs` is the one place
 that reads it, so neither face can apply a different half of the file, and the priority is fixed
 there once - what the caller typed wins over what the file says, and the project defaults fill what
-neither of them names.
+neither of them names.  The optional ``session`` block (Э17.z) rides along: it is the one place a
+*killzone window* leaves the code, and it is read by :func:`session_from_config` rather than by
+:func:`flatten_block`, because a window is a pair of hours and not a threshold.
 
 The third is the clock of a raw tape (Э17.B, §7.26).  A file holds its stamps in one clock, and the
 Э17 audit found that both bases - ``./data`` and the MT5 export - hold the clock of the broker
@@ -57,6 +59,7 @@ from smc_zero.config import (
     InstrumentSpec,
     RiskConfig,
     RunConfig,
+    SessionConfig,
     SourceClock,
     SourceClockConfig,
     StrategyConfig,
@@ -118,6 +121,27 @@ HIERARCHY_KEY = "hierarchy"
 #: has always assumed, and a file that names :data:`~smc_zero.config.SOURCE_CLOCK_BROKER_SERVER`
 #: declares what the Э17 audit found in both bases - the live config of Э10'.2 does.
 SOURCE_CLOCK_KEY = "source_clock"
+#: The optional ``session`` block of a live config (Э17.z): the killzone table the run trades.  It is
+#: not in :data:`CONFIG_KEYS` either - a file without it keeps the shipped table of
+#: :class:`~smc_zero.config.SessionConfig`.  A window is a *pair* of hours and not a threshold, so the
+#: block is read by :func:`session_from_config` and not by :func:`flatten_block`, which refuses a list
+#: leaf on purpose.
+SESSION_BLOCK = "session"
+#: The pair-valued fields of that block: the MSK half-open windows first, then the broker's C6 times.
+SESSION_WINDOW_KEYS: tuple[str, ...] = (
+    "prelondon_msk",
+    "london_summer_msk",
+    "london_winter_msk",
+    "ny_summer_msk",
+    "ny_winter_msk",
+    "session_open_msk",
+    "session_close_msk",
+)
+#: The switch-valued fields of that block: the gate, the fixed pre-London window and the research-only
+#: switch of Э17.z, which a live config must never set.
+SESSION_FLAG_KEYS: tuple[str, ...] = ("use_kz", "prelondon", "research_ignore_sessions")
+#: Everything the ``session`` block may name.
+SESSION_KEYS: tuple[str, ...] = SESSION_WINDOW_KEYS + SESSION_FLAG_KEYS
 
 
 def mt5_data_dir() -> Path:
@@ -404,6 +428,65 @@ def strategy_from_config(cfg: Mapping[str, Any]) -> StrategyConfig:
         raise ValueError(f"strategy: {error}") from error
 
 
+def _two_hours(name: str, value: Any) -> tuple[int, int]:
+    """Return the ``(hour, minute)`` pair of one window of the ``session`` block (rule 5).
+
+    A YAML list of two whole numbers is the only shape accepted.  A bare string would slip into a
+    field that unpacks two values (``"9-12"`` unpacks into four), and a silently wrong window is
+    the one thing a table must not do.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{SESSION_BLOCK}.{name}: a window is a pair of hours, got {value!r}")
+    parts: list[int] = []
+    for part in value:
+        if isinstance(part, bool) or not isinstance(part, int):
+            raise ValueError(f"{SESSION_BLOCK}.{name}: a window holds whole hours, got {value!r}")
+        parts.append(int(part))
+    return parts[0], parts[1]
+
+
+def session_from_config(cfg: Mapping[str, Any] | None) -> SessionConfig:
+    """Return the killzone table of the optional ``session`` block, else the shipped one (Э17.z).
+
+    The block is the one place where a *window* leaves the code: the killzone gate and the Э3'
+    session level maps read one table (SPEC_SMC.md, C1), so moving it is a strategy decision and
+    not a run knob.  A window is a pair of hours and not a threshold, which is why the block has a
+    reader of its own instead of going through :func:`flatten_block` - exactly how
+    :func:`run_from_config` reads the ``run`` block.
+
+    ``None`` and a file without the block both answer the shipped
+    :class:`~smc_zero.config.SessionConfig`, so a config written before Э17.z keeps behaving bit
+    for bit as it did.  An unknown key is refused with the list of the settable ones (rule 5), and
+    the values themselves are validated by the dataclass (half-open windows, whole hours).
+    """
+    if cfg is None or SESSION_BLOCK not in cfg:
+        return SessionConfig()
+    values = dict(block(cfg, SESSION_BLOCK))
+    unknown = sorted(set(values) - set(SESSION_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{SESSION_BLOCK}: no such field(s) {', '.join(unknown)}: the table sets "
+            f"{', '.join(SESSION_KEYS)}"
+        )
+    windows = {
+        name: _two_hours(name, value)
+        for name, value in values.items()
+        if name in SESSION_WINDOW_KEYS
+    }
+    flags: dict[str, bool] = {}
+    for name in SESSION_FLAG_KEYS:
+        if name not in values:
+            continue
+        flag = values[name]
+        if not isinstance(flag, bool):
+            raise ValueError(f"{SESSION_BLOCK}.{name}: a switch is true or false, got {flag!r}")
+        flags[name] = flag
+    try:
+        return SessionConfig(**windows, **flags)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{SESSION_BLOCK}: {error}") from error
+
+
 def broker_from_config(cfg: Mapping[str, Any]) -> BrokerSpec:
     """Return the :class:`BrokerSpec` of the ``broker`` block: every field by its name (C6, Э10').
 
@@ -555,6 +638,11 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
     :func:`~smc_zero.data_loader.bars_per_day`, so an M5 run of the second hierarchy reads its 288
     bars a day instead of the 96 of M15.  For the default M15 hierarchy the values are the
     dataclass defaults and the returned config is unchanged.
+
+    The optional ``session`` block (Э17.z) is read by :func:`session_from_config` and lands in
+    *both* configs: the entry chain and the Э3' session level maps read the strategy's copy, while
+    the engine's broker-hours mask reads the run's one, and two different tables in one run would
+    let a setup arm where placement is refused.
     """
     cfg = load_config(args.config_path) if args.config_path else None
     preset_name = resolve_hierarchy(getattr(args, "hierarchy", None), cfg)
@@ -577,8 +665,11 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
             f"'{HIERARCHY_KEY}: H4_M15_M5' (or pass --hierarchy) for an M5 run"
         )
     scale = bars_per_day(timeframe)
+    session = session_from_config(cfg)
     strategy = StrategyConfig() if cfg is None else strategy_from_config(cfg)
-    strategy = replace(strategy, bias=replace(strategy.bias, timeframes=preset.bias))
+    strategy = replace(
+        strategy, bias=replace(strategy.bias, timeframes=preset.bias), session=session
+    )
     if cfg is None:
         return (
             symbol,
@@ -587,7 +678,10 @@ def live_inputs(args: argparse.Namespace) -> tuple[str, str, StrategyConfig, Bac
             BacktestConfig(timeframes=timeframes, sharpe_bars_per_day=scale),
         )
     backtest = replace(
-        backtest_from_config(cfg), timeframes=timeframes, sharpe_bars_per_day=scale
+        backtest_from_config(cfg),
+        timeframes=timeframes,
+        sharpe_bars_per_day=scale,
+        session=session,
     )
     return symbol, timeframe, strategy, backtest
 

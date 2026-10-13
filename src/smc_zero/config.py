@@ -213,6 +213,15 @@ class SessionConfig:
     hours (C6) and are *not* killzones: the killzone gate filters the sessions
     inside the day, the mask built by :func:`smc_zero.indicators.sessions.alfa_trading_mask`
     filters whole days (Monday opening, Friday closing, weekend off).
+
+    ``research_ignore_sessions`` is a *research* switch of Э17.z and never a live one: it turns
+    the entry killzone gate off for the whole run, so every bar inside the broker's week may arm
+    a setup.  The switch exists because the hour filter of a strategy is measured by comparing
+    the same strategy with it and without it, while the Э3' session level maps must keep reading
+    this very table (``levels._session_windows`` rejects a window outside one UTC day, so the
+    table itself cannot be widened).  It reaches the gate and *not* the level maps, and the live
+    configs of ``configs/`` must never carry it (``tests/test_live_config.py`` refuses them if
+    they do).
     """
 
     use_kz: bool = True
@@ -229,6 +238,8 @@ class SessionConfig:
     # Э5'), because the mask must reuse this module's single MSK definition.
     session_open_msk: TimeOfDay = (2, 0)
     session_close_msk: TimeOfDay = (23, 55)
+    # Research-only switch of Э17.z: it disables the *entry* killzone gate and nothing else.
+    research_ignore_sessions: bool = False
 
     def __post_init__(self) -> None:
         windows: dict[str, HourWindow] = {

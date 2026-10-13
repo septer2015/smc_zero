@@ -247,6 +247,46 @@ def test_killzone_mask_keeps_the_input_index_and_dtype() -> None:
     assert mask.index.equals(stamps.index)
 
 
+# --- the research switch of Э17.z: the gate is measured by turning it off ------
+def test_research_ignore_sessions_opens_the_scalar_gate() -> None:
+    """Э17.z: ``research_ignore_sessions`` answers ``True`` for every hour of both seasons."""
+    open_gate = SessionConfig(research_ignore_sessions=True)
+    for day in (SUMMER_DAY, WINTER_DAY):
+        for hour_msk in range(24):
+            assert in_killzone(utc_stamp(day, hour_msk), open_gate)
+    # The switch means "no hour filter", so it is checked before the switch that closes the gate.
+    closed_and_open = SessionConfig(use_kz=False, research_ignore_sessions=True)
+    assert in_killzone(utc_stamp(SUMMER_DAY, 3), closed_and_open)
+
+
+def test_research_ignore_sessions_opens_the_vector_gate() -> None:
+    """The mask form of the switch is all-``True`` and keeps the index of the frame it read."""
+    stamps = day_bars(SUMMER_DAY)
+    stamps.index = pd.RangeIndex(1000, 1000 + len(stamps))
+
+    mask = killzone_mask(stamps, SessionConfig(research_ignore_sessions=True))
+
+    assert mask.all()
+    assert mask.index.equals(stamps.index)
+
+
+def test_the_research_switch_moves_the_gate_only() -> None:
+    """The switch is read by the gate and *not* by the Э3' window table the level maps share.
+
+    Widening the table itself is impossible (``levels._session_windows`` refuses a window outside
+    one UTC day), so the hour filter is measured by a switch that leaves the table where it is -
+    which is what this test pins: the level maps keep reading the shipped windows.
+    """
+    flagged = SessionConfig(research_ignore_sessions=True)
+
+    for killzone in (PRE_LONDON, LONDON, NY):
+        for season in (SUMMER, WINTER):
+            assert kz_windows_msk(killzone, season, flagged) == kz_windows_msk(killzone, season)
+    for day in (SUMMER_DAY, WINTER_DAY):
+        assert kz_window_utc_hours(LONDON, day, flagged) == kz_window_utc_hours(LONDON, day)
+        assert kz_window_utc_hours(NY, day, flagged) == kz_window_utc_hours(NY, day)
+
+
 # --- C6 trading hours: the broker's week, not a killzone ----------------------
 #
 # The mask is built from the MSK week, so the dates below are derived from a known

@@ -3,8 +3,10 @@
 The config of the winner is a *file*, so what is pinned here is the road it travels: the loader
 that reads it, the mapping of its three blocks onto :class:`~smc_zero.config.StrategyConfig` and
 :class:`~smc_zero.config.BacktestConfig`, the priority of the command line over the file, and the
-two faces that consume it.  The expectation of every comparison is written down *again* here, by
-hand and out of the file it checks (``_hand_built_strategy`` and its two neighbours): a test that
+two faces that consume it.  The optional ``session`` block of Э17.z is pinned here as well: it is
+the one place a killzone *window* leaves the code, and the shipped configs of ``configs/`` must
+never carry its research switch.  The expectation of every comparison is written down *again* here,
+by hand and out of the file it checks (``_hand_built_strategy`` and its two neighbours): a test that
 read its expected numbers from the same YAML would only prove that the YAML parses.
 
 The two windows of the end-to-end tests are the shipped ``./data/EURUSD_M15.csv``, because a live
@@ -62,7 +64,7 @@ import yaml
 import scripts._common as common
 import scripts.run_backtest as backtest_face
 import scripts.run_optimization as optimize_face
-from smc_zero.backtester import run_backtest
+from smc_zero.backtester import BacktestResult, run_backtest
 from smc_zero.config import (
     BacktestConfig,
     BiasConfig,
@@ -70,6 +72,7 @@ from smc_zero.config import (
     DisplacementConfig,
     RiskConfig,
     RunConfig,
+    SessionConfig,
     StrategyConfig,
     TimeframeConfig,
     TPConfig,
@@ -694,3 +697,199 @@ def test_a_run_field_that_does_not_exist_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="n_trials"):
         common.live_inputs(backtest_face.build_parser().parse_args(["--config-path", str(path)]))
+
+
+# --- the session block of Э17.z: the killzone table from the file -------------
+#: The control window of the Э17.z check: four months of the shipped tape that carry setups under
+#: the numbers of the winner (measured on 2026-10-13: 17 intents, 11 trades, +66.60, about a second).
+CONTROL_WINDOW = ("2026-03-01", "2026-06-30")
+#: The block that names the shipped windows.  YAML has no tuple, so a window is a two-item list -
+#: and the block is the only way a window leaves the code.
+DEFAULT_SESSION_BLOCK: dict[str, object] = {
+    "use_kz": True,
+    "prelondon": False,
+    "prelondon_msk": [7, 9],
+    "london_summer_msk": [9, 12],
+    "london_winter_msk": [10, 13],
+    "ny_summer_msk": [14, 17],
+    "ny_winter_msk": [15, 18],
+    "session_open_msk": [2, 0],
+    "session_close_msk": [23, 55],
+    "research_ignore_sessions": False,
+}
+
+
+def _config_with_session(tmp_path: Path, name: str, session: dict[str, object]) -> Path:
+    """Write the live config of the winner plus one ``session`` block and return its path."""
+    cfg = common.load_config(LIVE_CONFIG)
+    cfg[common.SESSION_BLOCK] = dict(session)
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return path
+
+
+def _shifted_session(hours: int) -> dict[str, object]:
+    """Return the shipped table moved by ``hours``: the experiment Э17.z is asking about."""
+    block = dict(DEFAULT_SESSION_BLOCK)
+    for name in ("london_summer_msk", "london_winter_msk", "ny_summer_msk", "ny_winter_msk"):
+        start, end = block[name]  # type: ignore[misc]
+        block[name] = [int(start) + hours, int(end) + hours]
+    return block
+
+
+def _window_run(
+    strategy: StrategyConfig, backtest: BacktestConfig, start: str, end: str
+) -> tuple[int, BacktestResult]:
+    """Return the intent count and the result of one window, built in process from two configs."""
+    tape = common.load_windowed_tape(
+        "EURUSD", "M15", common.read_day(start), common.read_day(end), source_clock="broker_server"
+    )
+    marks = build_tape_marks(tape, strategy)
+    chain = build_intents(tape, marks.bias_frame(strategy.bias.agreement), marks.levels, strategy)
+    result = run_backtest(tape, chain.intents, backtest, common.instrument_for("EURUSD"))
+    return len(chain.intents), result
+
+
+
+def test_the_session_block_of_the_defaults_reads_the_shipped_table(tmp_path: Path) -> None:
+    """A block that names the shipped windows answers the shipped :class:`SessionConfig`.
+
+    The block is read by :func:`scripts._common.session_from_config` and lands in *both* configs:
+    the entry chain and the Э3' level maps read the strategy's copy, the engine's broker-hours mask
+    reads the run's one, and two tables in one run would let a setup arm where placement is refused.
+    """
+    typed_path = _config_with_session(tmp_path, "session_defaults.yaml", DEFAULT_SESSION_BLOCK)
+
+    _, _, strategy, backtest = common.live_inputs(
+        backtest_face.build_parser().parse_args(["--config-path", str(typed_path)])
+    )
+
+    assert strategy.session == SessionConfig()
+    assert backtest.session == SessionConfig()
+    plain = common.live_inputs(
+        backtest_face.build_parser().parse_args(["--config-path", str(LIVE_CONFIG)])
+    )
+    assert strategy == plain[2]
+    assert backtest == plain[3]
+
+
+def test_the_control_window_pays_the_same_with_and_without_the_session_block(
+    tmp_path: Path, repository_data: None
+) -> None:
+    """Э17.z: naming the shipped table changes neither the intents nor a single trade.
+
+    The comparison is measured on the tape and not only on the equality of two configs: the block
+    travels through :func:`scripts._common.live_inputs`, the chain and the engine, so a conversion
+    that rounded a window, swapped its ends or read it as UTC hours would move the trades here.
+    """
+    typed_path = _config_with_session(tmp_path, "session_defaults.yaml", DEFAULT_SESSION_BLOCK)
+    plain = common.live_inputs(
+        backtest_face.build_parser().parse_args(["--config-path", str(LIVE_CONFIG)])
+    )
+    typed = common.live_inputs(
+        backtest_face.build_parser().parse_args(["--config-path", str(typed_path)])
+    )
+
+    intents_plain, result_plain = _window_run(plain[2], plain[3], *CONTROL_WINDOW)
+    intents_typed, result_typed = _window_run(typed[2], typed[3], *CONTROL_WINDOW)
+
+    assert intents_plain >= 1, "the window carries no setup any more: pick another window"
+    assert intents_typed == intents_plain
+    pd.testing.assert_frame_equal(result_typed.trades, result_plain.trades)
+
+
+def test_a_shifted_session_block_moves_the_selection(tmp_path: Path, repository_data: None) -> None:
+    """The control example of Э17.z: a table one hour later selects another day of trades.
+
+    Measured on the shipped tape on 2026-10-13: the shipped table arms 17 intents and pays 11
+    trades on the control window, the table one hour later arms 21 and pays 15.  The numbers are
+    pinned so that a block the runner silently ignored cannot pass this test - the whole point of
+    the block is that moving it moves the selection.
+    """
+    shifted_path = _config_with_session(tmp_path, "session_shift_plus1.yaml", _shifted_session(1))
+
+    _, _, strategy, backtest = common.live_inputs(
+        backtest_face.build_parser().parse_args(["--config-path", str(shifted_path)])
+    )
+
+    assert strategy.session.london_summer_msk == (10, 13)
+    assert strategy.session.ny_summer_msk == (15, 18)
+
+    intents_plain, result_plain = _window_run(
+        _hand_built_strategy(), _hand_built_backtest(), *CONTROL_WINDOW
+    )
+    intents_shifted, result_shifted = _window_run(strategy, backtest, *CONTROL_WINDOW)
+
+    assert (intents_plain, len(result_plain.trades)) == (17, 11)
+    assert (intents_shifted, len(result_shifted.trades)) == (21, 15)
+
+
+def test_the_research_switch_opens_the_gate_of_a_run(tmp_path: Path, repository_data: None) -> None:
+    """``research_ignore_sessions`` is how the hour filter is measured: it carries more setups."""
+    path = _config_with_session(
+        tmp_path, "session_ignore.yaml", {**DEFAULT_SESSION_BLOCK, "research_ignore_sessions": True}
+    )
+
+    _, _, strategy, backtest = common.live_inputs(
+        backtest_face.build_parser().parse_args(["--config-path", str(path)])
+    )
+
+    assert strategy.session.research_ignore_sessions is True
+
+    intents_plain, _ = _window_run(_hand_built_strategy(), _hand_built_backtest(), *CONTROL_WINDOW)
+    intents_open, result_open = _window_run(strategy, backtest, *CONTROL_WINDOW)
+
+    assert intents_open > intents_plain
+    assert len(result_open.trades) > 11
+
+
+@pytest.mark.parametrize("path", [LIVE_CONFIG, M5_CONFIG])
+def test_a_live_config_never_ignores_the_sessions(path: Path) -> None:
+    """The research switch of Э17.z is not a live one: neither shipped file may carry it."""
+    assert common.session_from_config(common.load_config(path)).research_ignore_sessions is False
+
+
+def test_a_session_field_that_does_not_exist_is_refused(tmp_path: Path) -> None:
+    """A typo in the table is refused with the list of the settable fields (rule 5)."""
+    block = {**DEFAULT_SESSION_BLOCK, "london_evening_msk": [18, 20]}
+    path = _config_with_session(tmp_path, "session_typo.yaml", block)
+
+    with pytest.raises(ValueError, match="london_evening_msk"):
+        common.live_inputs(backtest_face.build_parser().parse_args(["--config-path", str(path)]))
+
+
+@pytest.mark.parametrize("window", ["9-12", [9], [9, 12, 15], [9.5, 12]])
+def test_a_window_that_is_not_a_pair_of_hours_is_refused(tmp_path: Path, window: object) -> None:
+    """A window is a pair of whole hours: a string or a fraction would reach a field unpacking two."""
+    block = {**DEFAULT_SESSION_BLOCK, "london_summer_msk": window}
+    path = _config_with_session(tmp_path, "session_window.yaml", block)
+
+    with pytest.raises(ValueError, match="london_summer_msk"):
+        common.live_inputs(backtest_face.build_parser().parse_args(["--config-path", str(path)]))
+
+
+def test_a_window_out_of_the_day_is_refused(tmp_path: Path) -> None:
+    """``SessionConfig`` owns the check: ``[12, 9]`` is not a half-open window."""
+    block = {**DEFAULT_SESSION_BLOCK, "london_summer_msk": [12, 9]}
+    path = _config_with_session(tmp_path, "session_backwards.yaml", block)
+
+    with pytest.raises(ValueError, match="london_summer_msk"):
+        common.live_inputs(backtest_face.build_parser().parse_args(["--config-path", str(path)]))
+
+
+def test_a_switch_that_is_not_a_switch_is_refused(tmp_path: Path) -> None:
+    """``use_kz: 1`` is not a switch: a number must not reach a boolean field of the table."""
+    block = {**DEFAULT_SESSION_BLOCK, "use_kz": 1}
+    path = _config_with_session(tmp_path, "session_switch.yaml", block)
+
+    with pytest.raises(ValueError, match="use_kz"):
+        common.live_inputs(backtest_face.build_parser().parse_args(["--config-path", str(path)]))
+
+
+def test_a_session_block_without_a_field_keeps_the_shipped_value() -> None:
+    """A block sets its own windows: every field it does not name keeps the shipped value."""
+    session = common.session_from_config({common.SESSION_BLOCK: {"london_summer_msk": [8, 11]}})
+
+    assert session.london_summer_msk == (8, 11)
+    assert session.london_winter_msk == SessionConfig().london_winter_msk
+    assert session.session_close_msk == SessionConfig().session_close_msk

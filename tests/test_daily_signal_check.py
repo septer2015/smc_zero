@@ -3,11 +3,13 @@
 The script is started as a *process* by ``bash``, because its contract is with the shell: the
 environment overrides it honours, the base of the tape it reads (Э11'.2), the report folder it
 names, the folder its log lands in (Э14.1, measured by Э15.5), the exit code it forwards and the
-trades it prints.  Two tapes are used.  The 400 bar
-synthetic walk of Э8' runs a real backtest over a temporary MT5 export folder (``SMC_DATA_DIR``),
-while the work directory holds no ``./data`` at all: a run that drops ``--data-source mt5`` stops on
-a missing tape.  A hand written ``trades.csv`` pins the filter itself, so the ``open_time >=``
-boundary of the night is measured without waiting for a setup.
+trades it prints.  The parallel paper mode of Э17.z++ is pinned here too: beside the live run the
+same night is measured with the candidate config, and every reading gets a JSON snapshot of its own
+(``base_<day>.json`` and ``candidate_<day>.json`` under ``SMC_PAPER_DIR``).  Two tapes are used.
+The 400 bar synthetic walk of Э8' runs a real backtest over a temporary MT5 export folder
+(``SMC_DATA_DIR``), while the work directory holds no ``./data`` at all: a run that drops
+``--data-source mt5`` stops on a missing tape.  A hand written ``trades.csv`` pins the filter itself,
+so the ``open_time >=`` boundary of the night is measured without waiting for a setup.
 
 The mutations this file is one line away from, and the test each one must break (each one red on the
 test named here and only there; m1-m5 measured on 2026-10-01, m6 and m7 on 2026-10-05):
@@ -43,11 +45,21 @@ test named here and only there; m1-m5 measured on 2026-10-01, m6 and m7 on 2026-
   the ``--source-clock`` it produces) - the run of the night would read a server tape as UTC and
   shift every session window by two or three hours (Э17.B); breaks
   :func:`test_the_live_config_declares_the_clock_of_the_raw_tape` and
-  :func:`test_the_clock_of_the_night_comes_from_the_config`.
+  :func:`test_the_clock_of_the_night_comes_from_the_config`;
+* m10 "point the candidate at the dated root of the base" (``--report-dir "${DATED}"`` for the
+  candidate too) - the role has no report folder of its own, the snapshot of the second reading is
+  never written and the check stops with code 1; breaks
+  :func:`test_the_parallel_paper_run_writes_a_snapshot_of_each_reading` and, because the parallel
+  mode is part of one check, :func:`test_the_daily_check_reads_the_mt5_export_and_prints_the_header`;
+* m11 "give the candidate snapshot the config of the base" - both files of ``./tmp/paper`` would
+  then name the live config, and the journal would compare a strategy with itself; breaks
+  :func:`test_the_parallel_paper_run_writes_a_snapshot_of_each_reading`, which pins the two names
+  (m10 and m11 measured on 2026-10-13).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -62,12 +74,15 @@ import pytest
 
 import scripts._common as common
 import scripts.run_backtest as runner
+from scripts import paper_snapshot
 from smc_zero.backtester.engine import TRADE_COLUMNS
-from smc_zero.config import SOURCE_CLOCK_BROKER_SERVER
+from smc_zero.config import SOURCE_CLOCK_BROKER_SERVER, SessionConfig
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "daily_signal_check.sh"
 LIVE_CONFIG = REPO / "configs" / "live_eurusd_m15.yaml"
+#: The research file of Э17.z++ the parallel paper run of the night measures (Э17.z++.1).
+CANDIDATE_CONFIG = REPO / "configs" / "research_e17zp_candidate.yaml"
 BARS = 400
 START = "2026-06-08"
 END = "2026-06-15"
@@ -294,6 +309,10 @@ def test_the_log_of_a_run_goes_to_the_tmp_folder_of_the_project(tmp_path: Path) 
         "SMC_START": START,
         "SMC_END": END,
         "SMC_WAIT_TIMEOUT": "120",
+        # ``repo`` is a stand-in without ``configs/``: it carries no candidate file of Э17.z++, so
+        # this test measures the log of the *live* run and not the parallel paper mode (the two
+        # configs of the night have tests of their own).
+        "SMC_PAPER": "0",
     }
 
     call = _check(cwd=tmp_path, drop=("SMC_LOG",), **runs)
@@ -352,4 +371,176 @@ def test_the_clock_of_the_night_comes_from_the_config(tmp_path: Path) -> None:
 
     assert overridden.returncode == 0, overridden.stderr
     assert "  clock    utc (SMC_SOURCE_CLOCK, перекрывает конфиг)" in overridden.stdout
+
+
+def test_the_candidate_config_is_the_live_config_with_the_two_shifts() -> None:
+    """Файл кандидата Э17.z++ двигает ровно две вещи: окна сессий на −3 ч и суточный лимит уровня.
+
+    Проверка идёт по двум файлам рядом: исследовательский конфиг обязан отличаться от боевого
+    только ими, иначе бумажное чтение ночи сравнивало бы не кандидата, а третью стратегию.
+    """
+    live = common.load_config(LIVE_CONFIG)
+    candidate = common.load_config(CANDIDATE_CONFIG)
+
+    assert candidate["symbol"] == live["symbol"]
+    assert candidate["timeframe"] == live["timeframe"]
+    assert candidate["source_clock"] == live["source_clock"] == SOURCE_CLOCK_BROKER_SERVER
+    assert candidate["broker"] == live["broker"]
+    assert candidate["backtest"] == live["backtest"]
+
+    # Блок стратегии отличается единственным ключом: суточный лимит настроек на уровень.
+    candidate_strategy = dict(candidate["strategy"])
+    assert candidate_strategy.pop("max_setups_per_level_per_day") == 3
+    assert candidate_strategy == live["strategy"]
+    # Боевой файл собственного значения не несёт: в коде остаётся поставленный дефолт 1.
+    assert "max_setups_per_level_per_day" not in live["strategy"]
+    assert "session" not in live
+
+    # Сдвиг: каждое окно кандидата — поставленное окно минус три часа (полдень MSK и так далее).
+    shipped = SessionConfig()
+    assert set(candidate["session"]) == {
+        "london_summer_msk",
+        "london_winter_msk",
+        "ny_summer_msk",
+        "ny_winter_msk",
+    }
+    for name, window in candidate["session"].items():
+        start, end = getattr(shipped, name)
+        assert window == [start - 3, end - 3]
+
+
+def test_the_parallel_paper_run_writes_a_snapshot_of_each_reading(tmp_path: Path) -> None:
+    """Э17.z++: рядом с базовым прогоном ночь измеряет кандидат, и у каждого чтения свой снимок.
+
+    Оба чтения идут по одной ленте, одному поясу и одному порогу ночи — различает их только
+    конфиг. Снимок каждого ложится отдельным файлом в ``SMC_PAPER_DIR``: два чтения одной ночи
+    нельзя записать в один файл, иначе журнал потеряет базовое.
+    """
+    export = tmp_path / "export"
+    _write_tape(export)
+    paper = tmp_path / "paper"
+    base_json = paper / f"base_{_today()}.json"
+    candidate_json = paper / f"candidate_{_today()}.json"
+
+    call = _check(
+        SMC_WORKDIR=str(tmp_path),
+        SMC_CONFIG=str(LIVE_CONFIG),
+        SMC_DATA_DIR=str(export),
+        SMC_REPORT_ROOT=str(tmp_path / "reports"),
+        SMC_START=START,
+        SMC_END=END,
+        SMC_LOG=str(tmp_path / "daily.log"),
+        SMC_PAPER_DIR=str(paper),
+        SMC_WAIT_TIMEOUT="600",
+    )
+
+    assert call.returncode == 0, call.stderr
+    base = json.loads(base_json.read_text(encoding="utf-8"))
+    candidate = json.loads(candidate_json.read_text(encoding="utf-8"))
+
+    assert base["role"] == "base"
+    assert base["config"] == str(LIVE_CONFIG)
+    assert candidate["role"] == "candidate"
+    assert candidate["config"] == str(CANDIDATE_CONFIG)
+    # Два прогона — две папки отчёта: сравнивать два чтения по одному отчёту невозможно.
+    assert base["report"] != candidate["report"]
+    assert (Path(candidate["report"]) / "trades.csv").is_file()
+    # Одна лента, один пояс, один порог ночи и одно окно: различается только стратегия.
+    assert candidate["since_utc"] == base["since_utc"]
+    assert candidate["window"] == base["window"] == {"start": START, "end": END}
+    assert "  paper    base + candidate=" in call.stdout
+    assert f"  paper    candidate -> {candidate_json}" in call.stdout
+    assert "--- paper journal: docs/PAPER_JOURNAL.md" in call.stdout
+
+
+def test_the_parallel_run_is_off_with_smc_paper_zero(tmp_path: Path) -> None:
+    """``SMC_PAPER=0`` оставляет проверку ровно тем, чем она была: один боевой прогон.
+
+    Это сухой прогон живого конфига: ни кандидатского отчёта, ни папки снимков не появляется,
+    и заголовок скрипта о параллельном чтении не сообщает.
+    """
+    export = tmp_path / "export"
+    _write_tape(export)
+    paper = tmp_path / "paper"
+
+    call = _check(
+        SMC_WORKDIR=str(tmp_path),
+        SMC_CONFIG=str(LIVE_CONFIG),
+        SMC_DATA_DIR=str(export),
+        SMC_REPORT_ROOT=str(tmp_path / "reports"),
+        SMC_START=START,
+        SMC_END=END,
+        SMC_LOG=str(tmp_path / "daily.log"),
+        SMC_PAPER="0",
+        SMC_PAPER_DIR=str(paper),
+        SMC_WAIT_TIMEOUT="300",
+    )
+
+    assert call.returncode == 0, call.stderr
+    assert not paper.exists()
+    assert "  paper    " not in call.stdout
+
+
+def test_the_paper_snapshot_maps_the_report_and_the_night_boundary(tmp_path: Path) -> None:
+    """Читатель отчёта: порог ночи включается на границе, метрики берутся из ``summary.txt``."""
+    folder = tmp_path / "backtest_EURUSD_M15_2026-06-01_2026-06-15"
+    _write_trades(
+        folder,
+        [("2026-06-09 18:59:59+00:00", "long"), (f"{NIGHT}+00:00", "short")],
+    )
+    (folder / "summary.txt").write_text(
+        "SMC backtest: EURUSD M15\n"
+        "  trades                   2\n"
+        "  win rate                 50.00 %\n"
+        "  profit                   +12.34\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "snapshot.json"
+
+    code = paper_snapshot.main(
+        [
+            "--report",
+            str(folder),
+            "--role",
+            "base",
+            "--config",
+            str(LIVE_CONFIG),
+            "--since",
+            NIGHT,
+            "--date",
+            "2026-06-10",
+            "--out",
+            str(out),
+        ]
+    )
+
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert code == 0
+    assert document["date"] == "2026-06-10"
+    assert document["signal_count"] == 1
+    assert [row["open_time"] for row in document["signals"]] == [f"{NIGHT}+00:00"]
+    assert document["metrics"]["trades"] == 2.0
+    assert document["metrics"]["profit"] == 12.34
+    assert document["report"] == str(folder)
+
+
+def test_the_snapshot_refuses_a_report_without_a_trade_log(tmp_path: Path) -> None:
+    """Пустая папка — отказ с кодом 2, а не пустой снимок: молчание сходило бы за «нет сигнала»."""
+    code = paper_snapshot.main(
+        [
+            "--report",
+            str(tmp_path / "no_such_report"),
+            "--role",
+            "candidate",
+            "--config",
+            str(CANDIDATE_CONFIG),
+            "--since",
+            NIGHT,
+            "--out",
+            str(tmp_path / "snapshot.json"),
+        ]
+    )
+
+    assert code == 2
+    assert not (tmp_path / "snapshot.json").exists()
 

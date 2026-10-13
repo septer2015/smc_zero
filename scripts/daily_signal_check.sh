@@ -49,6 +49,11 @@
 #   SMC_PYTHON         interpreter (default: ``SMC_REPO/.venv/bin/python``, else ``python3``)
 #   SMC_WAIT_TIMEOUT   seconds to wait for the backtest (default: 10800; 0 waits forever)
 #   SMC_REPORT_FOLDER  do not run a backtest, only re-print the signals of this report folder
+#   SMC_PAPER          1 (default) also measures the night with the candidate of Э17.z++,
+#                      0 runs the live config alone (a dry run)
+#   SMC_PAPER_CONFIGS  the pairs ``role=path`` of that parallel run (default: the shipped
+#                      ``configs/research_e17zp_candidate.yaml`` under the role ``candidate``)
+#   SMC_PAPER_DIR      folder of the JSON snapshots (default: ``<repo>/tmp/paper``)
 #
 # GNU coreutils are assumed for the date arithmetic (the project runs on Linux); on another system
 # set SMC_START, SMC_END and SMC_SINCE_UTC by hand.
@@ -109,6 +114,18 @@ WAIT_TIMEOUT=${SMC_WAIT_TIMEOUT:-10800}
 DATED="${SMC_REPORT_ROOT}/daily_${TODAY}"
 RERUN_FOLDER=${SMC_REPORT_FOLDER:+$(to_abs "${SMC_REPORT_FOLDER}")}
 
+# The parallel paper mode of Э17.z++: the live config above stays the *base* reading of the night,
+# and beside it the same night is measured with the research candidate of Э17.z++
+# (``configs/research_e17zp_candidate.yaml``: the -3 h shift of the session windows plus a daily cap
+# of three setups per level).  The mode is additive by construction: the base run, its report folder
+# and the list printed below are exactly what they were, while every reading gains a report folder of
+# its own and one JSON snapshot under ``<repo>/tmp/paper/`` - that file is what
+# ``docs/PAPER_JOURNAL.md`` compares.  A reading that fails stops the check with its own code, so a
+# silently missing candidate cannot pass for "no signal of the night".
+SMC_PAPER=${SMC_PAPER:-1}
+PAPER_CONFIGS=${SMC_PAPER_CONFIGS:-candidate=${SMC_REPO}/configs/research_e17zp_candidate.yaml}
+PAPER_DIR=$(to_abs "${SMC_PAPER_DIR:-${SMC_REPO}/tmp/paper}")
+
 if [ -n "${SMC_SINCE_UTC:-}" ]; then
   SINCE=${SMC_SINCE_UTC}
 else
@@ -140,6 +157,9 @@ else
 fi
 echo "  since    ${SINCE} UTC (yesterday 22:00 MSK)"
 echo "  journal  docs/TRADING_JOURNAL.md"
+if [ "${SMC_PAPER}" != "0" ] && [ -z "${RERUN_FOLDER}" ]; then
+  echo "  paper    base + ${PAPER_CONFIGS} -> ${PAPER_DIR}"
+fi
 
 RC=0
 if [ -n "${RERUN_FOLDER}" ]; then
@@ -225,6 +245,106 @@ awk -F, -v since="${SINCE}" '
   stamp && substr($stamp, 1, 19) >= since { print; found++ }
   END { printf "signals: %d\n", found + 0 }
 ' "${TRADES}"
+
+# --- Parallel paper mode: the same night read by the candidate of Э17.z++ (see the settings above). ---
+if [ "${SMC_PAPER}" != "0" ] && [ -z "${RERUN_FOLDER}" ]; then
+  mkdir -p -- "${PAPER_DIR}" || {
+    echo "error: cannot make the paper folder ${PAPER_DIR}" >&2
+    exit 2
+  }
+  # One reading -> one JSON snapshot.  The reader is ``scripts.paper_snapshot``: it filters the trade
+  # log with the very ``open_time >=`` rule printed above, so the file and the screen agree.
+  paper_snapshot() {
+    local role=$1 config=$2 folder=$3 out=$4
+    if ! env PYTHONPATH="${SMC_REPO}/src:${SMC_REPO}" "${PY}" -m scripts.paper_snapshot \
+        --report "${folder}" \
+        --role "${role}" \
+        --config "${config}" \
+        --since "${SINCE}" \
+        --window-start "${START}" \
+        --window-end "${END}" \
+        --date "${DAY_LABEL}" \
+        --out "${out}" >/dev/null; then
+      echo "error: no paper snapshot of ${role} at ${out}" >&2
+      return 1
+    fi
+    echo "  paper    ${role} -> ${out}"
+  }
+  # The base reading is the run above; every other one is a pair of ``SMC_PAPER_CONFIGS`` and is
+  # started exactly like it - nohup, a log of its own, a report folder of its own under the dated
+  # root, the same window and the clock its own file names.
+  paper_snapshot base "${SMC_CONFIG}" "${FOLDER}" "${PAPER_DIR}/base_${TODAY}.json" || exit 2
+  for pair in ${PAPER_CONFIGS}; do
+    role=${pair%%=*}
+    PAPER_CONFIG=$(to_abs "${pair#*=}")
+    case "${role}" in
+      "" | *[!A-Za-z0-9_-]*)
+        echo "error: a paper role is a name of letters, digits, '_' or '-', got '${role}'" >&2
+        exit 2
+        ;;
+    esac
+    if [ ! -f "${PAPER_CONFIG}" ]; then
+      echo "error: no paper config at ${PAPER_CONFIG} (pair '${pair}')" >&2
+      exit 2
+    fi
+    PAPER_LOG="${PAPER_DIR}/${role}_${TODAY}.log"
+    PAPER_ROOT="${DATED}/${role}"
+    echo "--- paper role ${role}: ${PAPER_CONFIG} ---"
+    cd "${SMC_WORKDIR}" || {
+      echo "error: no work directory ${SMC_WORKDIR}" >&2
+      exit 2
+    }
+    PAPER_CLOCK_ARGS=("${CLOCK_ARGS[@]}")
+    PAPER_CLOCK=$(sed -n 's/^source_clock:[[:space:]]*\([^[:space:]#]*\).*/\1/p' \
+      "${PAPER_CONFIG}" 2>/dev/null | head -1)
+    if [ -z "${SOURCE_CLOCK}" ] && [ -n "${PAPER_CLOCK}" ]; then
+      PAPER_CLOCK_ARGS=(--source-clock "${PAPER_CLOCK}")
+    fi
+    nohup env PYTHONPATH="${SMC_REPO}/src:${SMC_REPO}" "${PY}" -m scripts.run_backtest \
+      --config-path "${PAPER_CONFIG}" \
+      --data-source "${DATA_SOURCE}" \
+      "${PAPER_CLOCK_ARGS[@]}" \
+      --start "${START}" \
+      --end "${END}" \
+      --report-dir "${PAPER_ROOT}" \
+      >"${PAPER_LOG}" 2>&1 </dev/null &
+    PAPER_PID=$!
+    echo "  pid      ${PAPER_PID}"
+    echo "  monitor  tail -5 ${PAPER_LOG}"
+    echo "  status   ps -p ${PAPER_PID} -o pid,etime,%cpu,%mem --no-headers"
+    echo "  stop     kill ${PAPER_PID}"
+    elapsed=0
+    while kill -0 "${PAPER_PID}" 2>/dev/null; do
+      if [ "${WAIT_TIMEOUT}" -gt 0 ] && [ "${elapsed}" -ge "${WAIT_TIMEOUT}" ]; then
+        echo "warning: ${role} still runs after ${WAIT_TIMEOUT}s; nohup keeps it alive" >&2
+        echo "         follow it with: tail -f ${PAPER_LOG}" >&2
+        exit 2
+      fi
+      sleep 2
+      elapsed=$((elapsed + 2))
+    done
+    wait "${PAPER_PID}"
+    PAPER_RC=$?
+    if [ "${PAPER_RC}" -ne 0 ]; then
+      echo "error: ${role} exited with ${PAPER_RC}; last lines of ${PAPER_LOG}:" >&2
+      tail -5 "${PAPER_LOG}" >&2
+      exit "${PAPER_RC}"
+    fi
+    # The folder of the role is named by the runner itself, so it is read and never guessed.
+    PAPER_FOLDER=""
+    while IFS= read -r folder; do
+      PAPER_FOLDER=${folder%/}
+      break
+    done < <(ls -dt "${PAPER_ROOT}"/backtest_*/ 2>/dev/null)
+    if [ -z "${PAPER_FOLDER}" ] || [ ! -d "${PAPER_FOLDER}" ]; then
+      echo "error: no report folder of ${role} under ${PAPER_ROOT}" >&2
+      exit 1
+    fi
+    paper_snapshot "${role}" "${PAPER_CONFIG}" "${PAPER_FOLDER}" \
+      "${PAPER_DIR}/${role}_${TODAY}.json" || exit 2
+  done
+  echo "--- paper journal: docs/PAPER_JOURNAL.md (snapshots in ${PAPER_DIR}) ---"
+fi
 
 echo "--- every executed signal goes into docs/TRADING_JOURNAL.md ---"
 exit 0

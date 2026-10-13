@@ -1,0 +1,61 @@
+# ИССЛЕДОВАТЕЛЬСКИЙ конфиг Э17.z++ — НЕ ЖИВОЙ. Боевой конфиг режима A не заменяет.
+#
+# Копия configs/live_eurusd_m15.yaml (победитель Trial 42) с двумя изменениями кандидата
+# «сдвиг −3 ч + H1» из tmp/e17zp_cand/sm3_cap3.yaml:
+#   1. окна сессий сдвинуты на −3 часа (блок session: локальный 06..09 / 07..10 MSK,
+#      нью-йоркский 11..14 / 12..15 MSK против 09..12 / 10..13 и 14..17 / 15..18 по умолчанию);
+#   2. strategy.max_setups_per_level_per_day: 1 -> 3 (суточный лимит настроек на один уровень).
+# Все остальные параметры — как в боевом конфиге, пояс ленты тот же: broker_server.
+#
+# Вердикт Э17.z+ по этому кандидату — B: перспективен, доказательств недостаточно
+# (tmp/e17zp_verdict.md). До решения владельца карантин режима A не снимается, и файл
+# служит только параллельному бумажному мониторингу (scripts/daily_signal_check.sh).
+
+symbol: EURUSD
+timeframe: M15
+source_clock: broker_server
+
+strategy:
+  sweep_buffer_pip: 4
+  sl_buffer_pip: 10
+  min_fvg_pip: 1
+  fvg_lookback: 21
+  max_fvg_age_bars: 9
+  signal_max_age_bars: 94
+  max_setups_per_level_per_day: 3
+  displacement:
+    atr_mult_min: 0.7453013223207354
+    body_frac_min: 0.44988154849338813
+  bias:
+    agreement: majority
+  take_profit:
+    min_tp_rr: 1.1220531901171544
+    rr_fallback: 1.6091050846893695
+
+broker:
+  spread_pip: 1.4
+  commission_per_lot_usd: 0.0
+  slippage_pip: 0.2
+  swap_long_pip: -0.70
+  swap_short_pip: 0.00
+  contract_size: 100000
+  pip_size: 0.0001
+  leverage: 40
+
+backtest:
+  initial_capital: 10000.0
+  lot: 0.1
+
+session:
+  london_summer_msk:
+  - 6
+  - 9
+  london_winter_msk:
+  - 7
+  - 10
+  ny_summer_msk:
+  - 11
+  - 14
+  ny_winter_msk:
+  - 12
+  - 15
